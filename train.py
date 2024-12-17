@@ -12,12 +12,14 @@ from pathlib import Path
 from torch import optim
 from torch.utils.data import DataLoader, random_split
 from tqdm import tqdm
+from typing import Optional
 
 import wandb
 from evaluate import evaluate
 from unet import UNet
 from utils.data_loading import IDRIDDataset
 from utils.dice_score import dice_loss
+import numpy as np
 
 # Add CUDA error handling
 if torch.cuda.is_available():
@@ -37,10 +39,11 @@ def train_model(
         model,
         device,
         epochs: int = 100,
-        batch_size: int = 2,
-        learning_rate: float = 1e-4,
+        batch_size: int = 1,
+        learning_rate: float = 1e-3,
         save_checkpoint: bool = True,
-        img_scale: float = 0.25,
+        img_scale: float = 0.5,
+        patch_size: Optional[int] = None,
         amp: bool = True,
         gradient_clipping: float = 1.0,
 ):
@@ -51,13 +54,17 @@ def train_model(
     if not (data_dir / 'masks' / 'train').exists():
         raise RuntimeError(f"Training masks directory not found at {data_dir / 'masks' / 'train'}")
 
-    # Create datasets
-    try:
-        train_dataset = IDRIDDataset(base_dir='./data', split='train', scale=img_scale)
-        val_dataset = IDRIDDataset(base_dir='./data', split='val', scale=img_scale)
-    except Exception as e:
-        logging.error(f"Error creating datasets: {e}")
-        raise
+    # Load datasets with logging
+    train_dataset = IDRIDDataset(base_dir='./data', split='train', 
+                                scale=img_scale, patch_size=patch_size,
+                                lesion_type='EX')
+    val_dataset = IDRIDDataset(base_dir='./data', split='val', 
+                              scale=img_scale, patch_size=patch_size,
+                              lesion_type='EX')
+    
+    logging.info(f'Dataset sizes:')
+    logging.info(f'- Training: {len(train_dataset)} images')
+    logging.info(f'- Validation: {len(val_dataset)} images')
 
     # Create data loaders
     loader_args = dict(batch_size=batch_size, num_workers=4, pin_memory=True)
@@ -85,16 +92,55 @@ def train_model(
 
     # Use appropriate optimizer
     optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-5)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'max', patience=5)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, 
+        mode='max',
+        factor=0.5,       # Less aggressive reduction
+        patience=10,      # Wait longer before reducing
+        min_lr=1e-6,     # Don't go too low
+        verbose=True
+    )
     grad_scaler = torch.amp.GradScaler(enabled=amp)
     
-    # BCE loss for multi-label segmentation
-    criterion = nn.BCEWithLogitsLoss()
+    # Modify the class weights calculation for binary classification
+    def calculate_class_weights(dataset):
+        pos_count = 0
+        total_pixels = 0
+        for sample in dataset:
+            mask = sample['mask']
+            pos_count += (mask > 0).float().sum()
+            total_pixels += mask.numel()
+        
+        neg_count = total_pixels - pos_count
+        # Calculate weights for background (0) and lesion (1)
+        weights = torch.tensor([neg_count, pos_count])
+        weights = 1.0 / (weights + 1e-8)
+        weights = weights / weights.sum()
+        
+        logging.info(f'Class weights calculated - Background: {weights[0]:.4f}, Lesion: {weights[1]:.4f}')
+        return weights.to(device)
+
+    class_weights = calculate_class_weights(train_dataset)
+    criterion = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([10.0]).to(device))  # Weight positive examples more
+    
+    # Modify loss calculation
     global_step = 0
 
     # Move model to device and set to appropriate dtype
     model = model.to(device=device)
     
+    # Add debug logging for shapes
+    for batch in train_loader:
+        images = batch['image']
+        masks = batch['mask']
+        logging.info(f"Image shape: {images.shape}")
+        logging.info(f"Mask shape: {masks.shape}")
+        break
+
+    # Add memory debugging
+    if torch.cuda.is_available():
+        logging.info(f"GPU Memory before data loading: {torch.cuda.memory_allocated()/1024**2:.2f}MB")
+
     # 5. Begin training
     for epoch in range(1, epochs + 1):
         model.train()
@@ -104,14 +150,36 @@ def train_model(
                 images = batch['image'].to(device=device, dtype=torch.float32)
                 true_masks = batch['mask'].to(device=device, dtype=torch.float32)
 
+                logging.debug(f"Batch image shape: {images.shape}")
+                logging.debug(f"Batch mask shape: {true_masks.shape}")
+
                 with torch.autocast(device_type='cuda', enabled=amp):
                     masks_pred = model(images)
-                    loss = criterion(masks_pred, true_masks)
-                    loss += dice_loss(
+                    logging.debug(f"Predicted mask shape: {masks_pred.shape}")
+                    
+                    # Ensure shapes match
+                    if masks_pred.shape != true_masks.shape:
+                        logging.error(f"Shape mismatch - Pred: {masks_pred.shape}, True: {true_masks.shape}")
+                        raise RuntimeError(f"Shape mismatch in model output")
+
+                    # Add loss debugging
+                    if global_step % 10 == 0:  # Log every 10 steps
+                        with torch.no_grad():
+                            pred_sigmoid = torch.sigmoid(masks_pred)
+                            pos_pixels = (true_masks > 0.5).float().sum()
+                            pred_pos_pixels = (pred_sigmoid > 0.5).float().sum()
+                            logging.info(f'Positive pixels - True: {pos_pixels.item()}, Predicted: {pred_pos_pixels.item()}')
+
+                    # Calculate BCE loss
+                    bce_loss = criterion(masks_pred, true_masks)
+                    # Add Dice loss
+                    dice = dice_loss(
                         torch.sigmoid(masks_pred), 
                         true_masks,
-                        multiclass=True
+                        multiclass=False  # Changed to False since we're doing binary
                     )
+                    # Combine losses with weighting
+                    loss = bce_loss + dice
 
                 optimizer.zero_grad(set_to_none=True)
                 grad_scaler.scale(loss).backward()
@@ -138,100 +206,51 @@ def train_model(
                 if division_step > 0:
                     if global_step % division_step == 0:
                         val_score = evaluate(model, val_loader, device, amp)
-                        # Ensure val_score is a dictionary before accessing
-                        if isinstance(val_score, dict):
-                            scheduler.step(val_score['mean_dice'])
-                        else:
-                            scheduler.step(val_score)  # Assume it's a single value if not a dict
-                        logging.info('Validation Dice score: {}'.format(val_score))
+                        scheduler.step(val_score['mean_dice'])
                         
+                        # Log validation metrics
                         experiment.log({
                             'learning rate': optimizer.param_groups[0]['lr'],
                             'validation Dice': val_score['mean_dice'],
-                            'MA Dice': val_score['MA_dice'],
-                            'HE Dice': val_score['HE_dice'],
-                            'EX Dice': val_score['EX_dice'],
-                            'SE Dice': val_score['SE_dice'],
-                            'OD Dice': val_score['OD_dice'],
-                            'images': wandb.Image(
-                                images[0].cpu(),
-                                caption='Input Image'
-                            ),
-                            'masks': {
-                                'true_MA': wandb.Image(
-                                    true_masks[0, 0].float().cpu(),
-                                    caption='MA Ground Truth'
-                                ),
-                                'true_HE': wandb.Image(
-                                    true_masks[0, 1].float().cpu(),
-                                    caption='HE Ground Truth'
-                                ),
-                                'true_EX': wandb.Image(
-                                    true_masks[0, 2].float().cpu(),
-                                    caption='EX Ground Truth'
-                                ),
-                                'true_SE': wandb.Image(
-                                    true_masks[0, 3].float().cpu(),
-                                    caption='SE Ground Truth'
-                                ),
-                                'true_OD': wandb.Image(
-                                    true_masks[0, 4].float().cpu(),
-                                    caption='OD Ground Truth'
-                                ),
-                                'pred_MA': wandb.Image(
-                                    torch.sigmoid(masks_pred[0, 0]).float().cpu().detach(),
-                                    caption='MA Prediction'
-                                ),
-                                'pred_HE': wandb.Image(
-                                    torch.sigmoid(masks_pred[0, 1]).float().cpu().detach(),
-                                    caption='HE Prediction'
-                                ),
-                                'pred_EX': wandb.Image(
-                                    torch.sigmoid(masks_pred[0, 2]).float().cpu().detach(),
-                                    caption='EX Prediction'
-                                ),
-                                'pred_SE': wandb.Image(
-                                    torch.sigmoid(masks_pred[0, 3]).float().cpu().detach(),
-                                    caption='SE Prediction'
-                                ),
-                                'pred_OD': wandb.Image(
-                                    torch.sigmoid(masks_pred[0, 4]).float().cpu().detach(),
-                                    caption='OD Prediction'
-                                ),
-                            },
-                            'overlays': {
-                                'MA': wandb.Image(
-                                    images[0].cpu(),
-                                    masks={
-                                        "predictions": {
-                                            "mask_data": torch.sigmoid(masks_pred[0, 0]).float().cpu().detach().numpy(),
-                                            "class_labels": {1: "MA"}
-                                        },
-                                        "ground_truth": {
-                                            "mask_data": true_masks[0, 0].float().cpu().numpy(),
-                                            "class_labels": {1: "MA"}
-                                        }
-                                    },
-                                    caption='MA Overlay'
-                                ),
-                                'EX': wandb.Image(
-                                    images[0].cpu(),
-                                    masks={
-                                        "predictions": {
-                                            "mask_data": torch.sigmoid(masks_pred[0, 2]).float().cpu().detach().numpy(),
-                                            "class_labels": {1: "EX"}
-                                        },
-                                        "ground_truth": {
-                                            "mask_data": true_masks[0, 2].float().cpu().numpy(),
-                                            "class_labels": {1: "EX"}
-                                        }
-                                    },
-                                    caption='EX Overlay'
-                                )
-                            },
-                            'step': global_step,
                             'epoch': epoch
                         })
+
+                        # Log a batch of validation images
+                        with torch.no_grad():
+                            # Get a batch of validation images
+                            val_batch = next(iter(val_loader))
+                            images = val_batch['image']
+                            true_masks = val_batch['mask']
+                            
+                            # Get model prediction
+                            model.eval()
+                            mask_pred = model(images.to(device))
+                            mask_pred = torch.sigmoid(mask_pred)
+                            
+                            # Convert to numpy for visualization
+                            img = images[0].cpu().numpy()
+                            true_mask = true_masks[0].cpu().numpy()
+                            pred_mask = mask_pred[0].cpu().numpy()
+                            
+                            # Debug logging
+                            logging.info(f'Validation sample ranges:')
+                            logging.info(f'- True mask: min={true_mask.min():.3f}, max={true_mask.max():.3f}')
+                            logging.info(f'- Pred mask: min={pred_mask.min():.3f}, max={pred_mask.max():.3f}')
+                            
+                            # Ensure proper normalization for visualization
+                            img = img.transpose(1, 2, 0)  # CHW -> HWC
+                            img = (img * 255).astype(np.uint8)
+                            true_mask = (true_mask[0] * 255).astype(np.uint8)  # Take first channel
+                            pred_mask = (pred_mask[0] * 255).astype(np.uint8)  # Take first channel
+                            
+                            experiment.log({
+                                'validation sample': {
+                                    'image': wandb.Image(img),
+                                    'true_mask': wandb.Image(true_mask),
+                                    'pred_mask': wandb.Image(pred_mask),
+                                }
+                            })
+                            model.train()
 
         if save_checkpoint:
             Path(dir_checkpoint).mkdir(parents=True, exist_ok=True)
@@ -244,27 +263,39 @@ def get_args():
     parser = argparse.ArgumentParser(description='Train the UNet on images and target masks')
     parser.add_argument('--epochs', '-e', metavar='E', type=int, default=100, help='Number of epochs')
     parser.add_argument('--batch-size', '-b', dest='batch_size', metavar='B', type=int, default=2, help='Batch size')
-    parser.add_argument('--learning-rate', '-l', metavar='LR', type=float, default=1e-4,
-                        help='Learning rate', dest='learning_rate')
+    parser.add_argument('--learning-rate', '-l', metavar='LR', type=float, default=1e-3, help='Learning rate')
     parser.add_argument('--load', '-f', type=str, default=False, help='Load model from a .pth file')
-    parser.add_argument('--scale', '-s', type=float, default=0.5, help='Downscaling factor of the images')
+    parser.add_argument('--scale', '-s', type=float, default=1.0, help='Downscaling factor of the images')
+    parser.add_argument('--patch-size', '-p', type=lambda x: None if x.lower() == 'none' else int(x), 
+                        default=None, 
+                        help='Size of patches to extract (use None to disable)')
     parser.add_argument('--validation', '-v', dest='val', type=float, default=10.0,
                         help='Percent of the data that is used as validation (0-100)')
     parser.add_argument('--amp', action='store_true', default=False, help='Use mixed precision')
-    parser.add_argument('--bilinear', action='store_true', default=False, help='Use bilinear upsampling')
-    parser.add_argument('--classes', '-c', type=int, default=6, help='Number of classes')
-
+    parser.add_argument('--classes', '-c', type=int, default=1, help='Number of classes')
+    parser.add_argument('--gradient-clipping', type=float, default=1.0, help='Gradient clipping value')
     return parser.parse_args()
 
 
 if __name__ == '__main__':
     args = get_args()
 
-    logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
+    # Set up logging with more detail
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        datefmt='%H:%M:%S'
+    )
+    
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     logging.info(f'Using device {device}')
+    logging.info(f'Training configuration:')
+    logging.info(f'- Patch size: {args.patch_size}')
+    logging.info(f'- Scale: {args.scale}')
+    logging.info(f'- Batch size: {args.batch_size}')
+    logging.info(f'- Learning rate: {args.learning_rate}')
 
-    model = UNet(n_channels=3, n_classes=5, bilinear=False)
+    model = UNet(n_channels=3, n_classes=1, bilinear=False)
     model = model.to(device=device)
     
     if args.load:
@@ -280,7 +311,9 @@ if __name__ == '__main__':
             learning_rate=args.learning_rate,
             device=device,
             img_scale=args.scale,
-            amp=args.amp
+            patch_size=args.patch_size,
+            amp=args.amp,
+            gradient_clipping=args.gradient_clipping
         )
     except torch.cuda.OutOfMemoryError:
         logging.error('Detected OutOfMemoryError! '

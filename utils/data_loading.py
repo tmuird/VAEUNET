@@ -11,6 +11,8 @@ from os.path import splitext, isfile, join
 from pathlib import Path
 from torch.utils.data import Dataset
 from tqdm import tqdm
+import torch.nn.functional as F
+from typing import Optional
 
 
 def load_image(filename):
@@ -118,52 +120,91 @@ class CarvanaDataset(BasicDataset):
 
 
 class IDRIDDataset(Dataset):
-    def __init__(self, base_dir: str, split: str = 'train', scale: float = 0.25):
+    def __init__(self, base_dir: str, split: str = 'train', scale: float = 0.25, patch_size: Optional[int] = None, lesion_type: str = 'EX'):
         self.scale = scale
+        self.patch_size = patch_size
         
         # Setup directories
         self.images_dir = Path(base_dir) / 'imgs' / split
         self.masks_dir = Path(base_dir) / 'masks' / split
         
-        # Define the lesion classes and their corresponding directories
-        self.classes = ['MA', 'HE', 'EX', 'SE', 'OD']
-        self.class_dirs = ['MA', 'HA', 'EX', 'SE', 'OD']  # Added mapping for actual directory names
+        # Define the lesion type
+        self.lesion_type = lesion_type
+        self.class_dir = lesion_type
         
-        # Get all image files (only .jpg files)
-        self.ids = [splitext(file)[0] for file in listdir(self.images_dir) 
-                   if file.endswith('.jpg')]
+        # Add debug logging
+        logging.info(f'Loading {split} dataset from:')
+        logging.info(f'- Images: {self.images_dir}')
+        logging.info(f'- Masks: {self.masks_dir / self.class_dir}')
         
-        if not self.ids:
-            raise RuntimeError(f'No input file found in {self.images_dir}')
+        # Get image files
+        self.ids = [splitext(file)[0] for file in listdir(self.images_dir) if file.endswith('.jpg')]
         
-        logging.info(f'Creating {split} dataset with {len(self.ids)} examples')
+        # Verify mask files exist
+        for img_id in self.ids:
+            mask_file = self.masks_dir / self.class_dir / f"{img_id}_{self.lesion_type}.tif"
+            if not mask_file.exists():
+                logging.warning(f'No mask found for {img_id}')
+            else:
+                # Check mask content
+                mask = np.array(load_image(mask_file))
+                if mask.max() == 0:
+                    logging.warning(f'Mask for {img_id} is all zeros')
+                else:
+                    logging.info(f'Found valid mask for {img_id} with values in range [{mask.min()}, {mask.max()}]')
 
     def __len__(self):
         return len(self.ids)
 
-    @staticmethod
-    def preprocess(pil_img, scale, is_mask):
-        w, h = pil_img.size
-        newW, newH = int(scale * w), int(scale * h)
-        assert newW > 0 and newH > 0, 'Scale is too small'
-        
-        pil_img = pil_img.resize((newW, newH), 
-                                resample=Image.NEAREST if is_mask else Image.BICUBIC)
-        img_np = np.asarray(pil_img)
-
-        if is_mask:
-            return (img_np > 0).astype(np.float32)  # Binary mask
+    def preprocess(self, img, scale, is_mask=False):
+        if isinstance(img, np.ndarray):
+            h, w = img.shape[:2]
         else:
-            # Normalize image to [0, 1] range
-            if img_np.ndim == 2:
-                img_np = img_np[np.newaxis, ...]
-            else:
-                img_np = img_np.transpose((2, 0, 1))
+            w, h = img.size
             
-            if img_np.max() > 1:
-                img_np = img_np / 255.0
-                
-            return img_np
+        newW, newH = int(scale * w), int(scale * h)
+        
+        if not is_mask:
+            if isinstance(img, np.ndarray):
+                img = Image.fromarray(img)
+            img = img.resize((newW, newH))
+            img = np.array(img).transpose((2, 0, 1))
+            return img / 255.0
+        else:
+            if isinstance(img, np.ndarray):
+                img = Image.fromarray(img.astype(np.uint8))
+            img = img.resize((newW, newH))
+            mask = np.array(img)
+            # Debug mask values
+            logging.info(f'Mask values after preprocessing: min={mask.min()}, max={mask.max()}, unique={np.unique(mask)}')
+            return (mask > 0).astype(np.float32)
+
+    def extract_patch(self, img: torch.Tensor, mask: torch.Tensor) -> tuple:
+        """Extract a random patch from image and mask."""
+        if self.patch_size is None:
+            logging.debug('Patch extraction disabled, using full images')
+            return img, mask
+            
+        logging.debug(f'Extracting patch of size {self.patch_size}')
+        _, h, w = img.shape
+        max_x = w - self.patch_size
+        max_y = h - self.patch_size
+        
+        if max_x > 0 and max_y > 0:
+            x = torch.randint(0, max_x, (1,)).item()
+            y = torch.randint(0, max_y, (1,)).item()
+            
+            img = img[:, y:y+self.patch_size, x:x+self.patch_size]
+            mask = mask[:, y:y+self.patch_size, x:x+self.patch_size]
+            logging.debug(f'Extracted patch at position ({x}, {y})')
+        else:
+            pad_h = max(0, self.patch_size - h)
+            pad_w = max(0, self.patch_size - w)
+            img = F.pad(img, (0, pad_w, 0, pad_h))
+            mask = F.pad(mask, (0, pad_w, 0, pad_h))
+            logging.debug(f'Padded image to match patch size')
+            
+        return img, mask
 
     def __getitem__(self, idx):
         img_id = self.ids[idx]
@@ -172,23 +213,40 @@ class IDRIDDataset(Dataset):
         img_file = self.images_dir / f"{img_id}.jpg"
         img = load_image(img_file)
         
-        # Create multi-channel mask (5 channels for 5 classes)
-        w, h = img.size
-        mask = np.zeros((len(self.classes), int(h * self.scale), int(w * self.scale)), 
-                       dtype=np.float32)
-        
-        # Load available masks for each class
-        for i, (class_name, class_dir) in enumerate(zip(self.classes, self.class_dirs)):
-            mask_file = self.masks_dir / class_dir / f"{img_id}_{class_name}.tif"
-            if mask_file.exists():
-                class_mask = load_image(mask_file)
-                mask[i] = self.preprocess(class_mask, self.scale, is_mask=True)
-        
-        # Preprocess image
+        # Load mask with value checking
+        mask_file = self.masks_dir / self.class_dir / f"{img_id}_{self.lesion_type}.tif"
+        if mask_file.exists():
+            mask = load_image(mask_file)
+            mask = np.array(mask)
+            # Debug original mask values
+            logging.info(f'Original mask values for {img_id}: min={mask.min()}, max={mask.max()}, unique={np.unique(mask)}')
+            if mask.ndim > 2:
+                mask = mask[..., 0]
+        else:
+            w, h = img.size
+            mask = np.zeros((h, w), dtype=np.float32)
+
+        # Preprocess
         img = self.preprocess(img, self.scale, is_mask=False)
+        mask = self.preprocess(mask, self.scale, is_mask=True)
+
+        # Convert to tensors
+        img = torch.as_tensor(img.copy()).float()
+        mask = torch.as_tensor(mask.copy()).float()
         
+        # Add channel dimension to mask if needed
+        if mask.dim() == 2:
+            mask = mask.unsqueeze(0)
+            
+        # Only apply patching if patch_size is set
+        if self.patch_size is not None:
+            img, mask = self.extract_patch(img, mask)
+            
+        # Log final shapes
+        logging.debug(f'Final shapes - Image: {img.shape}, Mask: {mask.shape}')
+
         return {
-            'image': torch.as_tensor(img.copy()).float().contiguous(),
-            'mask': torch.as_tensor(mask.copy()).float().contiguous(),
+            'image': img.contiguous(),
+            'mask': mask.contiguous(),
             'img_id': img_id
         }

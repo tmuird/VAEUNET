@@ -1,20 +1,31 @@
 import torch
 from torch import Tensor
+import logging
 
 
 def dice_coeff(input: Tensor, target: Tensor, reduce_batch_first: bool = False, epsilon: float = 1e-6):
-    # Average of Dice coefficient for all batches, or for a single mask
-    assert input.size() == target.size()
-    assert input.dim() == 3 or not reduce_batch_first
+    # Add shape logging
+    logging.debug(f'Dice calculation - Input shape: {input.shape}, Target shape: {target.shape}')
 
-    sum_dim = (-1, -2) if input.dim() == 2 or not reduce_batch_first else (-1, -2, -3)
+    # Ensure same shape
+    if input.shape != target.shape:
+        raise ValueError(f'Shape mismatch in dice_coeff: input {input.shape} vs target {target.shape}')
 
-    inter = 2 * (input * target).sum(dim=sum_dim)
-    sets_sum = input.sum(dim=sum_dim) + target.sum(dim=sum_dim)
-    sets_sum = torch.where(sets_sum == 0, inter, sets_sum)
+    if input.dim() > 2 or target.dim() > 2:
+        if reduce_batch_first:
+            input = input.contiguous().view(input.shape[0], -1)
+            target = target.contiguous().view(target.shape[0], -1)
+        else:
+            input = input.contiguous().view(-1)
+            target = target.contiguous().view(-1)
 
-    dice = (inter + epsilon) / (sets_sum + epsilon)
-    return dice.mean()
+    intersection = (input * target).sum()
+    denominator = input.sum() + target.sum()
+
+    if denominator.item() == 0:
+        return torch.tensor(1.0).to(input.device)
+
+    return (2.0 * intersection + epsilon) / (denominator + epsilon)
 
 
 def multiclass_dice_coeff(input: Tensor, target: Tensor, reduce_batch_first: bool = False, epsilon: float = 1e-6):
