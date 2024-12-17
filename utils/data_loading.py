@@ -13,6 +13,8 @@ from torch.utils.data import Dataset
 from tqdm import tqdm
 import torch.nn.functional as F
 from typing import Optional
+import random
+import os
 
 
 def load_image(filename):
@@ -176,35 +178,55 @@ class IDRIDDataset(Dataset):
             img = img.resize((newW, newH))
             mask = np.array(img)
             # Debug mask values
-            logging.info(f'Mask values after preprocessing: min={mask.min()}, max={mask.max()}, unique={np.unique(mask)}')
+            #logging.info(f'Mask values after preprocessing: min={mask.min()}, max={mask.max()}, unique={np.unique(mask)}')
             return (mask > 0).astype(np.float32)
 
-    def extract_patch(self, img: torch.Tensor, mask: torch.Tensor) -> tuple:
-        """Extract a random patch from image and mask."""
-        if self.patch_size is None:
-            logging.debug('Patch extraction disabled, using full images')
-            return img, mask
-            
-        logging.debug(f'Extracting patch of size {self.patch_size}')
-        _, h, w = img.shape
-        max_x = w - self.patch_size
-        max_y = h - self.patch_size
+    def get_random_patch(self, image, mask):
+        """Extract random patch from image and mask, with higher probability around lesions"""
+        _, h, w = image.shape
         
-        if max_x > 0 and max_y > 0:
-            x = torch.randint(0, max_x, (1,)).item()
-            y = torch.randint(0, max_y, (1,)).item()
+        if h < self.patch_size or w < self.patch_size:
+            raise ValueError(f"Image size ({h}x{w}) is smaller than patch size ({self.patch_size})")
+
+        # Find lesion coordinates
+        lesion_coords = torch.nonzero(mask[0] > 0.5)  # [N, 2] tensor of (y, x) coordinates
+        
+        if len(lesion_coords) > 0 and random.random() < 0.8:  # 80% chance to sample from lesion areas
+            # Randomly select a lesion pixel
+            idx = random.randint(0, len(lesion_coords) - 1)
+            center_y, center_x = lesion_coords[idx]
             
-            img = img[:, y:y+self.patch_size, x:x+self.patch_size]
-            mask = mask[:, y:y+self.patch_size, x:x+self.patch_size]
-            logging.debug(f'Extracted patch at position ({x}, {y})')
+            # Add some randomness to the center point
+            center_y = center_y + random.randint(-self.patch_size//4, self.patch_size//4)
+            center_x = center_x + random.randint(-self.patch_size//4, self.patch_size//4)
+            
+            # Ensure the patch fits within the image
+            center_y = torch.clamp(center_y, self.patch_size//2, h - self.patch_size//2)
+            center_x = torch.clamp(center_x, self.patch_size//2, w - self.patch_size//2)
+            
+            # Calculate patch coordinates
+            y = center_y - self.patch_size//2
+            x = center_x - self.patch_size//2
         else:
-            pad_h = max(0, self.patch_size - h)
-            pad_w = max(0, self.patch_size - w)
-            img = F.pad(img, (0, pad_w, 0, pad_h))
-            mask = F.pad(mask, (0, pad_w, 0, pad_h))
-            logging.debug(f'Padded image to match patch size')
-            
-        return img, mask
+            # Random sampling for negative examples (20% of the time)
+            y = random.randint(0, h - self.patch_size)
+            x = random.randint(0, w - self.patch_size)
+        
+        # Extract patches
+        image_patch = image[:, y:y+self.patch_size, x:x+self.patch_size]
+        mask_patch = mask[:, y:y+self.patch_size, x:x+self.patch_size]
+        
+        # Verify patch contains data
+        if image_patch.shape != (3, self.patch_size, self.patch_size):
+            logging.error(f"Invalid patch shape: {image_patch.shape}")
+            raise ValueError(f"Invalid patch shape: {image_patch.shape}")
+        
+        # Log patch statistics
+        lesion_ratio = (mask_patch > 0.5).float().mean().item()
+        if lesion_ratio > 0:
+            logging.debug(f"Extracted patch with {lesion_ratio:.1%} lesion pixels")
+        
+        return image_patch, mask_patch
 
     def __getitem__(self, idx):
         img_id = self.ids[idx]
@@ -219,7 +241,7 @@ class IDRIDDataset(Dataset):
             mask = load_image(mask_file)
             mask = np.array(mask)
             # Debug original mask values
-            logging.info(f'Original mask values for {img_id}: min={mask.min()}, max={mask.max()}, unique={np.unique(mask)}')
+            #logging.info(f'Original mask values for {img_id}: min={mask.min()}, max={mask.max()}, unique={np.unique(mask)}')
             if mask.ndim > 2:
                 mask = mask[..., 0]
         else:
@@ -240,7 +262,7 @@ class IDRIDDataset(Dataset):
             
         # Only apply patching if patch_size is set
         if self.patch_size is not None:
-            img, mask = self.extract_patch(img, mask)
+            img, mask = self.get_random_patch(img, mask)
             
         # Log final shapes
         logging.debug(f'Final shapes - Image: {img.shape}, Mask: {mask.shape}')

@@ -38,12 +38,12 @@ dir_checkpoint = Path('./checkpoints/')
 def train_model(
         model,
         device,
-        epochs: int = 100,
+        epochs: int = 50,
         batch_size: int = 1,
-        learning_rate: float = 1e-3,
+        learning_rate: float = 1e-4,
         save_checkpoint: bool = True,
-        img_scale: float = 0.5,
-        patch_size: Optional[int] = None,
+        img_scale: float = 0.25,
+        patch_size: Optional[int] = 128,
         amp: bool = True,
         gradient_clipping: float = 1.0,
 ):
@@ -69,7 +69,11 @@ def train_model(
     # Create data loaders
     loader_args = dict(batch_size=batch_size, num_workers=4, pin_memory=True)
     train_loader = DataLoader(train_dataset, shuffle=True, **loader_args)
-    val_loader = DataLoader(val_dataset, shuffle=False, drop_last=True, **loader_args)
+    val_loader = DataLoader(val_dataset, 
+                           shuffle=False, 
+                           batch_size=1,  # Force batch_size=1 for validation
+                           num_workers=1, 
+                           pin_memory=True)
 
     # Initialize logging
     experiment = wandb.init(project='IDRID-UNET', resume='allow', anonymous='must')
@@ -96,8 +100,8 @@ def train_model(
         optimizer, 
         mode='max',
         factor=0.5,       # Less aggressive reduction
-        patience=10,      # Wait longer before reducing
-        min_lr=1e-6,     # Don't go too low
+        patience=15,      # Wait longer before reducing
+        min_lr=1e-5,     # Don't go too low
         verbose=True
     )
     grad_scaler = torch.amp.GradScaler(enabled=amp)
@@ -271,7 +275,7 @@ def get_args():
                         help='Size of patches to extract (use None to disable)')
     parser.add_argument('--validation', '-v', dest='val', type=float, default=10.0,
                         help='Percent of the data that is used as validation (0-100)')
-    parser.add_argument('--amp', action='store_true', default=False, help='Use mixed precision')
+    parser.add_argument('--amp', action='store_true', default=True, help='Use mixed precision')
     parser.add_argument('--classes', '-c', type=int, default=1, help='Number of classes')
     parser.add_argument('--gradient-clipping', type=float, default=1.0, help='Gradient clipping value')
     return parser.parse_args()

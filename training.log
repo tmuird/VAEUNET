@@ -1,0 +1,191 @@
+17:33:09 - INFO - Using device cuda
+17:33:09 - INFO - Training configuration:
+17:33:09 - INFO - - Patch size: 256
+17:33:09 - INFO - - Scale: 0.5
+17:33:09 - INFO - - Batch size: 4
+17:33:09 - INFO - - Learning rate: 0.0001
+17:33:09 - INFO - Creating train dataset with 54 examples
+17:33:09 - INFO - Creating val dataset with 27 examples
+17:33:09 - INFO - Dataset sizes:
+17:33:09 - INFO - - Training: 54 images
+17:33:09 - INFO - - Validation: 27 images
+17:33:11 - INFO - Starting training:
+    Epochs:          100
+    Batch size:      4
+    Learning rate:   0.0001
+    Training size:   54
+    Validation size: 27
+    Checkpoints:     True
+    Device:          cuda
+    Images scaling:  0.5
+    Mixed Precision: True
+    
+17:33:11 - INFO - Calculating class weights...
+17:33:20 - INFO - Positive class weight: 5.00
+17:33:32 - INFO - Best model saved! (Dice: 0.0633)
+17:34:38 - INFO - Using device cuda
+17:34:38 - INFO - Training configuration:
+17:34:38 - INFO - - Patch size: 256
+17:34:38 - INFO - - Scale: 0.5
+17:34:38 - INFO - - Batch size: 4
+17:34:38 - INFO - - Learning rate: 0.0001
+17:34:38 - INFO - Creating train dataset with 54 examples
+17:34:38 - INFO - Creating val dataset with 27 examples
+17:34:38 - INFO - Dataset sizes:
+17:34:38 - INFO - - Training: 54 images
+17:34:38 - INFO - - Validation: 27 images
+17:34:40 - INFO - Starting training:
+    Epochs:          100
+    Batch size:      4
+    Learning rate:   0.0001
+    Training size:   54
+    Validation size: 27
+    Checkpoints:     True
+    Device:          cuda
+    Images scaling:  0.5
+    Mixed Precision: True
+    
+17:34:40 - INFO - Calculating class weights...
+17:34:49 - INFO - Positive class weight: 5.00
+17:35:05 - INFO - Best model saved! (Dice: 0.0303)
+17:35:34 - INFO - Using device cuda
+17:35:34 - INFO - Training configuration:
+17:35:34 - INFO - - Patch size: 256
+17:35:34 - INFO - - Scale: 0.2
+17:35:34 - INFO - - Batch size: 4
+17:35:34 - INFO - - Learning rate: 0.0001
+17:35:34 - INFO - Creating train dataset with 54 examples
+17:35:34 - INFO - Creating val dataset with 27 examples
+17:35:34 - INFO - Dataset sizes:
+17:35:34 - INFO - - Training: 54 images
+17:35:34 - INFO - - Validation: 27 images
+17:35:37 - INFO - Starting training:
+    Epochs:          100
+    Batch size:      4
+    Learning rate:   0.0001
+    Training size:   54
+    Validation size: 27
+    Checkpoints:     True
+    Device:          cuda
+    Images scaling:  0.2
+    Mixed Precision: True
+    
+17:35:37 - INFO - Calculating class weights...
+17:35:43 - INFO - Positive class weight: 5.00
+17:35:50 - INFO - Best model saved! (Dice: 0.0002)
+17:36:06 - INFO - Best model saved! (Dice: 0.0005)
+17:37:28 - INFO - Early stopping triggered after 13 epochs
+17:38:03 - INFO - Using device cuda
+17:38:03 - INFO - Training configuration:
+17:38:03 - INFO - - Patch size: 256
+17:38:03 - INFO - - Scale: 0.5
+17:38:03 - INFO - - Batch size: 4
+17:38:03 - INFO - - Learning rate: 0.0001
+17:38:03 - INFO - Creating train dataset with 54 examples
+17:38:03 - INFO - Creating val dataset with 27 examples
+17:38:03 - INFO - Dataset sizes:
+17:38:03 - INFO - - Training: 54 images
+17:38:03 - INFO - - Validation: 27 images
+17:38:05 - INFO - Starting training:
+    Epochs:          50
+    Batch size:      4
+    Learning rate:   0.0001
+    Training size:   54
+    Validation size: 27
+    Checkpoints:     True
+    Device:          cuda
+    Images scaling:  0.5
+    Mixed Precision: True
+    
+17:38:05 - INFO - Calculating class weights...
+17:38:14 - INFO - Positive class weight: 5.00
+17:38:14 - INFO - Sample image shape: torch.Size([3, 256, 256])
+17:38:14 - INFO - Sample mask shape: torch.Size([1, 256, 256])
+17:38:14 - INFO - Requested patch size: 256
+17:38:30 - INFO - Best model saved! (Dice: 0.0303)
+17:39:13 - INFO - Using device cuda
+17:39:13 - INFO - Training configuration:
+17:39:13 - INFO - - Patch size: 128
+17:39:13 - INFO - - Scale: 0.25
+17:39:13 - INFO - - Batch size: 1
+17:39:13 - INFO - - Learning rate: 0.0001
+17:39:13 - INFO - Creating train dataset with 54 examples
+17:39:13 - INFO - Creating val dataset with 27 examples
+17:39:13 - INFO - Dataset sizes:
+17:39:13 - INFO - - Training: 54 images
+17:39:13 - INFO - - Validation: 27 images
+17:39:16 - INFO - Starting training:
+    Epochs:          50
+    Batch size:      1
+    Learning rate:   0.0001
+    Training size:   54
+    Validation size: 27
+    Checkpoints:     True
+    Device:          cuda
+    Images scaling:  0.25
+    Mixed Precision: True
+    
+17:39:16 - INFO - Calculating class weights...
+17:39:23 - INFO - Positive class weight: 5.00
+17:39:23 - INFO - Sample image shape: torch.Size([3, 128, 128])
+17:39:23 - INFO - Sample mask shape: torch.Size([1, 128, 128])
+17:39:23 - INFO - Requested patch size: 128
+17:39:34 - INFO - Best model saved! (Dice: 0.0000)
+17:39:46 - INFO - Best model saved! (Dice: 0.0346)
+17:41:47 - INFO - Using device cuda
+17:41:47 - INFO - Training configuration:
+17:41:47 - INFO - - Patch size: 128
+17:41:47 - INFO - - Scale: 0.25
+17:41:47 - INFO - - Batch size: 1
+17:41:47 - INFO - - Learning rate: 0.0001
+17:41:47 - INFO - Creating train dataset with 54 examples
+17:41:47 - INFO - Creating val dataset with 27 examples
+17:41:47 - INFO - Dataset sizes:
+17:41:47 - INFO - - Training: 54 images
+17:41:47 - INFO - - Validation: 27 images
+17:41:49 - INFO - Starting training:
+    Epochs:          50
+    Batch size:      1
+    Learning rate:   0.0001
+    Training size:   54
+    Validation size: 27
+    Checkpoints:     True
+    Device:          cuda
+    Images scaling:  0.25
+    Mixed Precision: True
+    
+17:41:49 - INFO - Calculating class weights...
+17:41:56 - INFO - Positive class weight: 5.00
+17:41:56 - INFO - Sample image shape: torch.Size([3, 128, 128])
+17:41:56 - INFO - Sample mask shape: torch.Size([1, 128, 128])
+17:41:56 - INFO - Requested patch size: 128
+17:42:06 - INFO - Best model saved! (Dice: 0.0000)
+17:42:24 - INFO - Using device cuda
+17:42:24 - INFO - Training configuration:
+17:42:24 - INFO - - Patch size: 128
+17:42:24 - INFO - - Scale: 0.25
+17:42:24 - INFO - - Batch size: 1
+17:42:24 - INFO - - Learning rate: 0.0001
+17:42:24 - INFO - Creating train dataset with 54 examples
+17:42:24 - INFO - Creating val dataset with 27 examples
+17:42:24 - INFO - Dataset sizes:
+17:42:24 - INFO - - Training: 54 images
+17:42:24 - INFO - - Validation: 27 images
+17:42:27 - INFO - Starting training:
+    Epochs:          50
+    Batch size:      1
+    Learning rate:   0.0001
+    Training size:   54
+    Validation size: 27
+    Checkpoints:     True
+    Device:          cuda
+    Images scaling:  0.25
+    Mixed Precision: True
+    
+17:42:27 - INFO - Calculating class weights...
+17:42:33 - INFO - Positive class weight: 5.00
+17:42:33 - INFO - Sample image shape: torch.Size([3, 128, 128])
+17:42:33 - INFO - Sample mask shape: torch.Size([1, 128, 128])
+17:42:33 - INFO - Requested patch size: 128
+17:42:43 - INFO - Best model saved! (Dice: 0.0000)
+17:42:55 - INFO - Best model saved! (Dice: 0.0346)
