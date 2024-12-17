@@ -115,3 +115,85 @@ class BasicDataset(Dataset):
 class CarvanaDataset(BasicDataset):
     def __init__(self, images_dir, mask_dir, scale=1):
         super().__init__(images_dir, mask_dir, scale, mask_suffix='_mask')
+
+
+class IDRIDDataset(Dataset):
+    def __init__(self, base_dir: str, split: str = 'train', scale: float = 0.25):
+        """
+        Args:
+            base_dir: Root directory of the dataset
+            split: 'train' or 'val'
+            scale: Scale factor for image resizing
+        """
+        self.scale = scale
+        
+        # Setup directories
+        self.images_dir = Path(base_dir) / 'imgs' / split
+        self.masks_dir = Path(base_dir) / 'masks' / split
+        
+        # Define the lesion classes
+        self.classes = ['MA', 'HE', 'EX', 'SE', 'OD']
+        
+        # Get all image files (only .jpg files)
+        self.ids = [splitext(file)[0] for file in listdir(self.images_dir) 
+                   if file.endswith('.jpg')]
+        
+        if not self.ids:
+            raise RuntimeError(f'No input file found in {self.images_dir}')
+        
+        logging.info(f'Creating {split} dataset with {len(self.ids)} examples')
+
+    def __len__(self):
+        return len(self.ids)
+
+    @staticmethod
+    def preprocess(pil_img, scale, is_mask):
+        w, h = pil_img.size
+        newW, newH = int(scale * w), int(scale * h)
+        assert newW > 0 and newH > 0, 'Scale is too small'
+        
+        pil_img = pil_img.resize((newW, newH), 
+                                resample=Image.NEAREST if is_mask else Image.BICUBIC)
+        img_np = np.asarray(pil_img)
+
+        if is_mask:
+            return (img_np > 0).astype(np.float32)  # Binary mask
+        else:
+            # Normalize image to [0, 1] range
+            if img_np.ndim == 2:
+                img_np = img_np[np.newaxis, ...]
+            else:
+                img_np = img_np.transpose((2, 0, 1))
+            
+            if img_np.max() > 1:
+                img_np = img_np / 255.0
+                
+            return img_np
+
+    def __getitem__(self, idx):
+        img_id = self.ids[idx]
+        
+        # Load image
+        img_file = self.images_dir / f"{img_id}.jpg"
+        img = load_image(img_file)
+        
+        # Create multi-channel mask (5 channels for 5 classes)
+        w, h = img.size
+        mask = np.zeros((len(self.classes), int(h * self.scale), int(w * self.scale)), 
+                       dtype=np.float32)
+        
+        # Load available masks for each class
+        for i, class_name in enumerate(self.classes):
+            mask_file = self.masks_dir / f"{img_id}_{class_name}.tif"
+            if mask_file.exists():
+                class_mask = load_image(mask_file)
+                mask[i] = self.preprocess(class_mask, self.scale, is_mask=True)
+        
+        # Preprocess image
+        img = self.preprocess(img, self.scale, is_mask=False)
+        
+        return {
+            'image': torch.as_tensor(img.copy()).float().contiguous(),
+            'mask': torch.as_tensor(mask.copy()).float().contiguous(),
+            'img_id': img_id
+        }
