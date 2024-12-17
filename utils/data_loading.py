@@ -119,20 +119,15 @@ class CarvanaDataset(BasicDataset):
 
 class IDRIDDataset(Dataset):
     def __init__(self, base_dir: str, split: str = 'train', scale: float = 0.25):
-        """
-        Args:
-            base_dir: Root directory of the dataset
-            split: 'train' or 'val'
-            scale: Scale factor for image resizing
-        """
         self.scale = scale
         
         # Setup directories
         self.images_dir = Path(base_dir) / 'imgs' / split
         self.masks_dir = Path(base_dir) / 'masks' / split
         
-        # Define the lesion classes
+        # Define the lesion classes and their corresponding directories
         self.classes = ['MA', 'HE', 'EX', 'SE', 'OD']
+        self.class_dirs = ['MA', 'HA', 'EX', 'SE', 'OD']  # Added mapping for actual directory names
         
         # Get all image files (only .jpg files)
         self.ids = [splitext(file)[0] for file in listdir(self.images_dir) 
@@ -183,8 +178,8 @@ class IDRIDDataset(Dataset):
                        dtype=np.float32)
         
         # Load available masks for each class
-        for i, class_name in enumerate(self.classes):
-            mask_file = self.masks_dir / f"{img_id}_{class_name}.tif"
+        for i, (class_name, class_dir) in enumerate(zip(self.classes, self.class_dirs)):
+            mask_file = self.masks_dir / class_dir / f"{img_id}_{class_name}.tif"
             if mask_file.exists():
                 class_mask = load_image(mask_file)
                 mask[i] = self.preprocess(class_mask, self.scale, is_mask=True)

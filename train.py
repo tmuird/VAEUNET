@@ -153,18 +153,81 @@ def train_model(
                             'EX Dice': val_score['EX_dice'],
                             'SE Dice': val_score['SE_dice'],
                             'OD Dice': val_score['OD_dice'],
-                            'images': wandb.Image(images[0].cpu()),
+                            'images': wandb.Image(
+                                images[0].cpu(),
+                                caption='Input Image'
+                            ),
                             'masks': {
-                                'true_MA': wandb.Image(true_masks[0, 0].float().cpu()),
-                                'true_HE': wandb.Image(true_masks[0, 1].float().cpu()),
-                                'true_EX': wandb.Image(true_masks[0, 2].float().cpu()),
-                                'true_SE': wandb.Image(true_masks[0, 3].float().cpu()),
-                                'true_OD': wandb.Image(true_masks[0, 4].float().cpu()),
-                                'pred_MA': wandb.Image(torch.sigmoid(masks_pred[0, 0]).float().cpu()),
-                                'pred_HE': wandb.Image(torch.sigmoid(masks_pred[0, 1]).float().cpu()),
-                                'pred_EX': wandb.Image(torch.sigmoid(masks_pred[0, 2]).float().cpu()),
-                                'pred_SE': wandb.Image(torch.sigmoid(masks_pred[0, 3]).float().cpu()),
-                                'pred_OD': wandb.Image(torch.sigmoid(masks_pred[0, 4]).float().cpu()),
+                                'true_MA': wandb.Image(
+                                    true_masks[0, 0].float().cpu(),
+                                    caption='MA Ground Truth'
+                                ),
+                                'true_HE': wandb.Image(
+                                    true_masks[0, 1].float().cpu(),
+                                    caption='HE Ground Truth'
+                                ),
+                                'true_EX': wandb.Image(
+                                    true_masks[0, 2].float().cpu(),
+                                    caption='EX Ground Truth'
+                                ),
+                                'true_SE': wandb.Image(
+                                    true_masks[0, 3].float().cpu(),
+                                    caption='SE Ground Truth'
+                                ),
+                                'true_OD': wandb.Image(
+                                    true_masks[0, 4].float().cpu(),
+                                    caption='OD Ground Truth'
+                                ),
+                                'pred_MA': wandb.Image(
+                                    torch.sigmoid(masks_pred[0, 0]).float().cpu().detach(),
+                                    caption='MA Prediction'
+                                ),
+                                'pred_HE': wandb.Image(
+                                    torch.sigmoid(masks_pred[0, 1]).float().cpu().detach(),
+                                    caption='HE Prediction'
+                                ),
+                                'pred_EX': wandb.Image(
+                                    torch.sigmoid(masks_pred[0, 2]).float().cpu().detach(),
+                                    caption='EX Prediction'
+                                ),
+                                'pred_SE': wandb.Image(
+                                    torch.sigmoid(masks_pred[0, 3]).float().cpu().detach(),
+                                    caption='SE Prediction'
+                                ),
+                                'pred_OD': wandb.Image(
+                                    torch.sigmoid(masks_pred[0, 4]).float().cpu().detach(),
+                                    caption='OD Prediction'
+                                ),
+                            },
+                            'overlays': {
+                                'MA': wandb.Image(
+                                    images[0].cpu(),
+                                    masks={
+                                        "predictions": {
+                                            "mask_data": torch.sigmoid(masks_pred[0, 0]).float().cpu().detach().numpy(),
+                                            "class_labels": {1: "MA"}
+                                        },
+                                        "ground_truth": {
+                                            "mask_data": true_masks[0, 0].float().cpu().numpy(),
+                                            "class_labels": {1: "MA"}
+                                        }
+                                    },
+                                    caption='MA Overlay'
+                                ),
+                                'EX': wandb.Image(
+                                    images[0].cpu(),
+                                    masks={
+                                        "predictions": {
+                                            "mask_data": torch.sigmoid(masks_pred[0, 2]).float().cpu().detach().numpy(),
+                                            "class_labels": {1: "EX"}
+                                        },
+                                        "ground_truth": {
+                                            "mask_data": true_masks[0, 2].float().cpu().numpy(),
+                                            "class_labels": {1: "EX"}
+                                        }
+                                    },
+                                    caption='EX Overlay'
+                                )
                             },
                             'step': global_step,
                             'epoch': epoch
