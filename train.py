@@ -101,7 +101,7 @@ def train_model(
         mode='max',
         factor=0.5,       # Less aggressive reduction
         patience=15,      # Wait longer before reducing
-        min_lr=1e-5,     # Don't go too low
+        min_lr=1e-6,     # Don't go too low
         verbose=True
     )
     grad_scaler = torch.amp.GradScaler(enabled=amp)
