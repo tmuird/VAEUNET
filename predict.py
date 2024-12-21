@@ -18,7 +18,7 @@ def predict_img(net,
                 scale_factor=1,
                 out_threshold=0.5,
                 use_patches=True,
-                patch_size=400,
+                patch_size=None,
                 overlap=100):
     net.eval()
     
@@ -30,8 +30,8 @@ def predict_img(net,
     # Get dimensions
     _, c, h, w = img.shape
     
-    # If not using patches, predict on full image
-    if not use_patches:
+    # If not using patches or patch_size is None, predict on full image
+    if not use_patches or patch_size is None:
         with torch.no_grad():
             mask_pred = net(img)
             mask_pred = torch.sigmoid(mask_pred)
@@ -124,8 +124,8 @@ def get_args():
                         help='Scale factor for the input images')
     parser.add_argument('--no-patches', action='store_true',
                         help='Disable patch-based prediction')
-    parser.add_argument('--patch-size', '-p', type=int, default=400,
-                        help='Size of patches to use for prediction')
+    parser.add_argument('--patch-size', '-p', type=int, default=None,
+                        help='Size of patches to use for prediction (None for full image)')
     parser.add_argument('--overlap', type=int, default=100,
                         help='Overlap size between patches')
     parser.add_argument('--bilinear', action='store_true', default=False,

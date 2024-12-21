@@ -13,12 +13,11 @@ from torch import optim
 from torch.utils.data import DataLoader, random_split
 from tqdm import tqdm
 from typing import Optional
-
+from utils import metrics
 import wandb
 from evaluate import evaluate
 from unet import UNet
 from utils.data_loading import IDRIDDataset
-from utils.dice_score import dice_loss
 import numpy as np
 
 # Add CUDA error handling
@@ -42,11 +41,15 @@ def train_model(
         batch_size: int = 1,
         learning_rate: float = 1e-4,
         save_checkpoint: bool = True,
-        img_scale: float = 0.25,
-        patch_size: Optional[int] = 128,
+        img_scale: float = 1,
+        patch_size: Optional[int] = None,
         amp: bool = True,
+        bilinear: bool = False,
         gradient_clipping: float = 1.0,
 ):
+    # Initialize best_dice at the start
+    best_dice = 0.0
+    
     # Check if data directories exist
     data_dir = Path('./data')
     if not (data_dir / 'imgs' / 'train').exists():
@@ -79,7 +82,7 @@ def train_model(
     experiment = wandb.init(project='IDRID-UNET', resume='allow', anonymous='must')
     experiment.config.update(
         dict(epochs=epochs, batch_size=batch_size, learning_rate=learning_rate,
-             save_checkpoint=save_checkpoint, img_scale=img_scale, amp=amp)
+             save_checkpoint=save_checkpoint, img_scale=img_scale, amp=amp, patch_size=patch_size, classes=1, lesion_type='EX')
     )
 
     logging.info(f'''Starting training:
@@ -88,7 +91,7 @@ def train_model(
         Learning rate:   {learning_rate}
         Training size:   {len(train_dataset)}
         Validation size: {len(val_dataset)}
-        Checkpoints:     {save_checkpoint}
+        Checkpoints:     {save_checkpoint}godfather
         Device:          {device.type}
         Images scaling:  {img_scale}
         Mixed Precision: {amp}
@@ -99,34 +102,16 @@ def train_model(
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, 
         mode='max',
-        factor=0.5,       # Less aggressive reduction
-        patience=15,      # Wait longer before reducing
-        min_lr=1e-6,     # Don't go too low
-        verbose=True
+        patience=10,     # Reduce patience
+        min_lr=1e-6,
+        verbose=True,
+        factor=0.5
+        
     )
     grad_scaler = torch.amp.GradScaler(enabled=amp)
-    
-    # Modify the class weights calculation for binary classification
-    def calculate_class_weights(dataset):
-        pos_count = 0
-        total_pixels = 0
-        for sample in dataset:
-            mask = sample['mask']
-            pos_count += (mask > 0).float().sum()
-            total_pixels += mask.numel()
-        
-        neg_count = total_pixels - pos_count
-        # Calculate weights for background (0) and lesion (1)
-        weights = torch.tensor([neg_count, pos_count])
-        weights = 1.0 / (weights + 1e-8)
-        weights = weights / weights.sum()
-        
-        logging.info(f'Class weights calculated - Background: {weights[0]:.4f}, Lesion: {weights[1]:.4f}')
-        return weights.to(device)
+    criterion = nn.CrossEntropyLoss() if model.n_classes > 1 else nn.BCEWithLogitsLoss()
 
-    class_weights = calculate_class_weights(train_dataset)
-    criterion = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([10.0]).to(device))  # Weight positive examples more
-    
+
     # Modify loss calculation
     global_step = 0
 
@@ -151,46 +136,42 @@ def train_model(
         epoch_loss = 0
         with tqdm(total=len(train_dataset), desc=f'Epoch {epoch}/{epochs}', unit='img') as pbar:
             for batch in train_loader:
-                images = batch['image'].to(device=device, dtype=torch.float32)
-                true_masks = batch['mask'].to(device=device, dtype=torch.float32)
+                images = batch['image']
+                true_masks = batch['mask']
 
-                logging.debug(f"Batch image shape: {images.shape}")
-                logging.debug(f"Batch mask shape: {true_masks.shape}")
+                # Move to device and set requires_grad
+                images = images.to(device=device, dtype=torch.float32)
+                images.requires_grad = True
+                true_masks = true_masks.to(device=device, dtype=torch.float32)
 
-                with torch.autocast(device_type='cuda', enabled=amp):
+                with torch.autocast(device.type if device.type != 'mps' else 'cpu', enabled=amp):
                     masks_pred = model(images)
-                    logging.debug(f"Predicted mask shape: {masks_pred.shape}")
-                    
-                    # Ensure shapes match
-                    if masks_pred.shape != true_masks.shape:
-                        logging.error(f"Shape mismatch - Pred: {masks_pred.shape}, True: {true_masks.shape}")
-                        raise RuntimeError(f"Shape mismatch in model output")
+                    if model.n_classes == 1:
+                        # Combine Focal Loss and Dice Loss
+                        focal = metrics.focal_loss(
+                            masks_pred, 
+                            true_masks.float(),
+                            alpha=0.85,    # Higher alpha because exudates are very sparse
+                            gamma=2.5      # Higher gamma to focus on hard examples
+                        )
+                        dice = metrics.dice_loss(
+                            torch.sigmoid(masks_pred), 
+                            true_masks, 
+                            multiclass=False
+                        )
+                        
+                        # Balance between Focal and Dice
+                        loss = 0.4 * focal + 0.6 * dice  # More weight on Dice for better boundary detection
+                    else:
+                        loss = criterion(masks_pred, true_masks)
 
-                    # Add loss debugging
-                    if global_step % 10 == 0:  # Log every 10 steps
-                        with torch.no_grad():
-                            pred_sigmoid = torch.sigmoid(masks_pred)
-                            pos_pixels = (true_masks > 0.5).float().sum()
-                            pred_pos_pixels = (pred_sigmoid > 0.5).float().sum()
-                            logging.info(f'Positive pixels - True: {pos_pixels.item()}, Predicted: {pred_pos_pixels.item()}')
-
-                    # Calculate BCE loss
-                    bce_loss = criterion(masks_pred, true_masks)
-                    # Add Dice loss
-                    dice = dice_loss(
-                        torch.sigmoid(masks_pred), 
-                        true_masks,
-                        multiclass=False  # Changed to False since we're doing binary
-                    )
-                    # Combine losses with weighting
-                    loss = bce_loss + dice
+                
 
                 optimizer.zero_grad(set_to_none=True)
                 grad_scaler.scale(loss).backward()
+                grad_scaler.unscale_(optimizer)
                 
-                if gradient_clipping > 0:
-                    grad_scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clipping)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clipping)
                 
                 grad_scaler.step(optimizer)
                 grad_scaler.update()
@@ -209,52 +190,73 @@ def train_model(
                 division_step = (len(train_dataset) // (5 * batch_size))
                 if division_step > 0:
                     if global_step % division_step == 0:
-                        val_score = evaluate(model, val_loader, device, amp)
-                        scheduler.step(val_score['mean_dice'])
-                        
-                        # Log validation metrics
-                        experiment.log({
-                            'learning rate': optimizer.param_groups[0]['lr'],
-                            'validation Dice': val_score['mean_dice'],
-                            'epoch': epoch
-                        })
 
-                        # Log a batch of validation images
+                        val_metrics = evaluate(model, val_loader, device, amp)
+                        # Update scheduler with dice score
+                        scheduler.step(val_metrics['dice'])
+                        
+                        # Log validation metrics to wandb
+                        experiment.log({
+                            **{f'val/{k}': v for k, v in val_metrics.items()},
+                            'epoch': epoch,
+                            'step': global_step,
+                            'learning_rate': optimizer.param_groups[0]['lr']
+                        })
                         with torch.no_grad():
-                            # Get a batch of validation images
+                            # Get a validation batch for visualization
                             val_batch = next(iter(val_loader))
-                            images = val_batch['image']
-                            true_masks = val_batch['mask']
+                            val_images = val_batch['image'].to(device=device, dtype=torch.float32)
+                            val_masks = val_batch['mask'].to(device=device, dtype=torch.float32)
+
+                            # Get predictions for the validation batch
+                            model.eval()  # Ensure model is in eval mode
+
+                            val_masks_pred = model(val_images)
+                            val_masks_pred = torch.sigmoid(val_masks_pred)
+
+                        # Log images and masks to wandb
+                        if val_images is not None:
+                            # Get first image from batch
+                            img = val_images[0].cpu().numpy()  # Change to HWC format
+                            pred_mask = val_masks_pred[0].cpu().numpy()
+                            true_mask = val_masks[0].cpu().numpy()
                             
-                            # Get model prediction
-                            model.eval()
-                            mask_pred = model(images.to(device))
-                            mask_pred = torch.sigmoid(mask_pred)
-                            
-                            # Convert to numpy for visualization
-                            img = images[0].cpu().numpy()
-                            true_mask = true_masks[0].cpu().numpy()
-                            pred_mask = mask_pred[0].cpu().numpy()
-                            
-                            # Debug logging
-                            logging.info(f'Validation sample ranges:')
-                            logging.info(f'- True mask: min={true_mask.min():.3f}, max={true_mask.max():.3f}')
-                            logging.info(f'- Pred mask: min={pred_mask.min():.3f}, max={pred_mask.max():.3f}')
-                            
-                            # Ensure proper normalization for visualization
+
+                            logging.info(f'Mask shapes - Pred: {pred_mask.shape}, True: {true_mask.shape}')
+                            logging.info(f'Mask values - Pred: min={pred_mask.min()}, max={pred_mask.max()}, True: min={true_mask.min()}, max={true_mask.max()}')
+                                                        # Ensure proper normalization for visualization
                             img = img.transpose(1, 2, 0)  # CHW -> HWC
                             img = (img * 255).astype(np.uint8)
                             true_mask = (true_mask[0] * 255).astype(np.uint8)  # Take first channel
                             pred_mask = (pred_mask[0] * 255).astype(np.uint8)  # Take first channel
                             
                             experiment.log({
-                                'validation sample': {
-                                    'image': wandb.Image(img),
-                                    'true_mask': wandb.Image(true_mask),
-                                    'pred_mask': wandb.Image(pred_mask),
-                                }
+                                'validation_images': wandb.Image(
+                                    img,  # Original image
+                                    masks={
+                                        "predictions": {
+                                            "mask_data": pred_mask,
+                                            "class_labels": {1: "lesion"}
+                                        },
+                                        "ground_truth": {
+                                            "mask_data": true_mask,
+                                            "class_labels": {1: "lesion"}
+                                        }
+                                    }
+                                )
                             })
-                            model.train()
+                        
+                        model.train()  # Set model back to training mode
+
+
+
+                        # Save best model based on dice score
+                        if val_metrics['dice'] > best_dice:
+                            best_dice = val_metrics['dice']
+                            Path(dir_checkpoint).mkdir(parents=True, exist_ok=True)
+                            state_dict = model.state_dict()
+                            torch.save(state_dict, str(dir_checkpoint / 'best_model.pth'))
+                            logging.info(f'Best model saved! Dice score: {val_metrics["dice"]:.4f}')
 
         if save_checkpoint:
             Path(dir_checkpoint).mkdir(parents=True, exist_ok=True)
@@ -278,6 +280,10 @@ def get_args():
     parser.add_argument('--amp', action='store_true', default=True, help='Use mixed precision')
     parser.add_argument('--classes', '-c', type=int, default=1, help='Number of classes')
     parser.add_argument('--gradient-clipping', type=float, default=1.0, help='Gradient clipping value')
+    parser.add_argument('--use-checkpointing', action='store_true', default=True,
+                        help='Use gradient checkpointing to reduce memory usage')
+    parser.add_argument('--bilinear', action='store_true', default=False,
+                        help='Use bilinear upsampling')
     return parser.parse_args()
 
 
@@ -299,11 +305,17 @@ if __name__ == '__main__':
     logging.info(f'- Batch size: {args.batch_size}')
     logging.info(f'- Learning rate: {args.learning_rate}')
 
-    model = UNet(n_channels=3, n_classes=1, bilinear=False)
-    model = model.to(device=device)
+    model = UNet(
+        n_channels=3, 
+        n_classes=1, 
+        bilinear=args.bilinear,
+        use_checkpointing=args.use_checkpointing
+    )
+    model = model.to(memory_format=torch.channels_last)
     
     if args.load:
         state_dict = torch.load(args.load, map_location=device)
+        del state_dict['mask_values']
         model.load_state_dict(state_dict)
         logging.info(f'Model loaded from {args.load}')
 
@@ -317,13 +329,19 @@ if __name__ == '__main__':
             img_scale=args.scale,
             patch_size=args.patch_size,
             amp=args.amp,
-            gradient_clipping=args.gradient_clipping
         )
     except torch.cuda.OutOfMemoryError:
         logging.error('Detected OutOfMemoryError! '
                      'Try reducing the batch size or image scale.')
-        raise
-    except KeyboardInterrupt:
-        torch.save(model.state_dict(), 'INTERRUPTED.pth')
-        logging.info('Saved interrupt')
-        raise
+        torch.cuda.empty_cache()
+        model.use_checkpointing()
+        train_model(
+            model=model,
+            epochs=args.epochs,
+            batch_size=args.batch_size,
+            learning_rate=args.learning_rate,
+            device=device,
+            img_scale=args.scale,
+            patch_size=args.patch_size,
+            amp=args.amp
+        )
