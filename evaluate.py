@@ -30,7 +30,7 @@ def evaluate(model, dataloader, device, amp):
             mask_pred = model(image)
 
             # convert to probabilities
-            mask_pred = (torch.sigmoid(mask_pred) > 0.5).float()
+            mask_pred = (F.sigmoid(mask_pred) > 0.5).float()
 
             # compute metrics for this batch
             batch_metrics = get_all_metrics(mask_pred,mask_true)

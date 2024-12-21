@@ -34,11 +34,20 @@ dir_mask = Path('./data/masks/')
 dir_checkpoint = Path('./checkpoints/')
 
 
+def collate_patches(batch):
+    """Custom collate function to handle patches"""
+    return {
+        'image': torch.stack([x['image'] for x in batch]),
+        'mask': torch.stack([x['mask'] for x in batch]),
+        'img_id': [x['img_id'] for x in batch]
+    }
+
+
 def train_model(
         model,
         device,
         epochs: int = 50,
-        batch_size: int = 1,
+        batch_size: int = 4,
         learning_rate: float = 1e-4,
         save_checkpoint: bool = True,
         img_scale: float = 1,
@@ -46,7 +55,18 @@ def train_model(
         amp: bool = True,
         bilinear: bool = False,
         gradient_clipping: float = 1.0,
+        max_images: Optional[int] = None,
 ):
+    # Clear cache at start
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        logging.info(f"""
+Initial GPU Status:
+- GPU: {torch.cuda.get_device_name()}
+- Memory Allocated: {torch.cuda.memory_allocated()/1e9:.2f}GB
+- Memory Reserved: {torch.cuda.memory_reserved()/1e9:.2f}GB
+""")
+
     # Initialize best_dice at the start
     best_dice = 0.0
     
@@ -57,29 +77,36 @@ def train_model(
     if not (data_dir / 'masks' / 'train').exists():
         raise RuntimeError(f"Training masks directory not found at {data_dir / 'masks' / 'train'}")
 
+    logging.info(f'Loading datasets with patch size: {patch_size} and max images: {max_images}')
     # Load datasets with logging
     train_dataset = IDRIDDataset(base_dir='./data', split='train', 
                                 scale=img_scale, patch_size=patch_size,
-                                lesion_type='EX')
+                                lesion_type='EX',
+                                max_images=max_images )
     val_dataset = IDRIDDataset(base_dir='./data', split='val', 
                               scale=img_scale, patch_size=patch_size,
-                              lesion_type='EX')
+                              lesion_type='EX',
+                              max_images=max_images )
     
     logging.info(f'Dataset sizes:')
     logging.info(f'- Training: {len(train_dataset)} images')
     logging.info(f'- Validation: {len(val_dataset)} images')
 
     # Create data loaders
-    loader_args = dict(batch_size=batch_size, num_workers=4, pin_memory=True)
-    train_loader = DataLoader(train_dataset, shuffle=True, **loader_args)
+    loader_args = dict(batch_size=batch_size, num_workers=0, pin_memory=True)
+    train_loader = DataLoader(
+        train_dataset,
+        shuffle=False,
+        **loader_args
+    )
     val_loader = DataLoader(val_dataset, 
                            shuffle=False, 
-                           batch_size=1,  # Force batch_size=1 for validation
-                           num_workers=1, 
-                           pin_memory=True)
+                           **loader_args,
+                           )
 
-    # Initialize logging
-    experiment = wandb.init(project='IDRID-UNET', resume='allow', anonymous='must')
+    # Initialize loggingrime
+    experiment = wandb.init(project='IDRID-UNET',resume='allow', anonymous='must'
+    )
     experiment.config.update(
         dict(epochs=epochs, batch_size=batch_size, learning_rate=learning_rate,
              save_checkpoint=save_checkpoint, img_scale=img_scale, amp=amp, patch_size=patch_size, classes=1, lesion_type='EX')
@@ -91,10 +118,12 @@ def train_model(
         Learning rate:   {learning_rate}
         Training size:   {len(train_dataset)}
         Validation size: {len(val_dataset)}
-        Checkpoints:     {save_checkpoint}godfather
+        Checkpoints:     {save_checkpoint}
         Device:          {device.type}
         Images scaling:  {img_scale}
         Mixed Precision: {amp}
+        Patch size:      {patch_size}
+        Max images:      {max_images}
     ''')
 
     # Use appropriate optimizer
@@ -130,44 +159,54 @@ def train_model(
     if torch.cuda.is_available():
         logging.info(f"GPU Memory before data loading: {torch.cuda.memory_allocated()/1024**2:.2f}MB")
 
+    # At start of training
+    if torch.cuda.is_available():
+        logging.info(f"Using GPU: {torch.cuda.get_device_name()}")
+        logging.info(f"AMP enabled: {amp}")
+        
     # 5. Begin training
     for epoch in range(1, epochs + 1):
+        current_image=None
+        patches_processed=0
         model.train()
         epoch_loss = 0
-        with tqdm(total=len(train_dataset), desc=f'Epoch {epoch}/{epochs}', unit='img') as pbar:
-            for batch in train_loader:
-                images = batch['image']
-                true_masks = batch['mask']
+        image_patches = {}  # Track patches per image
+        
+        with tqdm(total=len(train_loader), desc=f'Epoch {epoch}/{epochs}', unit='batch') as pbar:
+            for batch_idx, batch in enumerate(train_loader):
+                # Track memory before batch
+                mem_before = torch.cuda.memory_allocated()/1e9
 
-                # Move to device and set requires_grad
-                images = images.to(device=device, dtype=torch.float32)
-                images.requires_grad = True
-                true_masks = true_masks.to(device=device, dtype=torch.float32)
+                # Move to GPU and track memory
+                images = batch['image'].to(device)
+                masks = batch['mask'].to(device)
+                mem_after_transfer = torch.cuda.memory_allocated()/1e9
 
+                # Forward pass with AMP
                 with torch.autocast(device.type if device.type != 'mps' else 'cpu', enabled=amp):
                     masks_pred = model(images)
                     if model.n_classes == 1:
-                        # Combine Focal Loss and Dice Loss
+                        # Adjust Focal Loss parameters for severe imbalance
                         focal = metrics.focal_loss(
                             masks_pred, 
-                            true_masks.float(),
-                            alpha=0.85,    # Higher alpha because exudates are very sparse
-                            gamma=2.5      # Higher gamma to focus on hard examples
+                            masks.float(),
+                            alpha=0.95,    # Increase alpha (weight for positive class) significantly
+                            gamma=4.0      # Increase gamma to focus more on hard examples
                         )
                         dice = metrics.dice_loss(
                             torch.sigmoid(masks_pred), 
-                            true_masks, 
+                            masks, 
                             multiclass=False
                         )
                         
-                        # Balance between Focal and Dice
-                        loss = 0.4 * focal + 0.6 * dice  # More weight on Dice for better boundary detection
+                        # Adjust loss weights to emphasize Focal Loss
+                        loss = 0.7 * focal + 0.3 * dice  # Give more weight to Focal Loss
                     else:
-                        loss = criterion(masks_pred, true_masks)
+                        loss = criterion(masks_pred, masks)
 
-                
+                mem_after_forward = torch.cuda.memory_allocated()/1e9
 
-                optimizer.zero_grad(set_to_none=True)
+                # Backward pass with scaler
                 grad_scaler.scale(loss).backward()
                 grad_scaler.unscale_(optimizer)
                 
@@ -175,8 +214,70 @@ def train_model(
                 
                 grad_scaler.step(optimizer)
                 grad_scaler.update()
+                optimizer.zero_grad(set_to_none=True)
+                mem_after_backward = torch.cuda.memory_allocated()/1e9
 
-                pbar.update(images.shape[0])
+                # if batch_idx % 1 == 0:  # Log every batch
+                #     logging.info(f"""
+# Batch {batch_idx} Memory (GB):
+# - Before batch: {mem_before:.2f}
+# - After transfer: {mem_after_transfer:.2f}
+# - After forward: {mem_after_forward:.2f}
+# - After backward: {mem_after_backward:.2f}
+# Image shape: {images.shape}
+# """)
+                with torch.no_grad():
+                    train_images = batch['image'].to(device=device, dtype=torch.float32)
+                    train_masks = batch['mask'].to(device=device, dtype=torch.float32)
+
+                    model.eval()
+                    train_masks_pred = model(train_images)
+                    train_masks_pred = torch.sigmoid(train_masks_pred)
+
+                    # Select random index
+                    idx = random.randint(0, len(train_images) - 1)
+                    
+                    # Get images and masks
+                    img = train_images[idx].cpu().numpy()
+                    pred_mask = train_masks_pred[idx].cpu().numpy()
+                    true_mask = train_masks[idx].cpu().numpy()
+                    
+#                     logging.info(f"""
+# Selected patch visualization details:
+# Image: shape={img.shape}, range=[{img.min():.3f}, {img.max():.3f}]
+# True mask: shape={true_mask.shape}, range=[{true_mask.min():.3f}, {true_mask.max():.3f}]
+# Pred mask: shape={pred_mask.shape}, range=[{pred_mask.min():.3f}, {pred_mask.max():.3f}]
+# """)
+
+                    # Prepare image for wandb (HWC format, 0-255 range)
+                    img = img.transpose(1, 2, 0)  # [C,H,W] -> [H,W,C]
+                    img = np.clip(img * 255, 0, 255).astype(np.uint8)
+                    
+                    # Prepare masks for wandb (HW format, 0-255 range)
+                    true_mask = np.clip(true_mask[0] * 255, 0, 255).astype(np.uint8)  # Remove channel dim and scale
+                    pred_mask = np.clip(pred_mask[0] * 255, 0, 255).astype(np.uint8)  # Remove channel dim and scale
+
+                    experiment.log({
+                                'train_images': wandb.Image(
+                                    img,  # Original image
+                                    masks={
+                                        "predictions": {
+                                            "mask_data": pred_mask,
+                                            "class_labels": {1: "lesion"}
+                                        },
+                                        "ground_truth": {
+                                            "mask_data": true_mask,
+                                            "class_labels": {1: "lesion"}
+                                        }
+                                    }
+                                )
+                    })
+                    
+                # Clean up
+                del images, masks, masks_pred
+                torch.cuda.empty_cache()
+              
+                pbar.update(1)
                 global_step += 1
                 epoch_loss += loss.item()
                 experiment.log({
@@ -202,50 +303,7 @@ def train_model(
                             'step': global_step,
                             'learning_rate': optimizer.param_groups[0]['lr']
                         })
-                        with torch.no_grad():
-                            # Get a validation batch for visualization
-                            val_batch = next(iter(val_loader))
-                            val_images = val_batch['image'].to(device=device, dtype=torch.float32)
-                            val_masks = val_batch['mask'].to(device=device, dtype=torch.float32)
-
-                            # Get predictions for the validation batch
-                            model.eval()  # Ensure model is in eval mode
-
-                            val_masks_pred = model(val_images)
-                            val_masks_pred = torch.sigmoid(val_masks_pred)
-
-                        # Log images and masks to wandb
-                        if val_images is not None:
-                            # Get first image from batch
-                            img = val_images[0].cpu().numpy()  # Change to HWC format
-                            pred_mask = val_masks_pred[0].cpu().numpy()
-                            true_mask = val_masks[0].cpu().numpy()
-                            
-
-                            logging.info(f'Mask shapes - Pred: {pred_mask.shape}, True: {true_mask.shape}')
-                            logging.info(f'Mask values - Pred: min={pred_mask.min()}, max={pred_mask.max()}, True: min={true_mask.min()}, max={true_mask.max()}')
-                                                        # Ensure proper normalization for visualization
-                            img = img.transpose(1, 2, 0)  # CHW -> HWC
-                            img = (img * 255).astype(np.uint8)
-                            true_mask = (true_mask[0] * 255).astype(np.uint8)  # Take first channel
-                            pred_mask = (pred_mask[0] * 255).astype(np.uint8)  # Take first channel
-                            
-                            experiment.log({
-                                'validation_images': wandb.Image(
-                                    img,  # Original image
-                                    masks={
-                                        "predictions": {
-                                            "mask_data": pred_mask,
-                                            "class_labels": {1: "lesion"}
-                                        },
-                                        "ground_truth": {
-                                            "mask_data": true_mask,
-                                            "class_labels": {1: "lesion"}
-                                        }
-                                    }
-                                )
-                            })
-                        
+                   
                         model.train()  # Set model back to training mode
 
 
@@ -267,9 +325,9 @@ def train_model(
 
 def get_args():
     parser = argparse.ArgumentParser(description='Train the UNet on images and target masks')
-    parser.add_argument('--epochs', '-e', metavar='E', type=int, default=100, help='Number of epochs')
-    parser.add_argument('--batch-size', '-b', dest='batch_size', metavar='B', type=int, default=2, help='Batch size')
-    parser.add_argument('--learning-rate', '-l', metavar='LR', type=float, default=1e-3, help='Learning rate')
+    parser.add_argument('--epochs', '-e', metavar='E', type=int, default=100, help='Number of ep8chs')
+    parser.add_argument('--batch-size', '-b', dest='batch_size', metavar='B', type=int, default=8, help='Batch size')
+    parser.add_argument('--learning-rate', '-l', metavar='LR', type=float, default=1e-4, help='Learning rate')
     parser.add_argument('--load', '-f', type=str, default=False, help='Load model from a .pth file')
     parser.add_argument('--scale', '-s', type=float, default=1.0, help='Downscaling factor of the images')
     parser.add_argument('--patch-size', '-p', type=lambda x: None if x.lower() == 'none' else int(x), 
@@ -284,6 +342,7 @@ def get_args():
                         help='Use gradient checkpointing to reduce memory usage')
     parser.add_argument('--bilinear', action='store_true', default=False,
                         help='Use bilinear upsampling')
+    parser.add_argument('--max-images', type=int, default=None, help='Maximum number of images to process')
     return parser.parse_args()
 
 
@@ -309,7 +368,6 @@ if __name__ == '__main__':
         n_channels=3, 
         n_classes=1, 
         bilinear=args.bilinear,
-        use_checkpointing=args.use_checkpointing
     )
     model = model.to(memory_format=torch.channels_last)
     
@@ -328,6 +386,7 @@ if __name__ == '__main__':
             device=device,
             img_scale=args.scale,
             patch_size=args.patch_size,
+            max_images=args.max_images,
             amp=args.amp,
         )
     except torch.cuda.OutOfMemoryError:
@@ -343,5 +402,6 @@ if __name__ == '__main__':
             device=device,
             img_scale=args.scale,
             patch_size=args.patch_size,
+            max_images=args.max_images,
             amp=args.amp
         )

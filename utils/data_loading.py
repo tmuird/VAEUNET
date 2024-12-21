@@ -16,7 +16,6 @@ from typing import Optional
 import random
 import os
 
-
 def load_image(filename):
     ext = splitext(filename)[1]
     if ext == '.npy':
@@ -122,7 +121,10 @@ class CarvanaDataset(BasicDataset):
 
 
 class IDRIDDataset(Dataset):
-    def __init__(self, base_dir: str, split: str = 'train', scale: float = 0.25, patch_size: Optional[int] = None, lesion_type: str = 'EX'):
+    def __init__(self, base_dir: str, split: str = 'train', scale: float = 0.25, 
+                 patch_size: Optional[int] = None, lesion_type: str = 'EX',
+                 max_images: Optional[int] = None):
+        super().__init__()
         self.scale = scale
         self.patch_size = patch_size
         
@@ -139,8 +141,11 @@ class IDRIDDataset(Dataset):
         logging.info(f'- Images: {self.images_dir}')
         logging.info(f'- Masks: {self.masks_dir / self.class_dir}')
         
-        # Get image files
+        # Get image files and optionally limit them
         self.ids = [splitext(file)[0] for file in listdir(self.images_dir) if file.endswith('.jpg')]
+        if max_images is not None:
+            self.ids = self.ids[:max_images]  # Take only first n images
+            logging.info(f'Limited dataset to {max_images} images for testing')
         
         # Verify mask files exist
         for img_id in self.ids:
@@ -154,10 +159,70 @@ class IDRIDDataset(Dataset):
                     logging.warning(f'Mask for {img_id} is all zeros')
                 else:
                     logging.info(f'Found valid mask for {img_id} with values in range [{mask.min()}, {mask.max()}]')
+        
+        # Pre-calculate all patches for all images
+        self.patches = {}  # Will store all patches for each image
+        self.patch_indices = []  # Flat list of (img_id, patch_idx) for __getitem__
+        self.precompute_all_patches()
+        
+    def precompute_all_patches(self):
+        """Precompute all patches for all images once at initialization"""
+        logging.info("Precomputing patches for all images...")
+        
+        for img_id in tqdm(self.ids, desc="Precomputing patches"):
+            # Load image and mask
+            img_file = self.images_dir / f"{img_id}.jpg"
+            mask_file = self.masks_dir / self.class_dir / f"{img_id}_{self.lesion_type}.tif"
+            
+            img = self.preprocess(load_image(img_file), self.scale, is_mask=False)
+            mask = self.preprocess(load_image(mask_file), self.scale, is_mask=True)
+            
+            # Convert to tensors
+            img = torch.as_tensor(img.copy()).float()
+            mask = torch.as_tensor(mask.copy()).float()
+            logging.info(f"{img_id}: image shape {img.shape}, mask shape {mask.shape}")
 
+            if mask.dim() == 2:
+                mask = mask.unsqueeze(0)
+            
+            # Calculate patches
+            _, h, w = img.shape
+            stride = self.patch_size // 2
+            
+            patches = []
+            patch_info = []  # Store coordinates and lesion info
+            
+            for y in range(0, h - self.patch_size + 1, stride):
+                for x in range(0, w - self.patch_size + 1, stride):
+                    # Extract patches
+                    img_patch = img[:, y:y+self.patch_size, x:x+self.patch_size]
+                    mask_patch = mask[:, y:y+self.patch_size, x:x+self.patch_size]
+                    
+                    # Check if patch contains lesion
+                    has_lesion = torch.any(mask_patch > 0.5)
+                    
+                    # Store patch and its metadata
+                    patches.append({
+                        'image': img_patch,
+                        'mask': mask_patch,
+                        'coords': (y, x),
+                        'has_lesion': has_lesion
+                    })
+                    
+                    # Add to global index
+                    self.patch_indices.append((img_id, len(patches) - 1))
+            
+            self.patches[img_id] = patches
+            
+            # Log statistics
+            n_lesion = sum(1 for p in patches if p['has_lesion'])
+            logging.info(f"Image {img_id}: {len(patches)} patches ({n_lesion} with lesions)")
+    
     def __len__(self):
-        return len(self.ids)
-
+        """Return total number of patches across all images"""
+        return len(self.patch_indices)
+    
+    
     def preprocess(self, img, scale, is_mask=False):
         if isinstance(img, np.ndarray):
             h, w = img.shape[:2]
@@ -181,94 +246,17 @@ class IDRIDDataset(Dataset):
             #logging.info(f'Mask values after preprocessing: min={mask.min()}, max={mask.max()}, unique={np.unique(mask)}')
             return (mask > 0).astype(np.float32)
 
-    def get_random_patch(self, image, mask):
-        """Extract random patch from image and mask, with higher probability around lesions"""
-        _, h, w = image.shape
-        
-        if h < self.patch_size or w < self.patch_size:
-            raise ValueError(f"Image size ({h}x{w}) is smaller than patch size ({self.patch_size})")
-
-        # Find lesion coordinates
-        lesion_coords = torch.nonzero(mask[0] > 0.5)  # [N, 2] tensor of (y, x) coordinates
-        
-        if len(lesion_coords) > 0 and random.random() < 0.8:  # 80% chance to sample from lesion areas
-            # Randomly select a lesion pixel
-            idx = random.randint(0, len(lesion_coords) - 1)
-            center_y, center_x = lesion_coords[idx]
-            
-            # Add some randomness to the center point
-            center_y = center_y + random.randint(-self.patch_size//4, self.patch_size//4)
-            center_x = center_x + random.randint(-self.patch_size//4, self.patch_size//4)
-            
-            # Ensure the patch fits within the image
-            center_y = torch.clamp(center_y, self.patch_size//2, h - self.patch_size//2)
-            center_x = torch.clamp(center_x, self.patch_size//2, w - self.patch_size//2)
-            
-            # Calculate patch coordinates
-            y = center_y - self.patch_size//2
-            x = center_x - self.patch_size//2
-        else:
-            # Random sampling for negative examples (20% of the time)
-            y = random.randint(0, h - self.patch_size)
-            x = random.randint(0, w - self.patch_size)
-        
-        # Extract patches
-        image_patch = image[:, y:y+self.patch_size, x:x+self.patch_size]
-        mask_patch = mask[:, y:y+self.patch_size, x:x+self.patch_size]
-        
-        # Verify patch contains data
-        if image_patch.shape != (3, self.patch_size, self.patch_size):
-            logging.error(f"Invalid patch shape: {image_patch.shape}")
-            raise ValueError(f"Invalid patch shape: {image_patch.shape}")
-        
-        # Log patch statistics
-        lesion_ratio = (mask_patch > 0.5).float().mean().item()
-        if lesion_ratio > 0:
-            logging.debug(f"Extracted patch with {lesion_ratio:.1%} lesion pixels")
-        
-        return image_patch, mask_patch
-
     def __getitem__(self, idx):
-        img_id = self.ids[idx]
+        """Get a specific patch by index"""
+        img_id, patch_idx = self.patch_indices[idx]
+        patch = self.patches[img_id][patch_idx]
         
-        # Load image
-        img_file = self.images_dir / f"{img_id}.jpg"
-        img = load_image(img_file)
-        
-        # Load mask with value checking
-        mask_file = self.masks_dir / self.class_dir / f"{img_id}_{self.lesion_type}.tif"
-        if mask_file.exists():
-            mask = load_image(mask_file)
-            mask = np.array(mask)
-            # Debug original mask values
-            #logging.info(f'Original mask values for {img_id}: min={mask.min()}, max={mask.max()}, unique={np.unique(mask)}')
-            if mask.ndim > 2:
-                mask = mask[..., 0]
-        else:
-            w, h = img.size
-            mask = np.zeros((h, w), dtype=np.float32)
-
-        # Preprocess
-        img = self.preprocess(img, self.scale, is_mask=False)
-        mask = self.preprocess(mask, self.scale, is_mask=True)
-
-        # Convert to tensors
-        img = torch.as_tensor(img.copy()).float()
-        mask = torch.as_tensor(mask.copy()).float()
-        
-        # Add channel dimension to mask if needed
-        if mask.dim() == 2:
-            mask = mask.unsqueeze(0)
-            
-        # Only apply patching if patch_size is set
-        if self.patch_size is not None:
-            img, mask = self.get_random_patch(img, mask)
-            
-        # Log final shapes
-        logging.debug(f'Final shapes - Image: {img.shape}, Mask: {mask.shape}')
-
         return {
-            'image': img.contiguous(),
-            'mask': mask.contiguous(),
-            'img_id': img_id
+            'image': patch['image'].contiguous(),
+            'mask': patch['mask'].contiguous(),
+            'img_id': f"{img_id}_patch_{patch['coords'][0]}_{patch['coords'][1]}"
         }
+    
+    def shuffle_patches(self):
+        """Shuffle the order of patches while maintaining data"""
+        random.shuffle(self.patch_indices)
