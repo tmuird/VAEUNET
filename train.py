@@ -96,7 +96,7 @@ Initial GPU Status:
     loader_args = dict(batch_size=batch_size, num_workers=0, pin_memory=True)
     train_loader = DataLoader(
         train_dataset,
-        shuffle=False,
+        shuffle=True,
         **loader_args
     )
     val_loader = DataLoader(val_dataset, 
@@ -138,7 +138,7 @@ Initial GPU Status:
         
     )
     grad_scaler = torch.amp.GradScaler(enabled=amp)
-    criterion = nn.CrossEntropyLoss() if model.n_classes > 1 else nn.BCEWithLogitsLoss()
+    criterion = nn.CrossEntropyLoss() if model.n_classes > 1 else nn.BCEWithLogitsLoss(pos_weight=torch.tensor(20.0))
 
 
     # Modify loss calculation
@@ -175,32 +175,31 @@ Initial GPU Status:
         with tqdm(total=len(train_loader), desc=f'Epoch {epoch}/{epochs}', unit='batch') as pbar:
             for batch_idx, batch in enumerate(train_loader):
                 # Track memory before batch
-                mem_before = torch.cuda.memory_allocated()/1e9
 
                 # Move to GPU and track memory
                 images = batch['image'].to(device)
                 masks = batch['mask'].to(device)
-                mem_after_transfer = torch.cuda.memory_allocated()/1e9
 
                 # Forward pass with AMP
                 with torch.autocast(device.type if device.type != 'mps' else 'cpu', enabled=amp):
                     masks_pred = model(images)
                     if model.n_classes == 1:
                         # Adjust Focal Loss parameters for severe imbalance
-                        focal = metrics.focal_loss(
-                            masks_pred, 
-                            masks.float(),
-                            alpha=0.95,    # Increase alpha (weight for positive class) significantly
-                            gamma=4.0      # Increase gamma to focus more on hard examples
-                        )
-                        dice = metrics.dice_loss(
-                            torch.sigmoid(masks_pred), 
-                            masks, 
-                            multiclass=False
-                        )
+                        # focal = metrics.focal_loss(
+                        #     masks_pred, 
+                        #     masks.float(),
+                        #     alpha=0.95,    # Increase alpha (weight for positive class) significantly
+                        #     gamma=4.0      # Increase gamma to focus more on hard examples
+                        # )
+                        # dice = metrics.dice_loss(
+                        #     torch.sigmoid(masks_pred), 
+                        #     masks, 
+                        #     multiclass=False
+                        # )
                         
                         # Adjust loss weights to emphasize Focal Loss
-                        loss = 0.7 * focal + 0.3 * dice  # Give more weight to Focal Loss
+                        # loss = 0.7 * focal + 0.3 * dice  # Give more weight to Focal Loss
+                        loss=criterion(masks_pred,masks)
                     else:
                         loss = criterion(masks_pred, masks)
 
@@ -226,53 +225,47 @@ Initial GPU Status:
 # - After backward: {mem_after_backward:.2f}
 # Image shape: {images.shape}
 # """)
-                with torch.no_grad():
-                    train_images = batch['image'].to(device=device, dtype=torch.float32)
-                    train_masks = batch['mask'].to(device=device, dtype=torch.float32)
+                # Log images every N batches (e.g. every 100 batches)
+                if batch_idx % 100 == 0:
+                    with torch.no_grad():
+                        train_images = batch['image'].to(device=device, dtype=torch.float32)
+                        train_masks = batch['mask'].to(device=device, dtype=torch.float32)
 
-                    model.eval()
-                    train_masks_pred = model(train_images)
-                    train_masks_pred = torch.sigmoid(train_masks_pred)
+                        model.eval()
+                        train_masks_pred = model(train_images)
+                        train_masks_pred = torch.sigmoid(train_masks_pred)
 
-                    # Select random index
-                    idx = random.randint(0, len(train_images) - 1)
-                    
-                    # Get images and masks
-                    img = train_images[idx].cpu().numpy()
-                    pred_mask = train_masks_pred[idx].cpu().numpy()
-                    true_mask = train_masks[idx].cpu().numpy()
-                    
-#                     logging.info(f"""
-# Selected patch visualization details:
-# Image: shape={img.shape}, range=[{img.min():.3f}, {img.max():.3f}]
-# True mask: shape={true_mask.shape}, range=[{true_mask.min():.3f}, {true_mask.max():.3f}]
-# Pred mask: shape={pred_mask.shape}, range=[{pred_mask.min():.3f}, {pred_mask.max():.3f}]
-# """)
+                        # Select random index
+                        idx = random.randint(0, len(train_images) - 1)
+                        
+                        # Get images and masks
+                        img = train_images[idx].cpu().numpy()
+                        pred_mask = train_masks_pred[idx].cpu().numpy()
+                        true_mask = train_masks[idx].cpu().numpy()
 
-                    # Prepare image for wandb (HWC format, 0-255 range)
-                    img = img.transpose(1, 2, 0)  # [C,H,W] -> [H,W,C]
-                    img = np.clip(img * 255, 0, 255).astype(np.uint8)
-                    
-                    # Prepare masks for wandb (HW format, 0-255 range)
-                    true_mask = np.clip(true_mask[0] * 255, 0, 255).astype(np.uint8)  # Remove channel dim and scale
-                    pred_mask = np.clip(pred_mask[0] * 255, 0, 255).astype(np.uint8)  # Remove channel dim and scale
+                        # Prepare image for wandb (HWC format, 0-255 range)
+                        img = img.transpose(1, 2, 0)  # [C,H,W] -> [H,W,C]
+                        img = np.clip(img * 255, 0, 255).astype(np.uint8)
+                        
+                        # Prepare masks for wandb (HW format, 0-255 range)
+                        true_mask = np.clip(true_mask[0] * 255, 0, 255).astype(np.uint8)  # Remove channel dim and scale
+                        pred_mask = np.clip(pred_mask[0] * 255, 0, 255).astype(np.uint8)  # Remove channel dim and scale
 
-                    experiment.log({
-                                'train_images': wandb.Image(
-                                    img,  # Original image
-                                    masks={
-                                        "predictions": {
-                                            "mask_data": pred_mask,
-                                            "class_labels": {1: "lesion"}
-                                        },
-                                        "ground_truth": {
-                                            "mask_data": true_mask,
-                                            "class_labels": {1: "lesion"}
+                        experiment.log({
+                                    'train_images': wandb.Image(
+                                        img,  # Original image
+                                        masks={
+                                            "predictions": {
+                                                "mask_data": pred_mask,
+                                                "class_labels": {1: "lesion"}
+                                            },
+                                            "ground_truth": {
+                                                "mask_data": true_mask,
+                                                "class_labels": {1: "lesion"}
+                                            }
                                         }
-                                    }
-                                )
-                    })
-                    
+                                    )
+                        })
                 # Clean up
                 del images, masks, masks_pred
                 torch.cuda.empty_cache()
