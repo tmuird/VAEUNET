@@ -34,6 +34,7 @@ dir_mask = Path('./data/masks/')
 dir_checkpoint = Path('./checkpoints/')
 
 
+
 def collate_patches(batch):
     """Custom collate function to handle patches"""
     return {
@@ -93,7 +94,7 @@ Initial GPU Status:
     logging.info(f'- Validation: {len(val_dataset)} images')
 
     # Create data loaders
-    loader_args = dict(batch_size=batch_size, num_workers=0, pin_memory=True)
+    loader_args = dict(batch_size=batch_size, num_workers=4, pin_memory=True)
     train_loader = DataLoader(
         train_dataset,
         shuffle=True,
@@ -138,7 +139,7 @@ Initial GPU Status:
         
     )
     grad_scaler = torch.amp.GradScaler(enabled=amp)
-    criterion = nn.CrossEntropyLoss() if model.n_classes > 1 else nn.BCEWithLogitsLoss(pos_weight=torch.tensor(20.0))
+    criterion = nn.CrossEntropyLoss() if model.n_classes > 1 else nn.BCEWithLogitsLoss()
 
 
     # Modify loss calculation
@@ -164,6 +165,32 @@ Initial GPU Status:
         logging.info(f"Using GPU: {torch.cuda.get_device_name()}")
         logging.info(f"AMP enabled: {amp}")
         
+    logging.info(f"Initial VRAM: {torch.cuda.memory_allocated()/1e9:.2f}GB")
+
+    # After creating dataloaders
+    logging.info(f"VRAM after dataloaders: {torch.cuda.memory_allocated()/1e9:.2f}GB")
+
+    # Before training starts
+    logging.info(f"VRAM before training: {torch.cuda.memory_allocated()/1e9:.2f}GB")
+    
+    # After model to device
+    model = model.to(device)
+    logging.info(f"VRAM after model to device: {torch.cuda.memory_allocated()/1e9:.2f}GB")
+    
+    # After optimizer creation
+    optimizer = optim.AdamW(model.parameters(), lr=learning_rate)
+    logging.info(f"VRAM after optimizer: {torch.cuda.memory_allocated()/1e9:.2f}GB")
+    
+    # First batch
+    for batch in train_loader:
+        images = batch['image'].to(device)
+        logging.info(f"Image batch shape: {images.shape}")
+        logging.info(f"VRAM after first batch: {torch.cuda.memory_allocated()/1e9:.2f}GB")
+        break
+
+    # At start of training
+    optimizer.zero_grad(set_to_none=True)  # Initial gradient clear
+
     # 5. Begin training
     for epoch in range(1, epochs + 1):
         current_image=None
@@ -177,8 +204,8 @@ Initial GPU Status:
                 # Track memory before batch
 
                 # Move to GPU and track memory
-                images = batch['image'].to(device)
-                masks = batch['mask'].to(device)
+                images = batch['image'].to(device, non_blocking=True)
+                masks = batch['mask'].to(device, non_blocking=True)
 
                 # Forward pass with AMP
                 with torch.autocast(device.type if device.type != 'mps' else 'cpu', enabled=amp):
@@ -267,9 +294,9 @@ Initial GPU Status:
                                     )
                         })
                 # Clean up
-                del images, masks, masks_pred
                 torch.cuda.empty_cache()
               
+                del images, masks, masks_pred
                 pbar.update(1)
                 global_step += 1
                 epoch_loss += loss.item()
@@ -281,33 +308,63 @@ Initial GPU Status:
                 pbar.set_postfix(**{'loss (batch)': loss.item()})
 
                 # Evaluation round
-                division_step = (len(train_dataset) // (5 * batch_size))
-                if division_step > 0:
-                    if global_step % division_step == 0:
+                division_step = len(train_dataset) // (batch_size * 2)  # Validate twice per epoch
+                if division_step > 0 and batch_idx % division_step == 0:
+                    val_metrics, val_samples = evaluate(
+                        model, 
+                        val_loader, 
+                        device, 
+                        amp,
+                        max_samples=4,
+                    )
+                    # Also log images to wandb
+                    for i, (img_np, pred_np, true_np) in enumerate(val_samples):
+                        # Convert them to a suitable format for wandb.Image
+                        # Typically, original image is [C,H,W], so transpose to [H,W,C]
+                        img_vis = (img_np.transpose(1,2,0) * 255).clip(0,255).astype('uint8')
 
-                        val_metrics = evaluate(model, val_loader, device, amp)
-                        # Update scheduler with dice score
-                        scheduler.step(val_metrics['dice'])
-                        
-                        # Log validation metrics to wandb
-                        experiment.log({
-                            **{f'val/{k}': v for k, v in val_metrics.items()},
-                            'epoch': epoch,
-                            'step': global_step,
-                            'learning_rate': optimizer.param_groups[0]['lr']
+                        # For mask, pick channel 0 if shape is [1,H,W], or if multiple classes, do likewise
+                        pred_vis = (pred_np[0] * 255).clip(0,255).astype('uint8')
+                        true_vis = (true_np[0] * 255).clip(0,255).astype('uint8')
+
+                        # Log them as a wandb.Image with mask overlays
+                        wandb.log({
+                            f"val_image_{i}": wandb.Image(
+                                img_vis,
+                                masks={
+                                    "prediction": {
+                                        "mask_data": pred_vis,
+                                        "class_labels": {1: "Lesion"}
+                                    },
+                                    "ground_truth": {
+                                        "mask_data": true_vis,
+                                        "class_labels": {1: "Lesion"}
+                                    }
+                                }
+                            )
                         })
+                    # Update scheduler with dice score
+                    scheduler.step(val_metrics['dice'])
+                    
+                    # Log validation metrics to wandb
+                    experiment.log({
+                        **{f'val/{k}': v for k, v in val_metrics.items()},
+                        'epoch': epoch,
+                        'step': global_step,
+                        'learning_rate': optimizer.param_groups[0]['lr']
+                    })
                    
-                        model.train()  # Set model back to training mode
+                    model.train()  # Set model back to training mode
 
 
 
-                        # Save best model based on dice score
-                        if val_metrics['dice'] > best_dice:
-                            best_dice = val_metrics['dice']
-                            Path(dir_checkpoint).mkdir(parents=True, exist_ok=True)
-                            state_dict = model.state_dict()
-                            torch.save(state_dict, str(dir_checkpoint / 'best_model.pth'))
-                            logging.info(f'Best model saved! Dice score: {val_metrics["dice"]:.4f}')
+                    # Save best model based on dice score
+                    if val_metrics['dice'] > best_dice:
+                        best_dice = val_metrics['dice']
+                        Path(dir_checkpoint).mkdir(parents=True, exist_ok=True)
+                        state_dict = model.state_dict()
+                        torch.save(state_dict, str(dir_checkpoint / 'best_model.pth'))
+                        logging.info(f'Best model saved! Dice score: {val_metrics["dice"]:.4f}')
 
         if save_checkpoint:
             Path(dir_checkpoint).mkdir(parents=True, exist_ok=True)

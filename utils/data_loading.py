@@ -10,6 +10,7 @@ from pathlib import Path
 from torch.utils.data import Dataset
 from tqdm import tqdm
 import random
+import os
 
 def load_image(filename):
     """Load image/mask and force to RGB (3-channel) or L (1-channel) depending on usage."""
@@ -193,9 +194,17 @@ class IDRIDDataset(Dataset):
         self.patch_indices = []
         self.precompute_all_patches()
 
+        # Clear these after patch extraction
+        self.full_images = None
+        self.full_masks = None
+
     def precompute_all_patches(self):
-        """Load each image+mask, scale, then slice into patches."""
+        """Load each image+mask, scale, then slice into patches with balanced sampling."""
         logging.info(f"Precomputing patches for {len(self.ids)} images in split={self.split} ...")
+        
+        positive_patches = []
+        negative_patches = []
+
         for img_id in tqdm(self.ids, desc="Precomputing patches"):
             # Paths
             img_file  = self.images_dir / f"{img_id}.jpg"
@@ -244,27 +253,54 @@ class IDRIDDataset(Dataset):
                 logging.warning(f"{img_id}: scaled to {h}x{w} < patch_size={self.patch_size}; skipping.")
                 continue
 
-            stride = self.patch_size // 2  # Overlap
-            all_patches = []
+            stride = self.patch_size // 2
             for y in range(0, h - self.patch_size + 1, stride):
                 for x in range(0, w - self.patch_size + 1, stride):
-                    img_patch  = img_tensor[:, y:y+self.patch_size, x:x+self.patch_size]
+                    img_patch = img_tensor[:, y:y+self.patch_size, x:x+self.patch_size]
                     mask_patch = mask_tensor[:, y:y+self.patch_size, x:x+self.patch_size]
                     has_lesion = torch.any(mask_patch > 0.5)
 
-                    all_patches.append({
+                    patch_data = {
                         'image': img_patch.contiguous(),
-                        'mask':  mask_patch.contiguous(),
+                        'mask': mask_patch.contiguous(),
                         'coords': (y, x),
+                        'img_id': img_id,
                         'has_lesion': has_lesion
-                    })
-                    self.patch_indices.append((img_id, len(all_patches)-1))
+                    }
 
-            self.patches[img_id] = all_patches
-            logging.info(
-                f"{img_id}: generated {len(all_patches)} patches "
-                f"({sum(p['has_lesion'] for p in all_patches)} have lesions)."
-            )
+                    if has_lesion:
+                        positive_patches.append(patch_data)
+                    else:
+                        negative_patches.append(patch_data)
+
+        # Balance patches
+        num_positives = len(positive_patches)
+        logging.info(f"Found {num_positives} positive patches and {len(negative_patches)} negative patches")
+
+        # Randomly shuffle negative patches
+        random.shuffle(negative_patches)
+        
+        # Take only as many negatives as we have positives
+        negative_patches = negative_patches[:num_positives]
+        
+        # Combine and shuffle final patches
+        all_patches = positive_patches + negative_patches
+        random.shuffle(all_patches)
+
+        # Store in class variables
+        self.patches = {}
+        self.patch_indices = []
+        
+        for idx, patch in enumerate(all_patches):
+            img_id = patch['img_id']
+            if img_id not in self.patches:
+                self.patches[img_id] = []
+            patch_idx = len(self.patches[img_id])
+            self.patches[img_id].append(patch)
+            self.patch_indices.append((img_id, patch_idx))
+
+        logging.info(f"Final dataset has {len(self.patch_indices)} balanced patches "
+                    f"({len(positive_patches)} positive, {len(negative_patches)} negative)")
 
     def preprocess(self, pil_img: Image.Image, scale: float, is_mask: bool):
         """Resize and convert to np array. For masks => single channel. For images => 3 channels."""
