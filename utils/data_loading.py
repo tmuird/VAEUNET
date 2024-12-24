@@ -11,6 +11,8 @@ from torch.utils.data import Dataset
 from tqdm import tqdm
 import random
 import os
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
 
 def load_image(filename):
     """Load image/mask and force to RGB (3-channel) or L (1-channel) depending on usage."""
@@ -197,6 +199,38 @@ class IDRIDDataset(Dataset):
         # Clear these after patch extraction
         self.full_images = None
         self.full_masks = None
+
+        if split == 'train':
+            self.transform = A.Compose([
+                # SAFE TRANSFORMATIONS - Keep these
+                A.HorizontalFlip(p=0.5),  # Valid since lesions can appear on either side
+                A.VerticalFlip(p=0.5),    # Valid since lesions can appear top/bottom
+                
+                # CAREFUL WITH THESE - Modify parameters
+                A.RandomBrightnessContrast(
+                    brightness_limit=0.1,   # Reduced from 0.2 - hard exudates are bright yellow
+                    contrast_limit=0.1,     # Reduced from 0.2 - preserve lesion contrast
+                    p=0.3                   # Reduced probability
+                ),
+                
+                # ADD THESE - Specific for hard exudates
+                A.CLAHE(                   # Enhance contrast locally - helps with exudate detection
+                    clip_limit=2.0,
+                    tile_grid_size=(8, 8),
+                    p=0.5
+                ),
+                
+                # BE CAREFUL WITH ROTATION - Modify parameters
+                A.ShiftScaleRotate(
+                    shift_limit=0.1,        # Reduced from 0.2 - avoid displacing lesions too much
+                    scale_limit=0.1,        # Reduced from 0.2
+                    rotate_limit=15,        # Reduced from 30 - small rotations only
+                    p=0.3                   # Reduced probability
+                ),
+                
+                # Remove HueSaturationValue as it might alter the characteristic 
+                # yellow color of hard exudates
+            ])
 
     def precompute_all_patches(self):
         """Load each image+mask, scale, then slice into patches with balanced sampling."""

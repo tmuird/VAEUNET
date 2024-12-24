@@ -34,9 +34,8 @@ dir_mask = Path('./data/masks/')
 dir_checkpoint = Path('./checkpoints/')
 
 
-
 def collate_patches(batch):
-    """Custom collate function to handle patches"""
+    """Custom collate function to handle patches."""
     return {
         'image': torch.stack([x['image'] for x in batch]),
         'mask': torch.stack([x['mask'] for x in batch]),
@@ -80,37 +79,71 @@ Initial GPU Status:
 
     logging.info(f'Loading datasets with patch size: {patch_size} and max images: {max_images}')
     # Load datasets with logging
-    train_dataset = IDRIDDataset(base_dir='./data', split='train', 
-                                scale=img_scale, patch_size=patch_size,
-                                lesion_type='EX',
-                                max_images=max_images )
-    val_dataset = IDRIDDataset(base_dir='./data', split='val', 
-                              scale=img_scale, patch_size=patch_size,
-                              lesion_type='EX',
-                              max_images=max_images )
+    train_dataset = IDRIDDataset(base_dir='./data',
+                                 split='train',
+                                 scale=img_scale,
+                                 patch_size=patch_size,
+                                 lesion_type='EX',
+                                 max_images=max_images)
+    val_dataset = IDRIDDataset(base_dir='./data',
+                               split='val',
+                               scale=img_scale,
+                               patch_size=patch_size,
+                               lesion_type='EX',
+                               max_images=max_images)
     
     logging.info(f'Dataset sizes:')
     logging.info(f'- Training: {len(train_dataset)} images')
     logging.info(f'- Validation: {len(val_dataset)} images')
 
     # Create data loaders
-    loader_args = dict(batch_size=batch_size, num_workers=4, pin_memory=True)
+    loader_args = dict(
+        batch_size=batch_size, 
+        num_workers=6,
+        pin_memory=True,
+        persistent_workers=True,
+        prefetch_factor=2,
+        pin_memory_device='cuda'
+    )
     train_loader = DataLoader(
         train_dataset,
         shuffle=True,
         **loader_args
     )
-    val_loader = DataLoader(val_dataset, 
-                           shuffle=False, 
-                           **loader_args,
-                           )
-
-    # Initialize loggingrime
-    experiment = wandb.init(project='IDRID-UNET',resume='allow', anonymous='must'
+    val_loader = DataLoader(
+        val_dataset, 
+        shuffle=False,
+        **loader_args
     )
+
+    # Safely initialize wandb with fallback to offline
+    try:
+        experiment = wandb.init(
+            project='IDRID-UNET',
+            resume='allow',
+            anonymous='must'
+        )
+    except wandb.errors.CommError as e:
+        logging.warning(f"W&B connection error: {e}. Falling back to offline mode.")
+        experiment = wandb.init(
+            project='IDRID-UNET',
+            resume='allow',
+            anonymous='must',
+            mode='offline'
+        )
+
     experiment.config.update(
-        dict(epochs=epochs, batch_size=batch_size, learning_rate=learning_rate,
-             save_checkpoint=save_checkpoint, img_scale=img_scale, amp=amp, patch_size=patch_size, classes=1, lesion_type='EX')
+        dict(
+            epochs=epochs,
+            batch_size=batch_size,
+            learning_rate=learning_rate,
+            save_checkpoint=save_checkpoint,
+            img_scale=img_scale,
+            amp=amp,
+            patch_size=patch_size,
+            classes=1,
+            lesion_type='EX'
+        )
     )
 
     logging.info(f'''Starting training:
@@ -132,23 +165,20 @@ Initial GPU Status:
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, 
         mode='max',
-        patience=10,     # Reduce patience
+        patience=5,
         min_lr=1e-6,
         verbose=True,
         factor=0.5
-        
     )
     grad_scaler = torch.amp.GradScaler(enabled=amp)
     criterion = nn.CrossEntropyLoss() if model.n_classes > 1 else nn.BCEWithLogitsLoss()
 
-
-    # Modify loss calculation
     global_step = 0
 
-    # Move model to device and set to appropriate dtype
+    # Move model to device
     model = model.to(device=device)
     
-    # Add debug logging for shapes
+    # Quick shape debug
     for batch in train_loader:
         images = batch['image']
         masks = batch['mask']
@@ -156,160 +186,67 @@ Initial GPU Status:
         logging.info(f"Mask shape: {masks.shape}")
         break
 
-    # Add memory debugging
-    if torch.cuda.is_available():
-        logging.info(f"GPU Memory before data loading: {torch.cuda.memory_allocated()/1024**2:.2f}MB")
-
-    # At start of training
     if torch.cuda.is_available():
         logging.info(f"Using GPU: {torch.cuda.get_device_name()}")
         logging.info(f"AMP enabled: {amp}")
         
-    logging.info(f"Initial VRAM: {torch.cuda.memory_allocated()/1e9:.2f}GB")
+    # Before training loop
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cuda.preferred_linalg_library('cusolver')
 
-    # After creating dataloaders
-    logging.info(f"VRAM after dataloaders: {torch.cuda.memory_allocated()/1e9:.2f}GB")
-
-    # Before training starts
-    logging.info(f"VRAM before training: {torch.cuda.memory_allocated()/1e9:.2f}GB")
-    
-    # After model to device
-    model = model.to(device)
-    logging.info(f"VRAM after model to device: {torch.cuda.memory_allocated()/1e9:.2f}GB")
-    
-    # After optimizer creation
-    optimizer = optim.AdamW(model.parameters(), lr=learning_rate)
-    logging.info(f"VRAM after optimizer: {torch.cuda.memory_allocated()/1e9:.2f}GB")
-    
-    # First batch
-    for batch in train_loader:
-        images = batch['image'].to(device)
-        logging.info(f"Image batch shape: {images.shape}")
-        logging.info(f"VRAM after first batch: {torch.cuda.memory_allocated()/1e9:.2f}GB")
-        break
-
-    # At start of training
-    optimizer.zero_grad(set_to_none=True)  # Initial gradient clear
-
-    # 5. Begin training
+    # Training loop
     for epoch in range(1, epochs + 1):
-        current_image=None
-        patches_processed=0
         model.train()
         epoch_loss = 0
-        image_patches = {}  # Track patches per image
-        
+
         with tqdm(total=len(train_loader), desc=f'Epoch {epoch}/{epochs}', unit='batch') as pbar:
             for batch_idx, batch in enumerate(train_loader):
-                # Track memory before batch
-
-                # Move to GPU and track memory
                 images = batch['image'].to(device, non_blocking=True)
                 masks = batch['mask'].to(device, non_blocking=True)
 
-                # Forward pass with AMP
                 with torch.autocast(device.type if device.type != 'mps' else 'cpu', enabled=amp):
                     masks_pred = model(images)
                     if model.n_classes == 1:
-                        # Adjust Focal Loss parameters for severe imbalance
-                        # focal = metrics.focal_loss(
-                        #     masks_pred, 
-                        #     masks.float(),
-                        #     alpha=0.95,    # Increase alpha (weight for positive class) significantly
-                        #     gamma=4.0      # Increase gamma to focus more on hard examples
-                        # )
-                        # dice = metrics.dice_loss(
-                        #     torch.sigmoid(masks_pred), 
-                        #     masks, 
-                        #     multiclass=False
-                        # )
-                        
-                        # Adjust loss weights to emphasize Focal Loss
-                        # loss = 0.7 * focal + 0.3 * dice  # Give more weight to Focal Loss
-                        loss=criterion(masks_pred,masks)
+                        loss = criterion(masks_pred, masks.float())
                     else:
                         loss = criterion(masks_pred, masks)
 
-                mem_after_forward = torch.cuda.memory_allocated()/1e9
-
-                # Backward pass with scaler
                 grad_scaler.scale(loss).backward()
                 grad_scaler.unscale_(optimizer)
                 
                 torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clipping)
                 
+                optimizer.zero_grad(set_to_none=True)
+
                 grad_scaler.step(optimizer)
                 grad_scaler.update()
-                optimizer.zero_grad(set_to_none=True)
-                mem_after_backward = torch.cuda.memory_allocated()/1e9
 
-                # if batch_idx % 1 == 0:  # Log every batch
-                #     logging.info(f"""
-# Batch {batch_idx} Memory (GB):
-# - Before batch: {mem_before:.2f}
-# - After transfer: {mem_after_transfer:.2f}
-# - After forward: {mem_after_forward:.2f}
-# - After backward: {mem_after_backward:.2f}
-# Image shape: {images.shape}
-# """)
-                # Log images every N batches (e.g. every 100 batches)
-                if batch_idx % 100 == 0:
-                    with torch.no_grad():
-                        train_images = batch['image'].to(device=device, dtype=torch.float32)
-                        train_masks = batch['mask'].to(device=device, dtype=torch.float32)
-
-                        model.eval()
-                        train_masks_pred = model(train_images)
-                        train_masks_pred = torch.sigmoid(train_masks_pred)
-
-                        # Select random index
-                        idx = random.randint(0, len(train_images) - 1)
-                        
-                        # Get images and masks
-                        img = train_images[idx].cpu().numpy()
-                        pred_mask = train_masks_pred[idx].cpu().numpy()
-                        true_mask = train_masks[idx].cpu().numpy()
-
-                        # Prepare image for wandb (HWC format, 0-255 range)
-                        img = img.transpose(1, 2, 0)  # [C,H,W] -> [H,W,C]
-                        img = np.clip(img * 255, 0, 255).astype(np.uint8)
-                        
-                        # Prepare masks for wandb (HW format, 0-255 range)
-                        true_mask = np.clip(true_mask[0] * 255, 0, 255).astype(np.uint8)  # Remove channel dim and scale
-                        pred_mask = np.clip(pred_mask[0] * 255, 0, 255).astype(np.uint8)  # Remove channel dim and scale
-
-                        experiment.log({
-                                    'train_images': wandb.Image(
-                                        img,  # Original image
-                                        masks={
-                                            "predictions": {
-                                                "mask_data": pred_mask,
-                                                "class_labels": {1: "lesion"}
-                                            },
-                                            "ground_truth": {
-                                                "mask_data": true_mask,
-                                                "class_labels": {1: "lesion"}
-                                            }
-                                        }
-                                    )
-                        })
-                # Clean up
-                torch.cuda.empty_cache()
-              
-                del images, masks, masks_pred
-                pbar.update(1)
-                global_step += 1
                 epoch_loss += loss.item()
-                experiment.log({
-                    'train loss': loss.item(),
-                    'step': global_step,
-                    'epoch': epoch
-                })
-                pbar.set_postfix(**{'loss (batch)': loss.item()})
+                global_step += 1
 
-                # Evaluation round
-                division_step = len(train_dataset) // (batch_size * 2)  # Validate twice per epoch
-                if division_step > 0 and batch_idx % division_step == 0:
+                # Safely log train loss to wandb (catch connection errors)
+                try:
+                    wandb.log({
+                        'train loss': loss.item(),
+                        'step': global_step,
+                        'epoch': epoch
+                    })
+                except wandb.errors.Error as e:
+                    logging.warning(f"Could not log to W&B (train loss). Error: {e}")
+
+                pbar.set_postfix(**{'loss (batch)': loss.item()})
+                pbar.update(1)
+
+                # Periodically evaluate
+                division_step = len(train_dataset) // (batch_size * 2)  # Validate 2x per epoch
+                if division_step > 0 and batch_idx > 0 and batch_idx % division_step == 0:
+                    # Clear memory before validation
+                    del images, masks, masks_pred, loss
+                    torch.cuda.empty_cache()
+                    
+                    # Add explicit model mode switching
+                    model.eval()
+                    
                     val_metrics, val_samples = evaluate(
                         model, 
                         val_loader, 
@@ -317,72 +254,75 @@ Initial GPU Status:
                         amp,
                         max_samples=4,
                     )
-                    # Also log images to wandb
-                    for i, (img_np, pred_np, true_np) in enumerate(val_samples):
-                        # Convert them to a suitable format for wandb.Image
-                        # Typically, original image is [C,H,W], so transpose to [H,W,C]
-                        img_vis = (img_np.transpose(1,2,0) * 255).clip(0,255).astype('uint8')
 
-                        # For mask, pick channel 0 if shape is [1,H,W], or if multiple classes, do likewise
-                        pred_vis = (pred_np[0] * 255).clip(0,255).astype('uint8')
-                        true_vis = (true_np[0] * 255).clip(0,255).astype('uint8')
+                    # After validation, ensure we switch back to training mode
+                    model.train()
 
-                        # Log them as a wandb.Image with mask overlays
-                        wandb.log({
-                            f"val_image_{i}": wandb.Image(
-                                img_vis,
-                                masks={
-                                    "prediction": {
-                                        "mask_data": pred_vis,
-                                        "class_labels": {1: "Lesion"}
-                                    },
-                                    "ground_truth": {
-                                        "mask_data": true_vis,
-                                        "class_labels": {1: "Lesion"}
+                    try:
+                        # Log sample images
+                        for i, (img_np, pred_np, true_np) in enumerate(val_samples):
+                            img_vis = (img_np.transpose(1,2,0) * 255).clip(0,255).astype('uint8')
+                            pred_vis = (pred_np[0] * 255).clip(0,255).astype('uint8')
+                            true_vis = (true_np[0] * 255).clip(0,255).astype('uint8')
+                            wandb.log({
+                                f"val_image_{i}": wandb.Image(
+                                    img_vis,
+                                    masks={
+                                        "prediction": {"mask_data": pred_vis, "class_labels": {1: "Lesion"}},
+                                        "ground_truth": {"mask_data": true_vis, "class_labels": {1: "Lesion"}}
                                     }
-                                }
-                            )
+                                )
+                            })
+                            
+                            # Clear sample data after logging
+                            del img_vis, pred_vis, true_vis
+                            
+                        # Log metrics
+                        wandb.log({
+                            **{f'val/{k}': v for k, v in val_metrics.items()},
+                            'epoch': epoch,
+                            'step': global_step,
+                            'learning_rate': optimizer.param_groups[0]['lr']
                         })
-                    # Update scheduler with dice score
+                        
+                        # Clear samples after logging
+                        del val_samples
+                        torch.cuda.empty_cache()
+                        
+                    except wandb.errors.Error as e:
+                        logging.warning(f"Could not log to W&B (validation). Error: {e}")
+
+                    # Update LR based on dice
                     scheduler.step(val_metrics['dice'])
                     
-                    # Log validation metrics to wandb
-                    experiment.log({
-                        **{f'val/{k}': v for k, v in val_metrics.items()},
-                        'epoch': epoch,
-                        'step': global_step,
-                        'learning_rate': optimizer.param_groups[0]['lr']
-                    })
-                   
-                    model.train()  # Set model back to training mode
+                    # Clear validation metrics
+                    del val_metrics
+                    torch.cuda.empty_cache()
 
-
-
-                    # Save best model based on dice score
-                    if val_metrics['dice'] > best_dice:
-                        best_dice = val_metrics['dice']
-                        Path(dir_checkpoint).mkdir(parents=True, exist_ok=True)
-                        state_dict = model.state_dict()
-                        torch.save(state_dict, str(dir_checkpoint / 'best_model.pth'))
-                        logging.info(f'Best model saved! Dice score: {val_metrics["dice"]:.4f}')
+                # Add memory monitoring (optional, for debugging)
+                if torch.cuda.is_available() and batch_idx % 100 == 0:
+                    logging.info(f"""
+                    Memory Status:
+                    - Allocated: {torch.cuda.memory_allocated()/1e9:.2f}GB
+                    - Reserved:  {torch.cuda.memory_reserved()/1e9:.2f}GB
+                    """)
 
         if save_checkpoint:
             Path(dir_checkpoint).mkdir(parents=True, exist_ok=True)
             state_dict = model.state_dict()
-            torch.save(state_dict, str(dir_checkpoint / 'checkpoint_epoch{}.pth'.format(epoch)))
+            torch.save(state_dict, str(dir_checkpoint / f'checkpoint_epoch{epoch}.pth'))
             logging.info(f'Checkpoint {epoch} saved!')
 
 
 def get_args():
     parser = argparse.ArgumentParser(description='Train the UNet on images and target masks')
-    parser.add_argument('--epochs', '-e', metavar='E', type=int, default=100, help='Number of ep8chs')
+    parser.add_argument('--epochs', '-e', metavar='E', type=int, default=100, help='Number of epochs')
     parser.add_argument('--batch-size', '-b', dest='batch_size', metavar='B', type=int, default=8, help='Batch size')
     parser.add_argument('--learning-rate', '-l', metavar='LR', type=float, default=1e-4, help='Learning rate')
     parser.add_argument('--load', '-f', type=str, default=False, help='Load model from a .pth file')
     parser.add_argument('--scale', '-s', type=float, default=1.0, help='Downscaling factor of the images')
-    parser.add_argument('--patch-size', '-p', type=lambda x: None if x.lower() == 'none' else int(x), 
-                        default=None, 
-                        help='Size of patches to extract (use None to disable)')
+    parser.add_argument('--patch-size', '-p', type=lambda x: None if x.lower() == 'none' else int(x),
+                        default=None, help='Size of patches to extract (use None to disable)')
     parser.add_argument('--validation', '-v', dest='val', type=float, default=10.0,
                         help='Percent of the data that is used as validation (0-100)')
     parser.add_argument('--amp', action='store_true', default=True, help='Use mixed precision')
@@ -390,8 +330,7 @@ def get_args():
     parser.add_argument('--gradient-clipping', type=float, default=1.0, help='Gradient clipping value')
     parser.add_argument('--use-checkpointing', action='store_true', default=True,
                         help='Use gradient checkpointing to reduce memory usage')
-    parser.add_argument('--bilinear', action='store_true', default=False,
-                        help='Use bilinear upsampling')
+    parser.add_argument('--bilinear', action='store_true', default=False, help='Use bilinear upsampling')
     parser.add_argument('--max-images', type=int, default=None, help='Maximum number of images to process')
     return parser.parse_args()
 
@@ -423,7 +362,8 @@ if __name__ == '__main__':
     
     if args.load:
         state_dict = torch.load(args.load, map_location=device)
-        del state_dict['mask_values']
+        # If you previously had some extra keys, remove them:
+        state_dict.pop('mask_values', None)
         model.load_state_dict(state_dict)
         logging.info(f'Model loaded from {args.load}')
 
@@ -441,8 +381,9 @@ if __name__ == '__main__':
         )
     except torch.cuda.OutOfMemoryError:
         logging.error('Detected OutOfMemoryError! '
-                     'Try reducing the batch size or image scale.')
+                      'Try reducing the batch size or image scale.')
         torch.cuda.empty_cache()
+        # If you want to attempt re-training with gradient checkpointing or smaller batch size, do so here.
         model.use_checkpointing()
         train_model(
             model=model,
