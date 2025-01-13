@@ -166,12 +166,24 @@ class IDRIDDataset(Dataset):
         self.patch_size = patch_size
         self.base_dir = Path(base_dir)
         self.split = split
+        self.transform = None  # Initialize transform as None for all splits
 
         self.images_dir = self.base_dir / 'imgs' / split
         self.masks_dir  = self.base_dir / 'masks' / split
 
+        # Calculate stride
+        self.stride = self.patch_size // 2 if self.patch_size is not None else None
+
+        # Simple patches directory structure
+        self.patches_dir = self.base_dir / 'patches' / split / lesion_type
+        # Clear any existing patches
+        if self.patches_dir.exists():
+            import shutil
+            shutil.rmtree(self.patches_dir)
+        self.patches_dir.mkdir(parents=True, exist_ok=True)
+
         self.lesion_type = lesion_type
-        self.class_dir   = lesion_type
+        self.class_dir = lesion_type
 
         logging.info(f"Loading {split} dataset from: {self.images_dir}, {self.masks_dir / self.class_dir}")
         # Gather IDs
@@ -185,14 +197,14 @@ class IDRIDDataset(Dataset):
 
         # Check mask existence
         for img_id in self.ids:
-            mask_path = self.masks_dir / self.class_dir / f"{img_id}_{self.lesion_type}.tif"
+            mask_path = self.masks_dir / self.lesion_type / f"{img_id}_{self.lesion_type}.tif"
             if not mask_path.exists():
                 logging.warning(f"No mask found for {img_id}")
             else:
                 pass  # you can load & check if you want
 
-        # Prepare containers
-        self.patches = {}
+        # Store patch metadata instead of actual patches
+        self.patch_metadata = {}
         self.patch_indices = []
         self.precompute_all_patches()
 
@@ -200,6 +212,7 @@ class IDRIDDataset(Dataset):
         self.full_images = None
         self.full_masks = None
 
+        # Initialize transform for all splits
         if split == 'train':
             self.transform = A.Compose([
                 # SAFE TRANSFORMATIONS - Keep these
@@ -233,16 +246,17 @@ class IDRIDDataset(Dataset):
             ])
 
     def precompute_all_patches(self):
-        """Load each image+mask, scale, then slice into patches with balanced sampling."""
+        """Load each image+mask, scale, then slice into patches and save to disk one at a time."""
         logging.info(f"Precomputing patches for {len(self.ids)} images in split={self.split} ...")
         
-        positive_patches = []
-        negative_patches = []
+        positive_count = 0
+        negative_paths = []  # Store only paths, not actual patches
+        patch_index = []
 
-        for img_id in tqdm(self.ids, desc="Precomputing patches"):
+        for img_id in tqdm(self.ids, desc="Processing images and counting patches"):
             # Paths
             img_file  = self.images_dir / f"{img_id}.jpg"
-            mask_file = self.masks_dir / self.class_dir / f"{img_id}_{self.lesion_type}.tif"
+            mask_file = self.masks_dir / self.lesion_type / f"{img_id}_{self.lesion_type}.tif"
 
             # Load & convert
             img_pil  = load_image(img_file).convert('RGB')
@@ -265,76 +279,89 @@ class IDRIDDataset(Dataset):
             if mask_tensor.dim() == 2:
                 mask_tensor = mask_tensor.unsqueeze(0)
             if img_tensor.dim() == 2:
-                # Rare if grayscale snuck through; ensure shape => [1,H,W]
                 img_tensor = img_tensor.unsqueeze(0)
 
             _, h, w = img_tensor.shape
 
             # If no patch_size set, store the entire image as a single patch
             if self.patch_size is None:
-                self.patches[img_id] = [{
+                patch_path = self.patches_dir / f"{img_id}_full"
+                torch.save({
                     'image': img_tensor,
-                    'mask':  mask_tensor,
+                    'mask': mask_tensor,
                     'coords': (0, 0),
                     'has_lesion': torch.any(mask_tensor > 0.5)
-                }]
+                }, patch_path)
+                
+                metadata = {
+                    'path': patch_path,
+                    'coords': (0, 0),
+                    'has_lesion': torch.any(mask_tensor > 0.5).item(),
+                    'img_id': img_id
+                }
+                self.patch_metadata[img_id] = [metadata]
                 self.patch_indices.append((img_id, 0))
                 logging.info(f"{img_id}: 1 patch (full image) with shape {img_tensor.shape}.")
                 continue
 
             if (h < self.patch_size) or (w < self.patch_size):
-                # If the scaled image is smaller than patch_size, either skip or pad
                 logging.warning(f"{img_id}: scaled to {h}x{w} < patch_size={self.patch_size}; skipping.")
                 continue
 
             stride = self.patch_size // 2
+            patch_count = 0
             for y in range(0, h - self.patch_size + 1, stride):
                 for x in range(0, w - self.patch_size + 1, stride):
                     img_patch = img_tensor[:, y:y+self.patch_size, x:x+self.patch_size]
                     mask_patch = mask_tensor[:, y:y+self.patch_size, x:x+self.patch_size]
                     has_lesion = torch.any(mask_patch > 0.5)
 
-                    patch_data = {
+                    patch_path = self.patches_dir / f"{img_id}_{patch_count}"
+                    torch.save({
                         'image': img_patch.contiguous(),
                         'mask': mask_patch.contiguous(),
                         'coords': (y, x),
-                        'img_id': img_id,
                         'has_lesion': has_lesion
-                    }
-
+                    }, patch_path)
+                    
                     if has_lesion:
-                        positive_patches.append(patch_data)
+                        positive_count += 1
+                        patch_index.append((img_id, str(patch_path), True))
                     else:
-                        negative_patches.append(patch_data)
+                        negative_paths.append((img_id, str(patch_path)))
 
-        # Balance patches
-        num_positives = len(positive_patches)
-        logging.info(f"Found {num_positives} positive patches and {len(negative_patches)} negative patches")
+                    patch_count += 1
 
-        # Randomly shuffle negative patches
-        random.shuffle(negative_patches)
-        
-        # Take only as many negatives as we have positives
-        negative_patches = negative_patches[:num_positives]
-        
-        # Combine and shuffle final patches
-        all_patches = positive_patches + negative_patches
-        random.shuffle(all_patches)
+        # Clear tensors to free memory
+        del img_tensor, mask_tensor
+        torch.cuda.empty_cache() if torch.cuda.is_available() else None
 
-        # Store in class variables
-        self.patches = {}
-        self.patch_indices = []
-        
-        for idx, patch in enumerate(all_patches):
-            img_id = patch['img_id']
-            if img_id not in self.patches:
-                self.patches[img_id] = []
-            patch_idx = len(self.patches[img_id])
-            self.patches[img_id].append(patch)
-            self.patch_indices.append((img_id, patch_idx))
+        logging.info(f"Found {positive_count} positive patches and {len(negative_paths)} negative patches")
 
-        logging.info(f"Final dataset has {len(self.patch_indices)} balanced patches "
-                    f"({len(positive_patches)} positive, {len(negative_patches)} negative)")
+        # Randomly select negative patches equal to positive count
+        random.shuffle(negative_paths)
+        selected_negative_paths = negative_paths[:positive_count]
+
+        # Add selected negative patches to index
+        for img_id, path in selected_negative_paths:
+            patch_index.append((img_id, path, False))
+
+        # Remove unselected negative patches to save disk space
+        for img_id, path in negative_paths[positive_count:]:
+            try:
+                os.remove(path)
+            except OSError as e:
+                logging.warning(f"Could not remove unselected negative patch {path}: {e}")
+
+        # Save patch index
+        random.shuffle(patch_index)  # Shuffle final index
+        self.patch_index_file = self.patches_dir / 'patch_index.txt'
+        with open(self.patch_index_file, 'w') as f:
+            for img_id, path, has_lesion in patch_index:
+                f.write(f"{img_id}\t{path}\t{has_lesion}\n")
+
+        self.patch_indices = patch_index  # Set the patch_indices attribute
+        logging.info(f"Saved {len(patch_index)} balanced patches to {self.patches_dir}")
 
     def preprocess(self, pil_img: Image.Image, scale: float, is_mask: bool):
         """Resize and convert to np array. For masks => single channel. For images => 3 channels."""
@@ -364,15 +391,24 @@ class IDRIDDataset(Dataset):
             return arr
 
     def __getitem__(self, idx):
-        """Return a single patch (image, mask)."""
-        img_id, patch_idx = self.patch_indices[idx]
-        patch = self.patches[img_id][patch_idx]
-
-        return {
-            'image': patch['image'],
-            'mask':  patch['mask'],
-            'img_id': f"{img_id}_y{patch['coords'][0]}_x{patch['coords'][1]}"
+        """Return a single patch (image, mask) loaded from disk."""
+        img_id, patch_path, _ = self.patch_indices[idx]
+        
+        # Load patch from disk
+        patch_data = torch.load(patch_path)
+        
+        sample = {
+            'image': patch_data['image'],
+            'mask': patch_data['mask']
         }
+
+        if self.transform is not None:
+            transformed = self.transform(image=sample['image'].permute(1,2,0).numpy(), 
+                                       mask=sample['mask'].permute(1,2,0).numpy())
+            sample['image'] = torch.from_numpy(transformed['image']).permute(2,0,1)
+            sample['mask'] = torch.from_numpy(transformed['mask']).permute(2,0,1)
+
+        return sample
 
     def __len__(self):
         return len(self.patch_indices)

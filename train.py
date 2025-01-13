@@ -46,16 +46,18 @@ def collate_patches(batch):
 def train_model(
         model,
         device,
-        epochs: int = 50,
-        batch_size: int = 4,
+        epochs: int = 5,
+        batch_size: int = 1,
         learning_rate: float = 1e-4,
         save_checkpoint: bool = True,
         img_scale: float = 1,
         patch_size: Optional[int] = None,
-        amp: bool = True,
+        amp: bool = False,
         bilinear: bool = False,
         gradient_clipping: float = 1.0,
         max_images: Optional[int] = None,
+        gradient_accumulation_steps: int = 2,
+        early_stopping_patience: int = 10,
 ):
     # Clear cache at start
     if torch.cuda.is_available():
@@ -69,6 +71,8 @@ Initial GPU Status:
 
     # Initialize best_dice at the start
     best_dice = 0.0
+    best_val_score = float('-inf')
+    no_improvement_count = 0
     
     # Check if data directories exist
     data_dir = Path('./data')
@@ -175,8 +179,8 @@ Initial GPU Status:
 
     global_step = 0
 
-    # Move model to device
-    model = model.to(device=device)
+    # Move model to device and optimize memory format
+    model = model.to(device=device, memory_format=torch.channels_last)
     
     # Quick shape debug
     for batch in train_loader:
@@ -198,11 +202,12 @@ Initial GPU Status:
     for epoch in range(1, epochs + 1):
         model.train()
         epoch_loss = 0
+        optimizer.zero_grad(set_to_none=True)
 
         with tqdm(total=len(train_loader), desc=f'Epoch {epoch}/{epochs}', unit='batch') as pbar:
             for batch_idx, batch in enumerate(train_loader):
-                images = batch['image'].to(device, non_blocking=True)
-                masks = batch['mask'].to(device, non_blocking=True)
+                images = batch['image'].to(device=device, memory_format=torch.channels_last, non_blocking=True)
+                masks = batch['mask'].to(device=device, non_blocking=True)
 
                 with torch.autocast(device.type if device.type != 'mps' else 'cpu', enabled=amp):
                     masks_pred = model(images)
@@ -210,18 +215,20 @@ Initial GPU Status:
                         loss = criterion(masks_pred, masks.float())
                     else:
                         loss = criterion(masks_pred, masks)
+                    # Scale loss for gradient accumulation
+                    loss = loss / gradient_accumulation_steps
 
                 grad_scaler.scale(loss).backward()
-                grad_scaler.unscale_(optimizer)
-                
-                torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clipping)
-                
-                optimizer.zero_grad(set_to_none=True)
 
-                grad_scaler.step(optimizer)
-                grad_scaler.update()
+                # Only step optimizer after accumulating gradients
+                if (batch_idx + 1) % gradient_accumulation_steps == 0:
+                    grad_scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clipping)
+                    grad_scaler.step(optimizer)
+                    grad_scaler.update()
+                    optimizer.zero_grad(set_to_none=True)
 
-                epoch_loss += loss.item()
+                epoch_loss += loss.item() * gradient_accumulation_steps
                 global_step += 1
 
                 # Safely log train loss to wandb (catch connection errors)
@@ -292,6 +299,29 @@ Initial GPU Status:
                     except wandb.errors.Error as e:
                         logging.warning(f"Could not log to W&B (validation). Error: {e}")
 
+                    # Early Stopping and Model Checkpointing
+                    val_score = val_metrics['dice']
+                    if val_score > best_val_score:
+                        best_val_score = val_score
+                        if save_checkpoint:
+                            Path(dir_checkpoint).mkdir(parents=True, exist_ok=True)
+                            checkpoint_path = str(dir_checkpoint / f'best_model.pth')
+                            torch.save({
+                                'epoch': epoch,
+                                'model_state_dict': model.state_dict(),
+                                'optimizer_state_dict': optimizer.state_dict(),
+                                'scheduler_state_dict': scheduler.state_dict(),
+                                'best_val_score': best_val_score,
+                                'amp_scaler': grad_scaler.state_dict(),
+                            }, checkpoint_path)
+                            logging.info(f'New best model saved! (Dice: {val_score:.4f})')
+                        no_improvement_count = 0
+                    else:
+                        no_improvement_count += 1
+                        if no_improvement_count >= early_stopping_patience:
+                            logging.info(f'Early stopping triggered after {epoch} epochs')
+                            return
+
                     # Update LR based on dice
                     scheduler.step(val_metrics['dice'])
                     
@@ -332,6 +362,8 @@ def get_args():
                         help='Use gradient checkpointing to reduce memory usage')
     parser.add_argument('--bilinear', action='store_true', default=False, help='Use bilinear upsampling')
     parser.add_argument('--max-images', type=int, default=None, help='Maximum number of images to process')
+    parser.add_argument('--gradient-accumulation-steps', type=int, default=2, help='Gradient accumulation steps')
+    parser.add_argument('--early-stopping-patience', type=int, default=10, help='Early stopping patience')
     return parser.parse_args()
 
 
@@ -378,6 +410,8 @@ if __name__ == '__main__':
             patch_size=args.patch_size,
             max_images=args.max_images,
             amp=args.amp,
+            gradient_accumulation_steps=args.gradient_accumulation_steps,
+            early_stopping_patience=args.early_stopping_patience,
         )
     except torch.cuda.OutOfMemoryError:
         logging.error('Detected OutOfMemoryError! '
@@ -394,5 +428,7 @@ if __name__ == '__main__':
             img_scale=args.scale,
             patch_size=args.patch_size,
             max_images=args.max_images,
-            amp=args.amp
+            amp=args.amp,
+            gradient_accumulation_steps=args.gradient_accumulation_steps,
+            early_stopping_patience=args.early_stopping_patience,
         )
