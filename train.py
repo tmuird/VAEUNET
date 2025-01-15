@@ -244,44 +244,36 @@ Initial GPU Status:
                 pbar.set_postfix(**{'loss (batch)': loss.item()})
                 pbar.update(1)
 
-                # Periodically evaluate
-                division_step = len(train_dataset) // (batch_size * 2)  # Validate 2x per epoch
-                if division_step > 0 and batch_idx > 0 and batch_idx % division_step == 0:
+                # Periodically evaluate during epoch
+                division_step = (len(train_dataset) // (batch_size * 2))  # Validate 2 times per epoch
+                if division_step > 0 and global_step % division_step == 0:
                     # Clear memory before validation
-                    del images, masks, masks_pred, loss
+                    for var in ['images', 'masks', 'masks_pred', 'loss']:
+                        if var in locals():
+                            exec(f'del {var}')
                     torch.cuda.empty_cache()
                     
-                    # Add explicit model mode switching
+                    logging.info(f'Running validation step at global_step {global_step}')
                     model.eval()
+                    val_metrics, val_samples = evaluate(model, val_loader, device, amp, max_samples=4)
                     
-                    val_metrics, val_samples = evaluate(
-                        model, 
-                        val_loader, 
-                        device, 
-                        amp,
-                        max_samples=4,
-                    )
-
-                    # After validation, ensure we switch back to training mode
-                    model.train()
-
                     try:
                         # Log sample images
-                        for i, (img_np, pred_np, true_np) in enumerate(val_samples):
+                        for i, (img_np, pred_np, true_np, global_idx) in enumerate(val_samples):
                             img_vis = (img_np.transpose(1,2,0) * 255).clip(0,255).astype('uint8')
                             pred_vis = (pred_np[0] * 255).clip(0,255).astype('uint8')
                             true_vis = (true_np[0] * 255).clip(0,255).astype('uint8')
                             wandb.log({
-                                f"val_image_{i}": wandb.Image(
+                                f"val_image_e{epoch}_s{global_step}_idx{global_idx}": wandb.Image(
                                     img_vis,
                                     masks={
                                         "prediction": {"mask_data": pred_vis, "class_labels": {1: "Lesion"}},
                                         "ground_truth": {"mask_data": true_vis, "class_labels": {1: "Lesion"}}
                                     }
-                                )
+                                ),
+                                'epoch': epoch,
+                                'step': global_step
                             })
-                            
-                            # Clear sample data after logging
                             del img_vis, pred_vis, true_vis
                             
                         # Log metrics
@@ -291,16 +283,14 @@ Initial GPU Status:
                             'step': global_step,
                             'learning_rate': optimizer.param_groups[0]['lr']
                         })
-                        
-                        # Clear samples after logging
-                        del val_samples
-                        torch.cuda.empty_cache()
-                        
                     except wandb.errors.Error as e:
                         logging.warning(f"Could not log to W&B (validation). Error: {e}")
 
-                    # Early Stopping and Model Checkpointing
+                    # Update scheduler based on validation metric
                     val_score = val_metrics['dice']
+                    scheduler.step(val_score)
+                    
+                    # Save best model if we have an improvement
                     if val_score > best_val_score:
                         best_val_score = val_score
                         if save_checkpoint:
@@ -313,6 +303,7 @@ Initial GPU Status:
                                 'scheduler_state_dict': scheduler.state_dict(),
                                 'best_val_score': best_val_score,
                                 'amp_scaler': grad_scaler.state_dict(),
+                                'global_step': global_step
                             }, checkpoint_path)
                             logging.info(f'New best model saved! (Dice: {val_score:.4f})')
                         no_improvement_count = 0
@@ -322,26 +313,26 @@ Initial GPU Status:
                             logging.info(f'Early stopping triggered after {epoch} epochs')
                             return
 
-                    # Update LR based on dice
-                    scheduler.step(val_metrics['dice'])
-                    
-                    # Clear validation metrics
-                    del val_metrics
+                    # Cleanup validation data
+                    del val_metrics, val_samples
                     torch.cuda.empty_cache()
+                    model.train()
 
-                # Add memory monitoring (optional, for debugging)
-                if torch.cuda.is_available() and batch_idx % 100 == 0:
-                    logging.info(f"""
-                    Memory Status:
-                    - Allocated: {torch.cuda.memory_allocated()/1e9:.2f}GB
-                    - Reserved:  {torch.cuda.memory_reserved()/1e9:.2f}GB
-                    """)
-
-        if save_checkpoint:
-            Path(dir_checkpoint).mkdir(parents=True, exist_ok=True)
-            state_dict = model.state_dict()
-            torch.save(state_dict, str(dir_checkpoint / f'checkpoint_epoch{epoch}.pth'))
-            logging.info(f'Checkpoint {epoch} saved!')
+        # End of epoch validation and cleanup
+        # Safely clean up training variables
+        for var in ['images', 'masks', 'masks_pred', 'loss']:
+            if var in locals():
+                exec(f'del {var}')
+        torch.cuda.empty_cache()
+        
+        # # Save epoch checkpoint if requested
+        # if save_checkpoint:
+        #     Path(dir_checkpoint).mkdir(parents=True, exist_ok=True)
+        #     state_dict = model.state_dict()
+        #     torch.save(state_dict, str(dir_checkpoint / f'checkpoint_epoch{epoch}.pth'))
+        #     logging.info(f'Checkpoint {epoch} saved!')
+            
+        model.train()  # Ensure we're back in training mode for next epoch
 
 
 def get_args():

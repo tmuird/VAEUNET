@@ -22,7 +22,7 @@ def evaluate(model, dataloader, device, amp, max_samples=4):
         max_samples: Number of sample images to return for visualization
     Returns:
         metrics_mean: Dict of averaged metrics
-        samples: List of (image, prediction, ground_truth) tuples
+        samples: List of (image, prediction, ground_truth, global_idx) tuples
     """
     model.eval()
     
@@ -31,6 +31,15 @@ def evaluate(model, dataloader, device, amp, max_samples=4):
     torch.cuda.memory.empty_cache()
     if torch.cuda.is_available():
         torch.cuda.set_per_process_memory_fraction(0.95)  # Leave some VRAM free
+
+    # Calculate total number of samples
+    total_samples = len(dataloader.dataset)
+    
+    # Pre-select random indices if we're collecting samples
+    selected_indices = []
+    if max_samples > 0:
+        selected_indices = random.sample(range(total_samples), min(max_samples, total_samples))
+        selected_indices = set(selected_indices)  # Convert to set for O(1) lookup
 
     metrics_sum = {
         'dice': 0,
@@ -42,7 +51,7 @@ def evaluate(model, dataloader, device, amp, max_samples=4):
         'accuracy': 0
     }
     num_val_batches = 0
-    samples = [(None, None, None)] * max_samples if max_samples > 0 else []
+    samples = [(None, None, None, None)] * max_samples if max_samples > 0 else []
     collected = 0
 
     # Use tqdm for progress tracking
@@ -73,16 +82,20 @@ def evaluate(model, dataloader, device, amp, max_samples=4):
                     metrics_sum[metric] += batch_metrics[metric]
 
                 # Sample collection with memory optimization
-                if collected < max_samples:
-                    with torch.cuda.amp.autocast(enabled=False):
-                        idx = random.randint(0, len(image) - 1)
-                        # Ensure samples are in full precision
-                        samples[collected] = (
-                            image[idx].detach().cpu().float().numpy(),
-                            mask_pred[idx].detach().cpu().float().numpy(),
-                            mask_true[idx].detach().cpu().float().numpy()
-                        )
-                    collected += 1
+                if max_samples > 0:
+                    batch_start_idx = num_val_batches * dataloader.batch_size
+                    for i in range(len(image)):
+                        global_idx = batch_start_idx + i
+                        if global_idx in selected_indices:
+                            with torch.cuda.amp.autocast(enabled=False):
+                                # Ensure samples are in full precision
+                                sample_idx = len([x for x in samples if x[0] is not None])
+                                samples[sample_idx] = (
+                                    image[i].detach().cpu().float().numpy(),
+                                    mask_pred[i].detach().cpu().float().numpy(),
+                                    mask_true[i].detach().cpu().float().numpy(),
+                                    global_idx
+                                )
 
                 # Memory cleanup
                 del image, mask_true, mask_pred, batch_metrics
