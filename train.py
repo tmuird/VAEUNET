@@ -8,6 +8,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.transforms as transforms
 import torchvision.transforms.functional as TF
+import cv2
 from pathlib import Path
 from torch import optim
 from torch.utils.data import DataLoader, random_split
@@ -58,6 +59,7 @@ def train_model(
         max_images: Optional[int] = None,
         gradient_accumulation_steps: int = 2,
         early_stopping_patience: int = 10,
+        lesion_type: str = 'EX'
 ):
     # Clear cache at start
     if torch.cuda.is_available():
@@ -82,19 +84,27 @@ Initial GPU Status:
         raise RuntimeError(f"Training masks directory not found at {data_dir / 'masks' / 'train'}")
 
     logging.info(f'Loading datasets with patch size: {patch_size} and max images: {max_images}')
-    # Load datasets with logging
-    train_dataset = IDRIDDataset(base_dir='./data',
+    try:
+        train_dataset = IDRIDDataset(base_dir='./data',
                                  split='train',
                                  scale=img_scale,
                                  patch_size=patch_size,
-                                 lesion_type='EX',
+                                 lesion_type=lesion_type,
                                  max_images=max_images)
-    val_dataset = IDRIDDataset(base_dir='./data',
+        val_dataset = IDRIDDataset(base_dir='./data',
                                split='val',
                                scale=img_scale,
                                patch_size=patch_size,
-                               lesion_type='EX',
+                               lesion_type=lesion_type,
                                max_images=max_images)
+    except ValueError as e:
+        logging.error(f"Error creating datasets: {e}")
+        logging.error(f"No valid data found for lesion type {lesion_type}. Please check your data directory.")
+        return
+        
+    if len(train_dataset) == 0 or len(val_dataset) == 0:
+        logging.error(f"Empty dataset found for lesion type {lesion_type}. Please check your data directory.")
+        return
     
     logging.info(f'Dataset sizes:')
     logging.info(f'- Training: {len(train_dataset)} images')
@@ -122,6 +132,7 @@ Initial GPU Status:
 
     # Safely initialize wandb with fallback to offline
     try:
+        
         experiment = wandb.init(
             project='IDRID-UNET',
             resume='allow',
@@ -146,7 +157,7 @@ Initial GPU Status:
             amp=amp,
             patch_size=patch_size,
             classes=1,
-            lesion_type='EX'
+            lesion_type=lesion_type
         )
     )
 
@@ -258,31 +269,54 @@ Initial GPU Status:
                     val_metrics, val_samples = evaluate(model, val_loader, device, amp, max_samples=4)
                     
                     try:
-                        # Log sample images
+                        # Log
                         for i, (img_np, pred_np, true_np, global_idx) in enumerate(val_samples):
-                            img_vis = (img_np.transpose(1,2,0) * 255).clip(0,255).astype('uint8')
-                            pred_vis = (pred_np[0] * 255).clip(0,255).astype('uint8')
-                            true_vis = (true_np[0] * 255).clip(0,255).astype('uint8')
+                            # Prepare image for visualization
+                            img_vis = img_np.transpose(1, 2, 0)  # [C,H,W] -> [H,W,C]
+                            
+                            # Adjust brightness and ensure proper format for W&B media saving
+                            img_vis = (img_vis - img_vis.min()) / (img_vis.max() - img_vis.min())
+                            img_vis = (img_vis * 255).clip(0, 255).astype('uint8')
+                            
+                            # Prepare masks for overlay view
+                            pred_overlay = (pred_np[0] > 0.5).astype('uint8')
+                            true_overlay = (true_np[0] > 0.5).astype('uint8')
+                            
+                            # Prepare masks for separate viewing (full range visualization)
+                            pred_vis = pred_np[0]  # Get the first channel
+                            pred_vis = (pred_vis - pred_vis.min()) / (pred_vis.max() - pred_vis.min() + 1e-8)  # Normalize
+                            pred_vis = (pred_vis * 255).astype('uint8')  # Scale to 0-255
+                            
+                            # Ground truth for separate viewing
+                            true_vis = true_np[0] * 255  # Scale to 0-255
+                            
+                            # Log images and metrics together to ensure proper step alignment
                             wandb.log({
-                                f"val_image_e{epoch}_s{global_step}_idx{global_idx}": wandb.Image(
+                                # Overlay view
+                                f"{global_idx}_comparison": wandb.Image(
                                     img_vis,
                                     masks={
-                                        "prediction": {"mask_data": pred_vis, "class_labels": {1: "Lesion"}},
-                                        "ground_truth": {"mask_data": true_vis, "class_labels": {1: "Lesion"}}
+                                        "predictions": {
+                                            "mask_data": pred_overlay,
+                                            "class_labels": {1: "Prediction"}
+                                        },
+                                        "ground_truth": {
+                                            "mask_data": true_overlay,
+                                            "class_labels": {1: "Ground Truth"}
+                                        }
                                     }
                                 ),
+                                # Separate images for VS Code viewing
+                                f"{global_idx}_image": wandb.Image(img_vis),
+                                f"{global_idx}_pred": wandb.Image(pred_vis),
+                                f"{global_idx}_true": wandb.Image(true_vis),
+                                # Include metrics in the same log call
+                                **{f'val/{k}': v for k, v in val_metrics.items()},
+                                'learning_rate': optimizer.param_groups[0]['lr'],
                                 'epoch': epoch,
                                 'step': global_step
                             })
-                            del img_vis, pred_vis, true_vis
-                            
-                        # Log metrics
-                        wandb.log({
-                            **{f'val/{k}': v for k, v in val_metrics.items()},
-                            'epoch': epoch,
-                            'step': global_step,
-                            'learning_rate': optimizer.param_groups[0]['lr']
-                        })
+                            del img_vis, pred_vis, true_vis, pred_overlay, true_overlay
                     except wandb.errors.Error as e:
                         logging.warning(f"Could not log to W&B (validation). Error: {e}")
 
@@ -355,6 +389,7 @@ def get_args():
     parser.add_argument('--max-images', type=int, default=None, help='Maximum number of images to process')
     parser.add_argument('--gradient-accumulation-steps', type=int, default=2, help='Gradient accumulation steps')
     parser.add_argument('--early-stopping-patience', type=int, default=10, help='Early stopping patience')
+    parser.add_argument('--lesion-type', type=str, default='EX', help='Lesion type')
     return parser.parse_args()
 
 
@@ -403,6 +438,7 @@ if __name__ == '__main__':
             amp=args.amp,
             gradient_accumulation_steps=args.gradient_accumulation_steps,
             early_stopping_patience=args.early_stopping_patience,
+            lesion_type=args.lesion_type,
         )
     except torch.cuda.OutOfMemoryError:
         logging.error('Detected OutOfMemoryError! '
@@ -422,4 +458,5 @@ if __name__ == '__main__':
             amp=args.amp,
             gradient_accumulation_steps=args.gradient_accumulation_steps,
             early_stopping_patience=args.early_stopping_patience,
+            lesion_type=args.lesion_type,
         )

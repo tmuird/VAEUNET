@@ -4,6 +4,7 @@ from tqdm import tqdm
 from utils.metrics import get_all_metrics
 import random
 import os
+import logging
 
 # At start of script
 os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
@@ -90,10 +91,14 @@ def evaluate(model, dataloader, device, amp, max_samples=4):
                             with torch.cuda.amp.autocast(enabled=False):
                                 # Ensure samples are in full precision
                                 sample_idx = len([x for x in samples if x[0] is not None])
+                                image_np = image[i].detach().cpu().float().numpy()
+                                pred_np = mask_pred[i].detach().cpu().float().numpy()
+                                true_np = mask_true[i].detach().cpu().float().numpy()
+                                logging.info(f"Eval image stats - min: {image_np.min():.3f}, max: {image_np.max():.3f}, mean: {image_np.mean():.3f}")
                                 samples[sample_idx] = (
-                                    image[i].detach().cpu().float().numpy(),
-                                    mask_pred[i].detach().cpu().float().numpy(),
-                                    mask_true[i].detach().cpu().float().numpy(),
+                                    image_np,
+                                    pred_np,
+                                    true_np,
                                     global_idx
                                 )
 

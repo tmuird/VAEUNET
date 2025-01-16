@@ -195,13 +195,16 @@ class IDRIDDataset(Dataset):
         if max_images is not None:
             self.ids = self.ids[:max_images]
 
-        # Check mask existence
-        for img_id in self.ids:
-            mask_path = self.masks_dir / self.lesion_type / f"{img_id}_{self.lesion_type}.tif"
-            if not mask_path.exists():
-                logging.warning(f"No mask found for {img_id}")
-            else:
-                pass  # you can load & check if you want
+        # Check mask existence and filter out images without masks
+        self.ids = [
+            img_id for img_id in self.ids
+            if (self.masks_dir / self.lesion_type / f"{img_id}_{self.lesion_type}.tif").exists()
+        ]
+        
+        if not self.ids:
+            raise RuntimeError(f'No valid image-mask pairs found in {self.images_dir} and {self.masks_dir}')
+
+        logging.info(f"Found {len(self.ids)} valid image-mask pairs")
 
         # Store patch metadata instead of actual patches
         self.patch_metadata = {}
@@ -286,21 +289,24 @@ class IDRIDDataset(Dataset):
             # If no patch_size set, store the entire image as a single patch
             if self.patch_size is None:
                 patch_path = self.patches_dir / f"{img_id}_full"
+                has_lesion = torch.any(mask_tensor > 0.5)
                 torch.save({
                     'image': img_tensor,
                     'mask': mask_tensor,
                     'coords': (0, 0),
-                    'has_lesion': torch.any(mask_tensor > 0.5)
+                    'has_lesion': has_lesion
                 }, patch_path)
                 
                 metadata = {
                     'path': patch_path,
                     'coords': (0, 0),
-                    'has_lesion': torch.any(mask_tensor > 0.5).item(),
+                    'has_lesion': has_lesion.item(),
                     'img_id': img_id
                 }
                 self.patch_metadata[img_id] = [metadata]
-                self.patch_indices.append((img_id, 0))
+                if has_lesion:
+                    positive_count += 1
+                patch_index.append((img_id, str(patch_path), has_lesion))
                 logging.info(f"{img_id}: 1 patch (full image) with shape {img_tensor.shape}.")
                 continue
 
@@ -338,30 +344,29 @@ class IDRIDDataset(Dataset):
 
         logging.info(f"Found {positive_count} positive patches and {len(negative_paths)} negative patches")
 
-        # Randomly select negative patches equal to positive count
-        random.shuffle(negative_paths)
-        selected_negative_paths = negative_paths[:positive_count]
+        if self.patch_size is None:
+            # For full images, use all patches directly
+            self.patch_indices = patch_index
+            logging.info(f"Saved {len(self.patch_indices)} full images to {self.patches_dir}")
+        else:
+            # For patches, balance positive and negative samples
+            random.shuffle(negative_paths)
+            selected_negative_paths = negative_paths[:positive_count]
 
-        # Add selected negative patches to index
-        for img_id, path in selected_negative_paths:
-            patch_index.append((img_id, path, False))
+            # Add selected negative patches to index
+            for img_id, path in selected_negative_paths:
+                patch_index.append((img_id, path, False))
 
-        # Remove unselected negative patches to save disk space
-        for img_id, path in negative_paths[positive_count:]:
-            try:
-                os.remove(path)
-            except OSError as e:
-                logging.warning(f"Could not remove unselected negative patch {path}: {e}")
+            # Remove unselected negative patches to save disk space
+            for img_id, path in negative_paths[positive_count:]:
+                try:
+                    os.remove(path)
+                except OSError as e:
+                    logging.warning(f"Error removing {path}: {e}")
 
-        # Save patch index
-        random.shuffle(patch_index)  # Shuffle final index
-        self.patch_index_file = self.patches_dir / 'patch_index.txt'
-        with open(self.patch_index_file, 'w') as f:
-            for img_id, path, has_lesion in patch_index:
-                f.write(f"{img_id}\t{path}\t{has_lesion}\n")
-
-        self.patch_indices = patch_index  # Set the patch_indices attribute
-        logging.info(f"Saved {len(patch_index)} balanced patches to {self.patches_dir}")
+            # Save final patch index
+            self.patch_indices = patch_index
+            logging.info(f"Saved {len(self.patch_indices)} balanced patches to {self.patches_dir}")
 
     def preprocess(self, pil_img: Image.Image, scale: float, is_mask: bool):
         """Resize and convert to np array. For masks => single channel. For images => 3 channels."""
@@ -391,27 +396,36 @@ class IDRIDDataset(Dataset):
             return arr
 
     def __getitem__(self, idx):
-        """Return a single patch (image, mask) loaded from disk."""
-        img_id, patch_path, _ = self.patch_indices[idx]
+        """Return a single patch (image, mask) loaded from disk. If patch_size is None, returns full image."""
+        if self.patch_size is None:
+            img_id = self.patch_indices[idx][0]
+            patch_data = torch.load(self.patches_dir / f"{img_id}_full")
+        else:
+            img_id, patch_path, _ = self.patch_indices[idx]
+            patch_data = torch.load(patch_path)
         
-        # Load patch from disk
-        patch_data = torch.load(patch_path)
+        # Get image and mask from patch data
+        image = patch_data['image']
+        mask = patch_data['mask']
         
         sample = {
-            'image': patch_data['image'],
-            'mask': patch_data['mask']
+            'image': image,
+            'mask': mask,
+            'img_id': img_id
         }
 
         if self.transform is not None:
-            transformed = self.transform(image=sample['image'].permute(1,2,0).numpy(), 
-                                       mask=sample['mask'].permute(1,2,0).numpy())
-            sample['image'] = torch.from_numpy(transformed['image']).permute(2,0,1)
-            sample['mask'] = torch.from_numpy(transformed['mask']).permute(2,0,1)
+            # Convert to numpy for albumentations (expecting HWC format)
+            image_np = sample['image'].permute(1, 2, 0).numpy()
+            mask_np = sample['mask'].permute(1, 2, 0).numpy()
+            
+            transformed = self.transform(image=image_np, mask=mask_np)
+            
+            # Convert back to torch tensors (CHW format)
+            sample['image'] = torch.from_numpy(transformed['image']).permute(2, 0, 1)
+            sample['mask'] = torch.from_numpy(transformed['mask']).permute(2, 0, 1)
 
         return sample
 
     def __len__(self):
         return len(self.patch_indices)
-
-    def shuffle_patches(self):
-        random.shuffle(self.patch_indices)
