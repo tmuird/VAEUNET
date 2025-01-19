@@ -18,7 +18,9 @@ from utils import metrics
 import wandb
 from evaluate import evaluate
 from unet import UNet
+from unet.unet_resnet import UNetResNet
 from utils.data_loading import IDRIDDataset
+from utils.loss import CombinedLoss
 import numpy as np
 
 # Add CUDA error handling
@@ -59,7 +61,9 @@ def train_model(
         max_images: Optional[int] = None,
         gradient_accumulation_steps: int = 2,
         early_stopping_patience: int = 10,
-        lesion_type: str = 'EX'
+        lesion_type: str = 'EX',
+        backbone: str = 'resnet34',
+        pretrained: bool = True
 ):
     # Clear cache at start
     if torch.cuda.is_available():
@@ -157,7 +161,9 @@ Initial GPU Status:
             amp=amp,
             patch_size=patch_size,
             classes=1,
-            lesion_type=lesion_type
+            lesion_type=lesion_type,
+            backbone=backbone,
+            pretrained=pretrained
         )
     )
 
@@ -173,9 +179,12 @@ Initial GPU Status:
         Mixed Precision: {amp}
         Patch size:      {patch_size}
         Max images:      {max_images}
+        Backbone:        {backbone}
+        Pretrained:      {pretrained}
     ''')
 
-    # Use appropriate optimizer
+    # Use combined loss function with balanced weights
+    criterion = CombinedLoss(bce_weight=0.5, dice_weight=0.5)
     optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-5)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, 
@@ -186,8 +195,6 @@ Initial GPU Status:
         factor=0.5
     )
     grad_scaler = torch.amp.GradScaler(enabled=amp)
-    criterion = nn.CrossEntropyLoss() if model.n_classes > 1 else nn.BCEWithLogitsLoss()
-
     global_step = 0
 
     # Move model to device and optimize memory format
@@ -222,10 +229,7 @@ Initial GPU Status:
 
                 with torch.autocast(device.type if device.type != 'mps' else 'cpu', enabled=amp):
                     masks_pred = model(images)
-                    if model.n_classes == 1:
-                        loss = criterion(masks_pred, masks.float())
-                    else:
-                        loss = criterion(masks_pred, masks)
+                    loss = criterion(masks_pred, masks)
                     # Scale loss for gradient accumulation
                     loss = loss / gradient_accumulation_steps
 
@@ -376,46 +380,46 @@ def get_args():
     parser.add_argument('--learning-rate', '-l', metavar='LR', type=float, default=1e-4, help='Learning rate')
     parser.add_argument('--load', '-f', type=str, default=False, help='Load model from a .pth file')
     parser.add_argument('--scale', '-s', type=float, default=1.0, help='Downscaling factor of the images')
-    parser.add_argument('--patch-size', '-p', type=lambda x: None if x.lower() == 'none' else int(x),
-                        default=None, help='Size of patches to extract (use None to disable)')
     parser.add_argument('--validation', '-v', dest='val', type=float, default=10.0,
                         help='Percent of the data that is used as validation (0-100)')
     parser.add_argument('--amp', action='store_true', default=True, help='Use mixed precision')
+    parser.add_argument('--bilinear', action='store_true', default=False, help='Use bilinear upsampling')
     parser.add_argument('--classes', '-c', type=int, default=1, help='Number of classes')
+    parser.add_argument('--patch-size', '-p', type=lambda x: None if x.lower() == 'none' else int(x),
+                        default=None, help='Size of patches to extract (use None to disable)')
     parser.add_argument('--gradient-clipping', type=float, default=1.0, help='Gradient clipping value')
+    parser.add_argument('--max-images', type=int, default=None, help='Maximum number of images to process')
     parser.add_argument('--use-checkpointing', action='store_true', default=True,
                         help='Use gradient checkpointing to reduce memory usage')
-    parser.add_argument('--bilinear', action='store_true', default=False, help='Use bilinear upsampling')
-    parser.add_argument('--max-images', type=int, default=None, help='Maximum number of images to process')
     parser.add_argument('--gradient-accumulation-steps', type=int, default=2, help='Gradient accumulation steps')
     parser.add_argument('--early-stopping-patience', type=int, default=10, help='Early stopping patience')
     parser.add_argument('--lesion-type', type=str, default='EX', help='Lesion type')
+    parser.add_argument('--model-type', type=str, default='resnet', choices=['basic', 'resnet'], 
+                      help='Model type: basic (original UNet) or resnet (UNet with ResNet34 encoder)')
     return parser.parse_args()
 
 
 if __name__ == '__main__':
     args = get_args()
 
-    # Set up logging with more detail
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(levelname)s - %(message)s',
-        datefmt='%H:%M:%S'
-    )
-    
+    logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     logging.info(f'Using device {device}')
-    logging.info(f'Training configuration:')
-    logging.info(f'- Patch size: {args.patch_size}')
-    logging.info(f'- Scale: {args.scale}')
-    logging.info(f'- Batch size: {args.batch_size}')
-    logging.info(f'- Learning rate: {args.learning_rate}')
 
-    model = UNet(
-        n_channels=3, 
-        n_classes=1, 
-        bilinear=args.bilinear,
-    )
+    # Model initialization based on type
+    if args.model_type == 'resnet':
+        model = UNetResNet(
+            n_channels=3,
+            n_classes=1,
+            backbone='resnet34',
+            pretrained=True
+        )
+    else:
+        model = UNet(
+            n_channels=3,
+            n_classes=1,
+            bilinear=args.bilinear
+        )
     model = model.to(memory_format=torch.channels_last)
     
     if args.load:
@@ -439,6 +443,8 @@ if __name__ == '__main__':
             gradient_accumulation_steps=args.gradient_accumulation_steps,
             early_stopping_patience=args.early_stopping_patience,
             lesion_type=args.lesion_type,
+            backbone='resnet34',
+            pretrained=True,
         )
     except torch.cuda.OutOfMemoryError:
         logging.error('Detected OutOfMemoryError! '
@@ -459,4 +465,6 @@ if __name__ == '__main__':
             gradient_accumulation_steps=args.gradient_accumulation_steps,
             early_stopping_patience=args.early_stopping_patience,
             lesion_type=args.lesion_type,
+            backbone='resnet34',
+            pretrained=True,
         )
