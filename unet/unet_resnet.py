@@ -45,10 +45,20 @@ class DecoderBlock(nn.Module):
         )
         
     def forward(self, x, skip=None):
-        x = F.interpolate(x, scale_factor=2, mode='bilinear', align_corners=True)
+        # Compute output size based on skip connection if it exists
         if skip is not None:
+            output_size = skip.shape[2:]
+        else:
+            output_size = (x.shape[2] * 2, x.shape[3] * 2)
+            
+        # Upsample x to match skip connection size
+        x = F.interpolate(x, size=output_size, mode='bilinear', align_corners=True)
+        
+        if skip is not None:
+            # Apply attention and concatenate
             skip = self.attention(x, skip)
             x = torch.cat([x, skip], dim=1)
+            
         x = self.conv1(x)
         x = self.conv2(x)
         return x

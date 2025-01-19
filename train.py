@@ -274,7 +274,7 @@ Initial GPU Status:
                     
                     try:
                         # Log
-                        for i, (img_np, pred_np, true_np, global_idx) in enumerate(val_samples):
+                        for i, (img_np, pred_np, true_np, _) in enumerate(val_samples):
                             # Prepare image for visualization
                             img_vis = img_np.transpose(1, 2, 0)  # [C,H,W] -> [H,W,C]
                             
@@ -294,10 +294,13 @@ Initial GPU Status:
                             # Ground truth for separate viewing
                             true_vis = true_np[0] * 255  # Scale to 0-255
                             
+                            # Use global step in image names for proper tracking
+                            img_name = f"step_{global_step}_sample_{i}"
+                            
                             # Log images and metrics together to ensure proper step alignment
                             wandb.log({
                                 # Overlay view
-                                f"{global_idx}_comparison": wandb.Image(
+                                f"{img_name}_comparison": wandb.Image(
                                     img_vis,
                                     masks={
                                         "predictions": {
@@ -311,9 +314,9 @@ Initial GPU Status:
                                     }
                                 ),
                                 # Separate images for VS Code viewing
-                                f"{global_idx}_image": wandb.Image(img_vis),
-                                f"{global_idx}_pred": wandb.Image(pred_vis),
-                                f"{global_idx}_true": wandb.Image(true_vis),
+                                f"{img_name}_image": wandb.Image(img_vis),
+                                f"{img_name}_pred": wandb.Image(pred_vis),
+                                f"{img_name}_true": wandb.Image(true_vis),
                                 # Include metrics in the same log call
                                 **{f'val/{k}': v for k, v in val_metrics.items()},
                                 'learning_rate': optimizer.param_groups[0]['lr'],
