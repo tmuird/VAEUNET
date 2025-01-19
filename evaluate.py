@@ -1,7 +1,8 @@
 import torch
 import torch.nn.functional as F
 from tqdm import tqdm
-from utils.metrics import get_all_metrics
+from utils.metrics import get_all_metrics, dice_score
+from utils import metrics
 import random
 import os
 import logging
@@ -67,9 +68,13 @@ def evaluate(model, dataloader, device, amp, max_samples=4):
                 mask_true = batch['mask'].to(device=device, dtype=dtype, non_blocking=True)
 
                 # Compute prediction
-                logits = model(image)
-                mask_pred = torch.sigmoid(logits)
-                del logits
+                mask_pred = model(image)
+                
+                # Take only the main output if in training mode (ignoring deep supervision outputs)
+                if isinstance(mask_pred, list):
+                    mask_pred = mask_pred[0]
+                
+                mask_pred = torch.sigmoid(mask_pred)
 
                 # Binary prediction for metrics
                 mask_bin = (mask_pred > 0.5).float()
@@ -81,6 +86,9 @@ def evaluate(model, dataloader, device, amp, max_samples=4):
                 # Update metrics
                 for metric in metrics_sum:
                     metrics_sum[metric] += batch_metrics[metric]
+
+                # compute the Dice score
+                metrics_sum['dice'] += metrics.dice_score(mask_pred, mask_true)
 
                 # Sample collection with memory optimization
                 if max_samples > 0:
