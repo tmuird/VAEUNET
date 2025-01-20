@@ -8,8 +8,9 @@ import torch.nn.functional as F
 from PIL import Image
 from torchvision import transforms
 
-from utils.data_loading import BasicDataset
 from unet import UNet
+from unet.unet_resnet import UNetResNet
+from utils.data_loading import BasicDataset
 from utils.utils import plot_img_and_mask
 
 def predict_img(net,
@@ -167,18 +168,33 @@ if __name__ == '__main__':
     in_files = args.input
     out_files = get_output_filenames(args)
 
-    net = UNet(n_channels=3, n_classes=args.classes, bilinear=args.bilinear)
+    # Initialize UNetResNet instead of UNet
+    net = UNetResNet(
+        n_channels=3,
+        n_classes=args.classes,
+        backbone='resnet34',
+        pretrained=False  # We're loading our own weights
+    )
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     logging.info(f'Loading model {args.model}')
     logging.info(f'Using device {device}')
 
     net.to(device=device)
-    checkpoint = torch.load(args.model, map_location=device)
-    mask_values = checkpoint.pop('mask_values', [0, 1])
-    net.load_state_dict(checkpoint['model_state_dict'])
-
-    logging.info('Model loaded!')
+    try:
+        checkpoint = torch.load(args.model, map_location=device)
+        # Try to load as a state dict first
+        if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+            net.load_state_dict(checkpoint['model_state_dict'])
+            mask_values = checkpoint.pop('mask_values', [0, 1])
+        else:
+            # If it's just the state dict itself
+            net.load_state_dict(checkpoint)
+            mask_values = [0, 1]
+        logging.info('Model loaded successfully!')
+    except Exception as e:
+        logging.error(f'Error loading model: {str(e)}')
+        raise
 
     for i, filename in enumerate(in_files):
         logging.info(f'\nPredicting image {filename} ...')

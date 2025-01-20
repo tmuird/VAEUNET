@@ -224,28 +224,29 @@ class IDRIDDataset(Dataset):
                 
                 # CAREFUL WITH THESE - Modify parameters
                 A.RandomBrightnessContrast(
-                    brightness_limit=0.1,   # Reduced from 0.2 - hard exudates are bright yellow
-                    contrast_limit=0.1,     # Reduced from 0.2 - preserve lesion contrast
-                    p=0.3                   # Reduced probability
+                    brightness_limit=0.15,   # Reduced from 0.2 - hard exudates are bright yellow
+                    contrast_limit=0.15,     # Reduced from 0.2 - preserve lesion contrast
+                    p=0.5                   # Reduced probability
                 ),
                 
                 # ADD THESE - Specific for hard exudates
                 A.CLAHE(                   # Enhance contrast locally - helps with exudate detection
-                    clip_limit=2.0,
+                    clip_limit=3.0,
                     tile_grid_size=(8, 8),
-                    p=0.5
+                    p=0.3
                 ),
                 
                 # BE CAREFUL WITH ROTATION - Modify parameters
                 A.ShiftScaleRotate(
-                    shift_limit=0.1,        # Reduced from 0.2 - avoid displacing lesions too much
-                    scale_limit=0.1,        # Reduced from 0.2
-                    rotate_limit=15,        # Reduced from 30 - small rotations only
-                    p=0.3                   # Reduced probability
+                    shift_limit=0.15,        # Reduced from 0.2 - avoid displacing lesions too much
+                    scale_limit=0.15,        # Reduced from 0.2
+                    rotate_limit=30,        # Reduced from 30 - small rotations only
+                    p=0.5                   # Reduced probability
                 ),
                 
                 # Remove HueSaturationValue as it might alter the characteristic 
                 # yellow color of hard exudates
+                A.GaussNoise(var_limit=(5.0,20,0),p=0.2),
             ])
 
     def precompute_all_patches(self):
@@ -399,10 +400,10 @@ class IDRIDDataset(Dataset):
         """Return a single patch (image, mask) loaded from disk. If patch_size is None, returns full image."""
         if self.patch_size is None:
             img_id = self.patch_indices[idx][0]
-            patch_data = torch.load(self.patches_dir / f"{img_id}_full")
+            patch_data = torch.load(self.patches_dir / f"{img_id}_full", map_location='cpu')
         else:
             img_id, patch_path, _ = self.patch_indices[idx]
-            patch_data = torch.load(patch_path)
+            patch_data = torch.load(patch_path, map_location='cpu')
         
         # Get image and mask from patch data
         image = patch_data['image']

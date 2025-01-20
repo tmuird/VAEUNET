@@ -273,31 +273,27 @@ Initial GPU Status:
                     val_metrics, val_samples = evaluate(model, val_loader, device, amp, max_samples=4)
                     
                     try:
-                        # Log
-                        for i, (img_np, pred_np, true_np, _) in enumerate(val_samples):
-                            # Prepare image for visualization
-                            img_vis = img_np.transpose(1, 2, 0)  # [C,H,W] -> [H,W,C]
-                            
-                            # Adjust brightness and ensure proper format for W&B media saving
-                            img_vis = (img_vis - img_vis.min()) / (img_vis.max() - img_vis.min())
-                            img_vis = (img_vis * 255).clip(0, 255).astype('uint8')
-                            
-                            # Prepare masks for overlay view
-                            pred_overlay = (pred_np[0] > 0.5).astype('uint8')
-                            true_overlay = (true_np[0] > 0.5).astype('uint8')
-                            
-                            # Prepare masks for separate viewing (full range visualization)
-                            pred_vis = pred_np[0]  # Get the first channel
-                            pred_vis = (pred_vis - pred_vis.min()) / (pred_vis.max() - pred_vis.min() + 1e-8)  # Normalize
-                            pred_vis = (pred_vis * 255).astype('uint8')  # Scale to 0-255
-                            
-                            # Ground truth for separate viewing
-                            true_vis = true_np[0] * 255  # Scale to 0-255
-                            
-                            # Use global step in image names for proper tracking
-                            img_name = f"step_{global_step}_sample_{i}"
-                            
-                            # Log images and metrics together to ensure proper step alignment
+                        # Log a few examples to wandb
+                        for idx, (img, pred, true_mask, global_step_idx) in enumerate(val_samples):
+                            # Convert tensors to numpy arrays in correct format
+                            img_np = img.numpy()
+                            pred_np = pred.numpy()
+                            true_np = true_mask.numpy()
+
+                            # Handle dimensions correctly - img is [C,H,W]
+                            img_vis = np.transpose(img_np, (1, 2, 0))  # [C,H,W] -> [H,W,C]
+                            pred_vis = pred_np.squeeze()  # Remove any extra dimensions
+                            true_vis = true_np.squeeze()  # Remove any extra dimensions
+
+                            # Normalize image for visualization
+                            img_vis = (img_vis - img_vis.min()) / (img_vis.max() - img_vis.min() + 1e-8)
+
+                            # Create binary overlay masks
+                            pred_overlay = (pred_vis > 0.5).astype(np.uint8)
+                            true_overlay = (true_vis > 0.5).astype(np.uint8)
+
+                            img_name = f"step_{global_step}_sample_{idx}"
+
                             wandb.log({
                                 # Overlay view
                                 f"{img_name}_comparison": wandb.Image(

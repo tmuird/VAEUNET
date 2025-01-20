@@ -5,28 +5,34 @@ import logging
 
 def dice_score(input: Tensor, target: Tensor, reduce_batch_first: bool = False, epsilon: float = 1e-6) -> Tensor:
     """Compute Dice score between input and target tensors"""
-    # Add shape logging
-    logging.debug(f'Dice calculation - Input shape: {input.shape}, Target shape: {target.shape}')
+    # Handle deep supervision outputs
+    if isinstance(input, list):
+        return dice_score(input[0], target, reduce_batch_first, epsilon)
+
+    # Apply sigmoid if not already applied
+    if not isinstance(input, list) and input.requires_grad:
+        input = torch.sigmoid(input)
 
     # Ensure same shape
     if input.shape != target.shape:
         raise ValueError(f'Shape mismatch in dice_score: input {input.shape} vs target {target.shape}')
 
-    if input.dim() > 2 or target.dim() > 2:
-        if reduce_batch_first:
-            input = input.contiguous().view(input.shape[0], -1)
-            target = target.contiguous().view(target.shape[0], -1)
-        else:
-            input = input.contiguous().view(-1)
-            target = target.contiguous().view(-1)
+    # Make input and target contiguous
+    input = input.contiguous()
+    target = target.contiguous()
 
-    intersection = (input * target).sum()
-    denominator = input.sum() + target.sum()
+    # Handle 4D tensors (batch, channel, height, width)
+    if input.dim() == 4:
+        intersection = (input * target).sum(dim=(2, 3))
+        denominator = input.sum(dim=(2, 3)) + target.sum(dim=(2, 3))
+        dice = ((2.0 * intersection + epsilon) / (denominator + epsilon)).mean()
+    else:
+        # For flattened or other dimensional tensors
+        intersection = (input * target).sum()
+        denominator = input.sum() + target.sum()
+        dice = (2.0 * intersection + epsilon) / (denominator + epsilon)
 
-    if denominator.item() == 0:
-        return torch.tensor(1.0).to(input.device)
-
-    return (2.0 * intersection + epsilon) / (denominator + epsilon)
+    return dice
 
 def multiclass_dice_score(input: Tensor, target: Tensor, reduce_batch_first: bool = False, epsilon: float = 1e-6) -> Tensor:
     """Average of Dice score for all classes"""
@@ -37,24 +43,81 @@ def dice_loss(input: Tensor, target: Tensor, multiclass: bool = False) -> Tensor
     fn = multiclass_dice_score if multiclass else dice_score
     return 1 - fn(input, target, reduce_batch_first=True)
 
+def get_confusion_matrix(pred: Tensor, target: Tensor, threshold: float = 0.5) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+    """Compute confusion matrix elements (TP, FP, TN, FN)"""
+    # For evaluation metrics, we threshold
+    pred_binary = (pred > threshold).float()
+    target_binary = (target > threshold).float()
+    
+    # Sum over spatial dimensions (H,W) if they exist
+    if pred.dim() > 2:
+        tp = (pred_binary * target_binary).sum(dim=(-2,-1))
+        fp = pred_binary.sum(dim=(-2,-1)) - tp
+        fn = target_binary.sum(dim=(-2,-1)) - tp
+        tn = pred_binary[...,0,0].numel() - tp - fp - fn  # Count batch size correctly
+    else:
+        tp = (pred_binary * target_binary).sum()
+        fp = pred_binary.sum() - tp
+        fn = target_binary.sum() - tp
+        tn = pred_binary.numel() - tp - fp - fn
+    
+    return tp, fp, tn, fn
+
+def get_all_metrics(pred: Tensor, target: Tensor, epsilon: float = 1e-6) -> Dict[str, float]:
+    """Compute all metrics at once efficiently"""
+    # Handle deep supervision outputs
+    if isinstance(pred, list):
+        pred = pred[0]
+    
+    # Apply sigmoid for probability scores
+    pred = torch.sigmoid(pred)
+    
+    # Calculate Dice using the same method as loss function
+    dice = dice_score(pred, target, epsilon=epsilon)
+    
+    # Get confusion matrix for binary metrics
+    tp, fp, tn, fn = get_confusion_matrix(pred, target)
+    
+    # Calculate metrics using confusion matrix elements and take mean over batch
+    precision = ((tp + epsilon) / (tp + fp + epsilon)).mean()
+    recall = ((tp + epsilon) / (tp + fn + epsilon)).mean()
+    specificity = ((tn + epsilon) / (tn + fp + epsilon)).mean()
+    f1 = (2 * (precision * recall) / (precision + recall + epsilon)).mean()
+    accuracy = ((tp + tn) / (tp + tn + fp + fn)).mean()
+    
+    # Calculate IoU using binary predictions
+    intersection_binary = tp
+    union_binary = tp + fp + fn
+    iou = ((intersection_binary + epsilon) / (union_binary + epsilon)).mean()
+    
+    return {
+        'dice': dice.item(),
+        'iou': iou.item(),
+        'precision': precision.item(),
+        'recall': recall.item(),
+        'specificity': specificity.item(),
+        'f1': f1.item(),
+        'accuracy': accuracy.item()
+    }
+
 def iou_score(pred: Tensor, target: Tensor, epsilon: float = 1e-6) -> Tensor:
     """Compute Intersection over Union score"""
-    pred = (pred > 0.5).float()
-    target = (target > 0.5).float()
+    pred_binary = (pred > 0.5).float()
+    target_binary = (target > 0.5).float()
     
-    intersection = (pred * target).sum()
-    union = pred.sum() + target.sum() - intersection
+    intersection = (pred_binary * target_binary).sum()
+    union = pred_binary.sum() + target_binary.sum() - intersection
     
     return (intersection + epsilon) / (union + epsilon)
 
 def precision_recall(pred: Tensor, target: Tensor, epsilon: float = 1e-6) -> Tuple[Tensor, Tensor]:
     """Compute Precision and Recall scores"""
-    pred = (pred > 0.5).float()
-    target = (target > 0.5).float()
+    pred_binary = (pred > 0.5).float()
+    target_binary = (target > 0.5).float()
     
-    tp = (pred * target).sum()
-    fp = pred.sum() - tp
-    fn = target.sum() - tp
+    tp = (pred_binary * target_binary).sum()
+    fp = pred_binary.sum() - tp
+    fn = target_binary.sum() - tp
     
     precision = (tp + epsilon) / (tp + fp + epsilon)
     recall = (tp + epsilon) / (tp + fn + epsilon)
@@ -63,11 +126,11 @@ def precision_recall(pred: Tensor, target: Tensor, epsilon: float = 1e-6) -> Tup
 
 def specificity(pred: Tensor, target: Tensor, epsilon: float = 1e-6) -> Tensor:
     """Compute Specificity (True Negative Rate)"""
-    pred = (pred > 0.5).float()
-    target = (target > 0.5).float()
+    pred_binary = (pred > 0.5).float()
+    target_binary = (target > 0.5).float()
     
-    tn = ((1 - pred) * (1 - target)).sum()
-    fp = pred.sum() - (pred * target).sum()
+    tn = ((1 - pred_binary) * (1 - target_binary)).sum()
+    fp = pred_binary.sum() - (pred_binary * target_binary).sum()
     
     return (tn + epsilon) / (tn + fp + epsilon)
 
@@ -77,36 +140,13 @@ def f1_score(precision: Tensor, recall: Tensor, epsilon: float = 1e-6) -> Tensor
 
 def accuracy(pred: Tensor, target: Tensor) -> Tensor:
     """Compute Accuracy score"""
-    pred = (pred > 0.5).float()
-    target = (target > 0.5).float()
+    pred_binary = (pred > 0.5).float()
+    target_binary = (target > 0.5).float()
     
-    correct = (pred == target).float().sum()
+    correct = (pred_binary == target_binary).float().sum()
     total = torch.numel(pred)
     
     return correct / total
-
-def get_all_metrics(pred: Tensor, target: Tensor, epsilon: float = 1e-6) -> Dict[str, float]:
-    """Compute all metrics at once"""
-    # Ensure inputs are on the same device
-    pred = pred.to(target.device)
-    
-    # Calculate all metrics
-    dice = dice_score(pred, target, epsilon=epsilon)
-    iou = iou_score(pred, target, epsilon)
-    prec, rec = precision_recall(pred, target, epsilon)
-    spec = specificity(pred, target, epsilon)
-    f1 = f1_score(prec, rec, epsilon)
-    acc = accuracy(pred, target)
-    
-    return {
-        'dice': dice.item(),
-        'iou': iou.item(),
-        'precision': prec.item(),
-        'recall': rec.item(),
-        'specificity': spec.item(),
-        'f1': f1.item(),
-        'accuracy': acc.item()
-    }
 
 class MetricTracker:
     """Class to track metrics during training"""

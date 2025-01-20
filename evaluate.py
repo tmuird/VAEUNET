@@ -43,16 +43,17 @@ def evaluate(model, dataloader, device, amp, max_samples=4):
         selected_indices = random.sample(range(total_samples), min(max_samples, total_samples))
         selected_indices = set(selected_indices)  # Convert to set for O(1) lookup
 
+    # Initialize metric tracking with sample counts
     metrics_sum = {
-        'dice': 0,
-        'iou': 0,
-        'precision': 0,
-        'recall': 0,
-        'specificity': 0,
-        'f1': 0,
-        'accuracy': 0
+        'dice': 0.0,
+        'iou': 0.0,
+        'precision': 0.0,
+        'recall': 0.0,
+        'specificity': 0.0,
+        'f1': 0.0,
+        'accuracy': 0.0
     }
-    num_val_batches = 0
+    total_processed = 0
     samples = [(None, None, None, None)] * max_samples if max_samples > 0 else []
     collected = 0
 
@@ -66,6 +67,7 @@ def evaluate(model, dataloader, device, amp, max_samples=4):
                 dtype = torch.float16 if amp else torch.float32
                 image = batch['image'].to(device=device, dtype=dtype, non_blocking=True)
                 mask_true = batch['mask'].to(device=device, dtype=dtype, non_blocking=True)
+                batch_size = image.size(0)
 
                 # Compute prediction
                 mask_pred = model(image)
@@ -74,54 +76,37 @@ def evaluate(model, dataloader, device, amp, max_samples=4):
                 if isinstance(mask_pred, list):
                     mask_pred = mask_pred[0]
                 
-                mask_pred = torch.sigmoid(mask_pred)
+                # Calculate metrics (sigmoid is applied inside get_all_metrics)
+                batch_metrics = metrics.get_all_metrics(mask_pred, mask_true)
 
-                # Binary prediction for metrics
-                mask_bin = (mask_pred > 0.5).float()
-
-                # Compute metrics
-                batch_metrics = get_all_metrics(mask_bin, mask_true)
-                del mask_bin
-
-                # Update metrics
+                # Update metrics with proper weighting by batch size
                 for metric in metrics_sum:
-                    metrics_sum[metric] += batch_metrics[metric]
-
-                # compute the Dice score
-                metrics_sum['dice'] += metrics.dice_score(mask_pred, mask_true)
+                    metrics_sum[metric] += batch_metrics[metric] * batch_size
+                total_processed += batch_size
 
                 # Sample collection with memory optimization
                 if max_samples > 0:
-                    batch_start_idx = num_val_batches * dataloader.batch_size
+                    batch_start_idx = total_processed - batch_size
                     for i in range(len(image)):
                         global_idx = batch_start_idx + i
                         if global_idx in selected_indices:
-                            with torch.cuda.amp.autocast(enabled=False):
-                                # Ensure samples are in full precision
-                                sample_idx = len([x for x in samples if x[0] is not None])
-                                image_np = image[i].detach().cpu().float().numpy()
-                                pred_np = mask_pred[i].detach().cpu().float().numpy()
-                                true_np = mask_true[i].detach().cpu().float().numpy()
-                                logging.info(f"Eval image stats - min: {image_np.min():.3f}, max: {image_np.max():.3f}, mean: {image_np.mean():.3f}")
+                            # Store samples in full precision without autocast
+                            sample_idx = len([x for x in samples if x[0] is not None])
+                            if sample_idx < max_samples:
+                                # Apply sigmoid for visualization
+                                mask_pred_viz = torch.sigmoid(mask_pred[i])
                                 samples[sample_idx] = (
-                                    image_np,
-                                    pred_np,
-                                    true_np,
+                                    image[i].cpu(),
+                                    mask_pred_viz.cpu(),
+                                    mask_true[i].cpu(),
                                     global_idx
                                 )
+                                collected += 1
 
-                # Memory cleanup
-                del image, mask_true, mask_pred, batch_metrics
-                torch.cuda.empty_cache()
-
-            num_val_batches += 1
             pbar.update(1)
+            pbar.set_postfix(**{k: f'{v/total_processed:.3f}' for k, v in metrics_sum.items()})
 
-    # Calculate mean metrics
-    metrics_mean = {metric: value / num_val_batches for metric, value in metrics_sum.items()}
-    
-    # Clean up samples list
-    if max_samples > 0:
-        samples = [s for s in samples if s[0] is not None]
+    # Compute final averages
+    metrics_mean = {metric: value/total_processed for metric, value in metrics_sum.items()}
 
     return metrics_mean, samples
