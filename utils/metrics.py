@@ -2,6 +2,7 @@ import torch
 from torch import Tensor
 from typing import Dict, Tuple
 import logging
+from torchmetrics.functional import dice
 
 def dice_score(input: Tensor, target: Tensor, reduce_batch_first: bool = False, epsilon: float = 1e-6) -> Tensor:
     """Compute Dice score between input and target tensors"""
@@ -11,6 +12,10 @@ def dice_score(input: Tensor, target: Tensor, reduce_batch_first: bool = False, 
     # Ensure same shape
     if input.shape != target.shape:
         raise ValueError(f'Shape mismatch in dice_score: input {input.shape} vs target {target.shape}')
+
+    # Apply thresholding to make predictions binary
+    input = (input > 0.5).float()
+    target = (target > 0.5).float()
 
     if input.dim() > 2 or target.dim() > 2:
         if reduce_batch_first:
@@ -86,49 +91,61 @@ def accuracy(pred: Tensor, target: Tensor) -> Tensor:
     return correct / total
 
 def get_all_metrics(pred: Tensor, target: Tensor, epsilon: float = 1e-6) -> Dict[str, float]:
-    """Compute all metrics at once"""
-    # Ensure inputs are on the same device
-    pred = pred.to(target.device)
+    """Compute metrics following standard medical image segmentation practices"""
+    # Log input statistics
+    logging.info(f'\nMetrics Input Statistics:')
+    logging.info(f'Predictions:\n    Shape: {pred.shape}\n    Min: {pred.min():.4f}, Max: {pred.max():.4f}\n    Mean: {pred.mean():.4f}')
+    logging.info(f'True Masks:\n    Shape: {target.shape}\n    Min: {target.min():.4f}, Max: {target.max():.4f}\n    Mean: {target.mean():.4f}')
     
-    # Calculate all metrics
-    dice = dice_score(pred, target, epsilon=epsilon)
-    iou = iou_score(pred, target, epsilon)
-    prec, rec = precision_recall(pred, target, epsilon)
-    spec = specificity(pred, target, epsilon)
-    f1 = f1_score(prec, rec, epsilon)
+    # Calculate standard metrics
+    dice_val = dice_score(pred, target)
+    iou_val = iou_score(pred, target)
+    prec, recall = precision_recall(pred, target)
+    spec = specificity(pred, target)
+    f1 = f1_score(prec, recall)
     acc = accuracy(pred, target)
     
-    return {
-        'dice': dice.item(),
-        'iou': iou.item(),
+    metrics = {
+        'dice': dice_val.item(),
+        'iou': iou_val.item(),
         'precision': prec.item(),
-        'recall': rec.item(),
+        'recall': recall.item(),
         'specificity': spec.item(),
         'f1': f1.item(),
         'accuracy': acc.item()
     }
+    
+    # Log computed metrics
+    logging.info(f'\nComputed Metrics:')
+    logging.info(f'    Dice: {metrics["dice"]:.4f}')
+    logging.info(f'    IoU: {metrics["iou"]:.4f}')
+    logging.info(f'    F1: {metrics["f1"]:.4f}')
+    
+    return metrics
 
 class MetricTracker:
     """Class to track metrics during training"""
     def __init__(self):
+        # Standard metrics
+        standard_metrics = ['loss', 'dice', 'iou', 'precision', 'recall', 'specificity', 'f1', 'accuracy']
+        
         self.metrics = {
-            'train': {metric: [] for metric in ['loss', 'dice', 'iou', 'precision', 'recall', 'specificity', 'f1', 'accuracy']},
-            'val': {metric: [] for metric in ['loss', 'dice', 'iou', 'precision', 'recall', 'specificity', 'f1', 'accuracy']}
+            'train': {metric: [] for metric in standard_metrics},
+            'val': {metric: [] for metric in standard_metrics}
         }
         self.best_dice = 0.0
-    
+
     def update(self, phase: str, metrics: Dict[str, float]):
         """Update metrics for given phase (train/val)"""
-        for metric, value in metrics.items():
-            self.metrics[phase][metric].append(value)
-    
+        for k, v in metrics.items():
+            self.metrics[phase][k].append(v)
+
     def get_current(self, phase: str) -> Dict[str, float]:
         """Get most recent metrics for given phase"""
-        return {metric: values[-1] if values else 0.0 
-                for metric, values in self.metrics[phase].items()}
-    
+        return {k: v[-1] if v else 0.0 for k, v in self.metrics[phase].items()}
+
     def is_best_dice(self, current_dice: float) -> bool:
-        """Check if current dice score is best"""
+        """Check if current dice score is best (using standard Dice calculated on positive patches only)"""
         if current_dice > self.best_dice:
             self.best_dice = current_dice
             return True

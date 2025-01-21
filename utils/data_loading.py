@@ -13,6 +13,7 @@ import random
 import os
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
+import cv2
 
 def load_image(filename):
     """Load image/mask and force to RGB (3-channel) or L (1-channel) depending on usage."""
@@ -248,6 +249,23 @@ class IDRIDDataset(Dataset):
                 # yellow color of hard exudates
             ])
 
+    def is_valid_patch(self, patch: torch.Tensor, threshold: float = 0.1) -> bool:
+        """Check if patch contains too much black border.
+        
+        Args:
+            patch: Tensor of shape [C, H, W] for image or [1, H, W] for mask
+            threshold: maximum allowed proportion of black pixels (default: 0.1)
+            
+        Returns:
+            bool: True if patch is valid (contains enough non-border pixels)
+        """
+        if patch.dim() == 3:
+            # For RGB patches, consider a pixel black if mean across channels is very dark
+            is_black = (patch.mean(dim=0) < 0.1)  # Adjust threshold as needed
+            black_ratio = is_black.float().mean()
+            return black_ratio.item() <= threshold
+        return True
+
     def precompute_all_patches(self):
         """Load each image+mask, scale, then slice into patches and save to disk one at a time."""
         logging.info(f"Precomputing patches for {len(self.ids)} images in split={self.split} ...")
@@ -288,26 +306,29 @@ class IDRIDDataset(Dataset):
 
             # If no patch_size set, store the entire image as a single patch
             if self.patch_size is None:
-                patch_path = self.patches_dir / f"{img_id}_full"
-                has_lesion = torch.any(mask_tensor > 0.5)
-                torch.save({
-                    'image': img_tensor,
-                    'mask': mask_tensor,
-                    'coords': (0, 0),
-                    'has_lesion': has_lesion
-                }, patch_path)
-                
-                metadata = {
-                    'path': patch_path,
-                    'coords': (0, 0),
-                    'has_lesion': has_lesion.item(),
-                    'img_id': img_id
-                }
-                self.patch_metadata[img_id] = [metadata]
-                if has_lesion:
-                    positive_count += 1
-                patch_index.append((img_id, str(patch_path), has_lesion))
-                logging.info(f"{img_id}: 1 patch (full image) with shape {img_tensor.shape}.")
+                if self.is_valid_patch(img_tensor):
+                    patch_path = self.patches_dir / f"{img_id}_full"
+                    has_lesion = torch.any(mask_tensor > 0.5)
+                    torch.save({
+                        'image': img_tensor,
+                        'mask': mask_tensor,
+                        'coords': (0, 0),
+                        'has_lesion': has_lesion
+                    }, patch_path)
+                    
+                    metadata = {
+                        'path': patch_path,
+                        'coords': (0, 0),
+                        'has_lesion': has_lesion.item(),
+                        'img_id': img_id
+                    }
+                    self.patch_metadata[img_id] = [metadata]
+                    if has_lesion:
+                        positive_count += 1
+                    patch_index.append((img_id, str(patch_path), has_lesion))
+                    logging.info(f"{img_id}: 1 patch (full image) with shape {img_tensor.shape}.")
+                else:
+                    logging.warning(f"{img_id}: full image contains too much black border; skipping.")
                 continue
 
             if (h < self.patch_size) or (w < self.patch_size):
@@ -320,6 +341,11 @@ class IDRIDDataset(Dataset):
                 for x in range(0, w - self.patch_size + 1, stride):
                     img_patch = img_tensor[:, y:y+self.patch_size, x:x+self.patch_size]
                     mask_patch = mask_tensor[:, y:y+self.patch_size, x:x+self.patch_size]
+                    
+                    # Skip patches with too much black border
+                    if not self.is_valid_patch(img_patch):
+                        continue
+                        
                     has_lesion = torch.any(mask_patch > 0.5)
 
                     patch_path = self.patches_dir / f"{img_id}_{patch_count}"
@@ -349,24 +375,37 @@ class IDRIDDataset(Dataset):
             self.patch_indices = patch_index
             logging.info(f"Saved {len(self.patch_indices)} full images to {self.patches_dir}")
         else:
-            # For patches, balance positive and negative samples
-            random.shuffle(negative_paths)
-            selected_negative_paths = negative_paths[:positive_count]
+            # For patches, balance positive and negative samples for training only
+            if self.split == 'train':
+                random.shuffle(negative_paths)
+                selected_negative_paths = negative_paths[:positive_count]
+                
+                # Add selected negative patches to index
+                for img_id, path in selected_negative_paths:
+                    patch_index.append((img_id, path, False))
 
-            # Add selected negative patches to index
-            for img_id, path in selected_negative_paths:
-                patch_index.append((img_id, path, False))
+                # Remove unselected negative patches to save disk space
+                for img_id, path in negative_paths[positive_count:]:
+                    try:
+                        os.remove(path)
+                    except OSError as e:
+                        logging.warning(f"Error removing {path}: {e}")
 
-            # Remove unselected negative patches to save disk space
-            for img_id, path in negative_paths[positive_count:]:
-                try:
-                    os.remove(path)
-                except OSError as e:
-                    logging.warning(f"Error removing {path}: {e}")
-
-            # Save final patch index
-            self.patch_indices = patch_index
-            logging.info(f"Saved {len(self.patch_indices)} balanced patches to {self.patches_dir}")
+                # Save final patch index
+                self.patch_indices = patch_index
+                logging.info(f"Saved {len(self.patch_indices)} balanced patches to {self.patches_dir}")
+            else:
+                # For validation/test, only use positive patches
+                self.patch_indices = [(img_id, path, True) for img_id, path, has_lesion in patch_index if has_lesion]
+                
+                # Remove all negative patches to save disk space
+                for img_id, path in negative_paths:
+                    try:
+                        os.remove(path)
+                    except OSError as e:
+                        logging.warning(f"Error removing {path}: {e}")
+                
+                logging.info(f"Saved {len(self.patch_indices)} positive patches for validation to {self.patches_dir}")
 
     def preprocess(self, pil_img: Image.Image, scale: float, is_mask: bool):
         """Resize and convert to np array. For masks => single channel. For images => 3 channels."""

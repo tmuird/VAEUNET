@@ -184,7 +184,7 @@ Initial GPU Status:
     ''')
 
     # Use combined loss function with balanced weights
-    criterion = CombinedLoss(bce_weight=0.5, dice_weight=0.5)
+    criterion = CombinedLoss(bce_weight=0.3, dice_weight=0.7)
     optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-5)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, 
@@ -259,16 +259,20 @@ Initial GPU Status:
                 pbar.set_postfix(**{'loss (batch)': loss.item()})
                 pbar.update(1)
 
-                # Periodically evaluate during epoch
-                division_step = (len(train_dataset) // (batch_size * 2))  # Validate 2 times per epoch
-                if division_step > 0 and global_step % division_step == 0:
+                # Calculate steps per epoch and current epoch progress
+                steps_per_epoch = len(train_loader)
+                current_epoch_step = batch_idx + 1  # +1 because batch_idx is 0-based
+                
+                # Validate at middle and end of epoch
+                if current_epoch_step == steps_per_epoch // 2 or current_epoch_step == steps_per_epoch:
                     # Clear memory before validation
                     for var in ['images', 'masks', 'masks_pred', 'loss']:
                         if var in locals():
                             exec(f'del {var}')
                     torch.cuda.empty_cache()
                     
-                    logging.info(f'Running validation step at global_step {global_step}')
+                    validation_point = "mid" if current_epoch_step == steps_per_epoch // 2 else "end"
+                    logging.info(f'Running {validation_point}-epoch validation (epoch {epoch}, step {current_epoch_step}/{steps_per_epoch})')
                     model.eval()
                     val_metrics, val_samples = evaluate(model, val_loader, device, amp, max_samples=4)
                     
@@ -366,14 +370,91 @@ Initial GPU Status:
                 exec(f'del {var}')
         torch.cuda.empty_cache()
         
-        # # Save epoch checkpoint if requested
-        # if save_checkpoint:
-        #     Path(dir_checkpoint).mkdir(parents=True, exist_ok=True)
-        #     state_dict = model.state_dict()
-        #     torch.save(state_dict, str(dir_checkpoint / f'checkpoint_epoch{epoch}.pth'))
-        #     logging.info(f'Checkpoint {epoch} saved!')
+        # # Perform end of epoch validation
+        # logging.info(f'Running end of epoch validation for epoch {epoch}')
+        # model.eval()  # Ensure model is in eval mode
+        # val_metrics, val_samples = evaluate(model, val_loader, device, amp, max_samples=4)
+        
+        # try:
+        #     # Log validation metrics
+        #     wandb.log({
+        #         **{f'val/{k}': v for k, v in val_metrics.items()},
+        #         'learning_rate': optimizer.param_groups[0]['lr'],
+        #         'epoch': epoch,
+        #         'step': global_step
+        #     })
             
-        model.train()  # Ensure we're back in training mode for next epoch
+        #     # Log validation images
+        #     for i, (img_np, pred_np, true_np, _) in enumerate(val_samples):
+        #         # Prepare image for visualization
+        #         img_vis = img_np.transpose(1, 2, 0)  # [C,H,W] -> [H,W,C]
+        #         img_vis = (img_vis - img_vis.min()) / (img_vis.max() - img_vis.min())
+        #         img_vis = (img_vis * 255).clip(0, 255).astype('uint8')
+                
+        #         # Prepare masks
+        #         pred_overlay = (pred_np[0] > 0.5).astype('uint8')
+        #         true_overlay = (true_np[0] > 0.5).astype('uint8')
+                
+        #         pred_vis = pred_np[0]
+        #         pred_vis = (pred_vis - pred_vis.min()) / (pred_vis.max() - pred_vis.min() + 1e-8)
+        #         pred_vis = (pred_vis * 255).astype('uint8')
+                
+        #         true_vis = true_np[0] * 255
+                
+        #         img_name = f"epoch_{epoch}_final_sample_{i}"
+                
+        #         wandb.log({
+        #             f"{img_name}_comparison": wandb.Image(
+        #                 img_vis,
+        #                 masks={
+        #                     "predictions": {
+        #                         "mask_data": pred_overlay,
+        #                         "class_labels": {1: "Prediction"}
+        #                     },
+        #                     "ground_truth": {
+        #                         "mask_data": true_overlay,
+        #                         "class_labels": {1: "Ground Truth"}
+        #                     }
+        #                 }
+        #             ),
+        #             f"{img_name}_image": wandb.Image(img_vis),
+        #             f"{img_name}_pred": wandb.Image(pred_vis),
+        #             f"{img_name}_true": wandb.Image(true_vis)
+        #         })
+        #         del img_vis, pred_vis, true_vis, pred_overlay, true_overlay
+        # except wandb.errors.Error as e:
+        #     logging.warning(f"Could not log to W&B (end of epoch validation). Error: {e}")
+
+        # # Update scheduler based on validation metric
+        # val_score = val_metrics['dice']
+        # scheduler.step(val_score)
+        
+        # Save best model if we have an improvement
+        # if val_score > best_val_score:
+        #     best_val_score = val_score
+        #     if save_checkpoint:
+        #         Path(dir_checkpoint).mkdir(parents=True, exist_ok=True)
+        #         checkpoint_path = str(dir_checkpoint / f'best_model.pth')
+        #         torch.save({
+        #             'epoch': epoch,
+        #             'model_state_dict': model.state_dict(),
+        #             'optimizer_state_dict': optimizer.state_dict(),
+        #             'scheduler_state_dict': scheduler.state_dict(),
+        #             'best_val_score': best_val_score,
+        #             'amp_scaler': grad_scaler.state_dict(),
+        #             'global_step': global_step
+        #         }, checkpoint_path)
+        #         logging.info(f'New best model saved! (Dice: {val_score:.4f})')
+        #     no_improvement_count = 0
+        # else:
+        #     no_improvement_count += 1
+        #     if no_improvement_count >= early_stopping_patience:
+        #         logging.info(f'Early stopping triggered after {epoch} epochs')
+        #         return
+
+        # # Cleanup validation data
+        # torch.cuda.empty_cache()
+        # model.train()  # Ensure we're back in training mode for next epoch
 
 
 def get_args():
