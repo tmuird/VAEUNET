@@ -76,10 +76,6 @@ def specificity(pred: Tensor, target: Tensor, epsilon: float = 1e-6) -> Tensor:
     
     return (tn + epsilon) / (tn + fp + epsilon)
 
-def f1_score(precision: Tensor, recall: Tensor, epsilon: float = 1e-6) -> Tensor:
-    """Compute F1 Score from precision and recall"""
-    return 2 * (precision * recall) / (precision + recall + epsilon)
-
 def accuracy(pred: Tensor, target: Tensor) -> Tensor:
     """Compute Accuracy score"""
     pred = (pred > 0.5).float()
@@ -93,16 +89,15 @@ def accuracy(pred: Tensor, target: Tensor) -> Tensor:
 def get_all_metrics(pred: Tensor, target: Tensor, epsilon: float = 1e-6) -> Dict[str, float]:
     """Compute metrics following standard medical image segmentation practices"""
     # Log input statistics
-    logging.info(f'\nMetrics Input Statistics:')
-    logging.info(f'Predictions:\n    Shape: {pred.shape}\n    Min: {pred.min():.4f}, Max: {pred.max():.4f}\n    Mean: {pred.mean():.4f}')
-    logging.info(f'True Masks:\n    Shape: {target.shape}\n    Min: {target.min():.4f}, Max: {target.max():.4f}\n    Mean: {target.mean():.4f}')
+    # logging.info(f'\nMetrics Input Statistics:')
+    # logging.info(f'Predictions:\n    Shape: {pred.shape}\n    Min: {pred.min():.4f}, Max: {pred.max():.4f}\n    Mean: {pred.mean():.4f}')
+    # logging.info(f'True Masks:\n    Shape: {target.shape}\n    Min: {target.min():.4f}, Max: {target.max():.4f}\n    Mean: {target.mean():.4f}')
     
     # Calculate standard metrics
     dice_val = dice_score(pred, target)
     iou_val = iou_score(pred, target)
     prec, recall = precision_recall(pred, target)
     spec = specificity(pred, target)
-    f1 = f1_score(prec, recall)
     acc = accuracy(pred, target)
     
     metrics = {
@@ -111,15 +106,13 @@ def get_all_metrics(pred: Tensor, target: Tensor, epsilon: float = 1e-6) -> Dict
         'precision': prec.item(),
         'recall': recall.item(),
         'specificity': spec.item(),
-        'f1': f1.item(),
         'accuracy': acc.item()
     }
     
     # Log computed metrics
-    logging.info(f'\nComputed Metrics:')
-    logging.info(f'    Dice: {metrics["dice"]:.4f}')
-    logging.info(f'    IoU: {metrics["iou"]:.4f}')
-    logging.info(f'    F1: {metrics["f1"]:.4f}')
+    # logging.info(f'\nComputed Metrics:')
+    # logging.info(f'    Dice: {metrics["dice"]:.4f}')
+    # logging.info(f'    IoU: {metrics["iou"]:.4f}')
     
     return metrics
 
@@ -127,7 +120,7 @@ class MetricTracker:
     """Class to track metrics during training"""
     def __init__(self):
         # Standard metrics
-        standard_metrics = ['loss', 'dice', 'iou', 'precision', 'recall', 'specificity', 'f1', 'accuracy']
+        standard_metrics = ['loss', 'dice', 'iou', 'precision', 'recall', 'specificity', 'accuracy']
         
         self.metrics = {
             'train': {metric: [] for metric in standard_metrics},

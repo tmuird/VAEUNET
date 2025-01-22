@@ -184,7 +184,7 @@ Initial GPU Status:
     ''')
 
     # Use combined loss function with balanced weights
-    criterion = CombinedLoss(bce_weight=0.3, dice_weight=0.7)
+    criterion = CombinedLoss(bce_weight=0.5, dice_weight=0.5)
     optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-5)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, 

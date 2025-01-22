@@ -49,7 +49,6 @@ def evaluate(model, dataloader, device, amp, max_samples=4):
         'precision': 0,
         'recall': 0,
         'specificity': 0,
-        'f1': 0,
         'accuracy': 0
     }
     num_val_batches = 0
@@ -100,7 +99,7 @@ def evaluate(model, dataloader, device, amp, max_samples=4):
                                 image_np = image[i].detach().cpu().float().numpy()
                                 pred_np = mask_pred[i].detach().cpu().float().numpy()
                                 true_np = mask_true[i].detach().cpu().float().numpy()
-                                logging.info(f"Eval image stats - min: {image_np.min():.3f}, max: {image_np.max():.3f}, mean: {image_np.mean():.3f}")
+                                # logging.info(f"Eval image stats - min: {image_np.min():.3f}, max: {image_np.max():.3f}, mean: {image_np.mean():.3f}")
                                 samples[sample_idx] = (
                                     image_np,
                                     pred_np,
