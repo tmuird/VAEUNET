@@ -3,6 +3,7 @@ import torch
 import torch.nn.functional as F
 from PIL import Image
 import matplotlib.pyplot as plt
+from matplotlib import gridspec
 import numpy as np
 import torch.nn.functional as F
 import logging
@@ -140,49 +141,97 @@ def predict_with_patches(model, img, z, patch_size=512, overlap=100):
     
     return output_mask
 
-def get_segmentation_distribution(model, img, num_samples=4, patch_size=512, overlap=100):
-    """Generate multiple segmentations using patch-based prediction with consistent latent sampling."""
-    model.eval()
+def calculate_uncertainty_metrics(segmentations):
+    """Calculate various uncertainty metrics from multiple segmentation samples.
+    
+    Args:
+        segmentations: Tensor of shape [num_samples, B, C, H, W]
+    
+    Returns:
+        Dictionary containing different uncertainty metrics
+    """
+    # Calculate mean prediction
+    mean_pred = segmentations.mean(dim=0)  # [B, C, H, W]
+    
+    # Standard deviation (aleatory uncertainty)
+    std_dev = segmentations.std(dim=0)     # [B, C, H, W]
+    
+    # Entropy of the mean prediction (epistemic uncertainty)
+    epsilon = 1e-7  # Small constant to avoid log(0)
+    entropy = -(mean_pred * torch.log(mean_pred + epsilon) + 
+               (1 - mean_pred) * torch.log(1 - mean_pred + epsilon))
+    
+    # Mutual information (total uncertainty)
+    sample_entropies = -(segmentations * torch.log(segmentations + epsilon) + 
+                        (1 - segmentations) * torch.log(1 - segmentations + epsilon))
+    mean_entropy = sample_entropies.mean(dim=0)
+    mutual_info = entropy - mean_entropy
+    
+    # Coefficient of variation
+    coeff_var = std_dev / (mean_pred + epsilon)
+    
+    return {
+        'mean': mean_pred.squeeze(1),      # Remove channel dim for visualization
+        'std': std_dev.squeeze(1),
+        'entropy': entropy.squeeze(1),
+        'mutual_info': mutual_info.squeeze(1),
+        'coeff_var': coeff_var.squeeze(1)
+    }
+
+def get_segmentation_distribution(model, img, num_samples=32, patch_size=512, overlap=100, temperature=1.0, enable_dropout=True):
+    """Generate multiple segmentations using patch-based prediction with consistent latent sampling.
+    
+    Args:
+        model: VAE-UNet model
+        img: Input image tensor
+        num_samples: Number of samples to generate
+        patch_size: Size of patches to process
+        overlap: Overlap between patches
+        temperature: Controls the variance of the sampling (higher = more diverse samples)
+        enable_dropout: Whether to enable dropout during inference for epistemic uncertainty
+    """
+    if enable_dropout:
+        model.train()  # Enable dropout
+    else:
+        model.eval()
+        
     device = img.device
     
-    # Ensure input has shape [B, C, H, W]
-    if img.dim() == 3:  # [C, H, W]
-        img = img.unsqueeze(0)  # [1, C, H, W]
-    elif img.dim() == 5:  # [1, 1, C, H, W]
-        img = img.squeeze(1)  # [1, C, H, W]
-        
+    # Ensure input has batch dimension
+    if img.dim() == 3:
+        img = img.unsqueeze(0)
     print(f"Input shape after dimension adjustment: {img.shape}")
-    B, C, H, W = img.shape
     
-    # Get encoder features once for efficiency
+    # Get latent distribution parameters
     with torch.no_grad():
-        features = model.encoder(img)
-        x_enc = features[-1]
-        mu = model.mu_head(x_enc).squeeze(-1).squeeze(-1)
-        logvar = model.logvar_head(x_enc).squeeze(-1).squeeze(-1)
-        print(f"Latent distribution shapes - mu: {mu.shape}, logvar: {logvar.shape}")
+        mu, logvar = model.encode(img)
+    print(f"Latent distribution shapes - mu: {mu.shape}, logvar: {logvar.shape}")
+    
+    # Initialize list to store segmentations
+    segmentations = []
     
     # Generate multiple samples
-    segmentations = []
     for i in range(num_samples):
-        # Sample from latent distribution
-        z = model.reparameterize(mu, logvar)
-        z = z.unsqueeze(-1).unsqueeze(-1)  # Add spatial dimensions back
+        # Sample from latent space with increased variance
+        std = torch.exp(0.5 * logvar) * temperature
+        eps = torch.randn_like(std)
+        z = mu + eps * std
+        z = z.unsqueeze(-1).unsqueeze(-1)  # Add spatial dimensions
         print(f"Sample {i} latent shape: {z.shape}")
         
-        # Use the same z for all patches in this sample
-        with torch.no_grad():
-            seg = predict_with_patches(model, img, z, patch_size, overlap)
-            print(f"Sample {i} segmentation shape: {seg.shape}")
-            segmentations.append(seg)
+        # Generate segmentation using patches
+        seg = predict_with_patches(model, img, z, patch_size, overlap)
+        print(f"Sample {i} segmentation shape: {seg.shape}")
+        segmentations.append(seg)
     
-    # Stack all segmentations: [num_samples, B, C, H, W]
+    # Stack all segmentations
     segmentations = torch.cat(segmentations, dim=0)
     print(f"Final stacked segmentations shape: {segmentations.shape}")
+    
     return segmentations, mu, logvar
 
-def plot_reconstruction(model, img, mask, num_samples=4):
-    """Plot the input image, ground truth mask, and multiple sampled reconstructions."""
+def plot_reconstruction(model, img, mask, num_samples=32, temperature=1.0, enable_dropout=True):
+    """Plot the input image, ground truth mask, and uncertainty analysis from multiple sampled reconstructions."""
     # Ensure correct dimensions
     if img.dim() != 4:
         raise ValueError(f"Expected img to have 4 dimensions [B, C, H, W], got shape {img.shape}")
@@ -193,20 +242,17 @@ def plot_reconstruction(model, img, mask, num_samples=4):
     
     # Get multiple segmentations
     segmentations, mu, logvar = get_segmentation_distribution(
-        model, img, num_samples=num_samples
+        model, img, num_samples=num_samples, temperature=temperature, enable_dropout=enable_dropout
     )
     print(f"Segmentations shape after distribution: {segmentations.shape}")
     
-    # Calculate mean and std of segmentations
-    mean_seg = segmentations.mean(dim=0)  # [1, H, W]
-    std_seg = segmentations.std(dim=0)    # [1, H, W]
-    print(f"Mean seg shape: {mean_seg.shape}")
-    print(f"Std seg shape: {std_seg.shape}")
+    # Calculate uncertainty metrics
+    metrics = calculate_uncertainty_metrics(segmentations)
     
     # Create figure with subplots
     plt.rcParams['figure.dpi'] = 300  # Higher DPI for better quality
-    fig = plt.figure(figsize=(20, 12))  # Increased figure size
-    gs = plt.GridSpec(2, 3, figure=fig)
+    fig = plt.figure(figsize=(20, 16))  # Increased figure size for more plots
+    gs = gridspec.GridSpec(3, 3, figure=fig)
     gs.update(wspace=0.3, hspace=0.3)  # Increased spacing between plots
     
     # Original image (take first batch)
@@ -231,29 +277,37 @@ def plot_reconstruction(model, img, mask, num_samples=4):
     
     # Mean prediction
     ax3 = fig.add_subplot(gs[0, 2])
-    ax3.imshow(mean_seg[0].cpu(), cmap='gray')
-    ax3.set_title('Mean Prediction', fontsize=12, pad=10)
+    ax3.imshow(metrics['mean'][0].cpu(), cmap='gray')
+    ax3.set_title(f'Mean Prediction\n(T={temperature}, N={num_samples})', fontsize=12, pad=10)
     ax3.axis('off')
     
-    # Uncertainty (std)
+    # Standard deviation
     ax4 = fig.add_subplot(gs[1, 0])
-    uncertainty = ax4.imshow(std_seg[0].cpu(), cmap='hot')
-    ax4.set_title('Uncertainty (Std)', fontsize=12, pad=10)
+    std_plot = ax4.imshow(metrics['std'][0].cpu(), cmap='hot')
+    ax4.set_title('Std Deviation\n(Aleatory Uncertainty)', fontsize=12, pad=10)
     ax4.axis('off')
-    cbar = plt.colorbar(uncertainty, ax=ax4)
-    cbar.ax.tick_params(labelsize=10)
+    plt.colorbar(std_plot, ax=ax4)
     
-    # Sample 1
+    # Entropy
     ax5 = fig.add_subplot(gs[1, 1])
-    ax5.imshow(segmentations[0, 0].cpu(), cmap='gray')
-    ax5.set_title('Sample 1', fontsize=12, pad=10)
+    entropy_plot = ax5.imshow(metrics['entropy'][0].cpu(), cmap='hot')
+    ax5.set_title('Entropy\n(Epistemic Uncertainty)', fontsize=12, pad=10)
     ax5.axis('off')
+    plt.colorbar(entropy_plot, ax=ax5)
     
-    # Sample 2
+    # Mutual Information
     ax6 = fig.add_subplot(gs[1, 2])
-    ax6.imshow(segmentations[1, 0].cpu(), cmap='gray')
-    ax6.set_title('Sample 2', fontsize=12, pad=10)
+    mi_plot = ax6.imshow(metrics['mutual_info'][0].cpu(), cmap='hot')
+    ax6.set_title('Mutual Information\n(Total Uncertainty)', fontsize=12, pad=10)
     ax6.axis('off')
+    plt.colorbar(mi_plot, ax=ax6)
+    
+    # Sample predictions
+    for i in range(3):
+        ax = fig.add_subplot(gs[2, i])
+        ax.imshow(segmentations[i, 0].cpu(), cmap='gray')
+        ax.set_title(f'Sample {i+1}', fontsize=12, pad=10)
+        ax.axis('off')
     
     plt.suptitle('VAE-UNet Segmentation Analysis', fontsize=14, y=0.95)
     plt.tight_layout()
@@ -294,7 +348,7 @@ if __name__ == '__main__':
             print(f"Reserved:  {torch.cuda.memory_reserved()/1e9:.2f}GB")
         
         # Create visualization with high DPI
-        fig = plot_reconstruction(model, img, mask)
+        fig = plot_reconstruction(model, img, mask, temperature=2.0)
         fig.savefig(f'vae_analysis_{i+1}.png', dpi=300, bbox_inches='tight', pad_inches=0.2)
         plt.close(fig)
         
