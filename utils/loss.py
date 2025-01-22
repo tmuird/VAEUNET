@@ -16,27 +16,36 @@ def dice_loss(pred, target, smooth=1.0):
     return loss.mean()
 
 class CombinedLoss(nn.Module):
-    def __init__(self, bce_weight=0.5, dice_weight=0.5, aux_weight=0.4):
+    def __init__(self, bce_weight=0.5, dice_weight=0.5, aux_weight=0.4, kld_weight=0.1):
         super().__init__()
         self.bce_weight = bce_weight
         self.dice_weight = dice_weight
-        self.aux_weight = aux_weight  # Weight for auxiliary outputs
+        self.aux_weight = aux_weight
+        self.kld_weight = kld_weight
         self.bce = nn.BCEWithLogitsLoss()
         
     def forward(self, pred, target):
         if isinstance(pred, list):
-            # Main output loss
-            main_loss = self._calculate_loss(pred[0], target)
+            # Split predictions into segmentation outputs and VAE parameters
+            *seg_outputs, mu, logvar = pred
             
-            # Auxiliary outputs loss (if any)
+            # Main segmentation loss
+            main_loss = self._calculate_loss(seg_outputs[0], target)
+            
+            # Auxiliary segmentation losses (if any)
             aux_loss = 0
-            if len(pred) > 1:
-                for aux_pred in pred[1:]:
+            if len(seg_outputs) > 1:
+                for aux_pred in seg_outputs[1:-2]:  # Exclude mu and logvar
                     aux_loss += self._calculate_loss(aux_pred, target)
-                aux_loss /= (len(pred) - 1)  # Average auxiliary losses
-                
-            # Combine main and auxiliary losses
-            return main_loss + self.aux_weight * aux_loss
+                aux_loss /= (len(seg_outputs) - 1)
+            
+            # KL divergence loss for VAE
+            kld_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
+            kld_loss = kld_loss / mu.size(0)  # Normalize by batch size
+            
+            # Combine all losses
+            total_loss = main_loss + self.aux_weight * aux_loss + self.kld_weight * kld_loss
+            return total_loss
         
         return self._calculate_loss(pred, target)
     

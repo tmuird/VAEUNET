@@ -34,7 +34,7 @@ def predict_img(net,
     # If not using patches or patch_size is None, predict on full image
     if not use_patches or patch_size is None:
         with torch.no_grad():
-            mask_pred = net(img)
+            mask_pred, _, _ = net(img)  # Unpack only the segmentation output
             mask_pred = torch.sigmoid(mask_pred)
             
             # Resize to original image size if needed
@@ -80,9 +80,10 @@ def predict_img(net,
                     temp_patch[:, :, :patch.shape[-2], :patch.shape[-1]] = patch
                     patch = temp_patch
                 
-                # Predict
-                patch_pred = net(patch)
-                patch_pred = torch.sigmoid(patch_pred)
+                # Predict on patch
+                with torch.no_grad():
+                    patch_pred, _, _ = net(patch)  # Unpack only the segmentation output
+                    patch_pred = torch.sigmoid(patch_pred)
                 
                 # Apply weight for blending
                 patch_pred = patch_pred * weight

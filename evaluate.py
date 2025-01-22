@@ -67,7 +67,7 @@ def evaluate(model, dataloader, device, amp, max_samples=4):
                 mask_true = batch['mask'].to(device=device, dtype=dtype, non_blocking=True)
 
                 # Compute prediction
-                mask_pred = model(image)
+                mask_pred, _, _ = model(image)  # Unpack only the segmentation output
                 
                 # Take only the main output if in training mode (ignoring deep supervision outputs)
                 if isinstance(mask_pred, list):

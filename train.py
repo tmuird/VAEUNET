@@ -63,7 +63,8 @@ def train_model(
         early_stopping_patience: int = 10,
         lesion_type: str = 'EX',
         backbone: str = 'resnet34',
-        pretrained: bool = True
+        pretrained: bool = True,
+        beta: float = 0.1  # KL weight
 ):
     # Clear cache at start
     if torch.cuda.is_available():
@@ -184,7 +185,7 @@ Initial GPU Status:
     ''')
 
     # Use combined loss function with balanced weights
-    criterion = CombinedLoss(bce_weight=0.5, dice_weight=0.5)
+    criterion = CombinedLoss()
     optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-5)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, 
@@ -228,8 +229,20 @@ Initial GPU Status:
                 masks = batch['mask'].to(device=device, non_blocking=True)
 
                 with torch.autocast(device.type if device.type != 'mps' else 'cpu', enabled=amp):
-                    masks_pred = model(images)
-                    loss = criterion(masks_pred, masks)
+                    # Get model outputs
+                    seg_output, mu, logvar = model(images)
+                    
+                    # Compute reconstruction loss (dice + BCE)
+                    recon_loss = criterion(seg_output, masks)
+                    
+                    # Compute KL divergence loss
+                    kl_loss = 0.5 * torch.sum(
+                        torch.exp(logvar) + mu**2 - 1.0 - logvar
+                    ) / (mu.size(0) * mu.size(1))  # Normalize by batch size and latent dim
+                    
+                    # Combine losses
+                    loss = recon_loss + beta * kl_loss
+                    
                     # Scale loss for gradient accumulation
                     loss = loss / gradient_accumulation_steps
 
@@ -266,7 +279,7 @@ Initial GPU Status:
                 # Validate at middle and end of epoch
                 if current_epoch_step == steps_per_epoch // 2 or current_epoch_step == steps_per_epoch:
                     # Clear memory before validation
-                    for var in ['images', 'masks', 'masks_pred', 'loss']:
+                    for var in ['images', 'masks', 'seg_output', 'loss']:
                         if var in locals():
                             exec(f'del {var}')
                     torch.cuda.empty_cache()
@@ -365,7 +378,7 @@ Initial GPU Status:
 
         # End of epoch validation and cleanup
         # Safely clean up training variables
-        for var in ['images', 'masks', 'masks_pred', 'loss']:
+        for var in ['images', 'masks', 'seg_output', 'loss']:
             if var in locals():
                 exec(f'del {var}')
         torch.cuda.empty_cache()
@@ -529,6 +542,7 @@ if __name__ == '__main__':
             lesion_type=args.lesion_type,
             backbone='resnet34',
             pretrained=True,
+            beta=0.1
         )
     except torch.cuda.OutOfMemoryError:
         logging.error('Detected OutOfMemoryError! '
@@ -551,4 +565,5 @@ if __name__ == '__main__':
             lesion_type=args.lesion_type,
             backbone='resnet34',
             pretrained=True,
+            beta=0.1
         )
