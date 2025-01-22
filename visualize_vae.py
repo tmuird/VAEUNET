@@ -10,6 +10,7 @@ from pathlib import Path
 from torchvision import transforms
 from utils.data_loading import IDRIDDataset, load_image  # Import from data_loading
 from unet.unet_resnet import UNetResNet
+import math
 
 def load_image_for_prediction(filename, scale=1.0):
     """Load and preprocess image for the model."""
@@ -38,58 +39,54 @@ def load_mask_for_prediction(filename, scale=1.0):
     return mask_tensor
 
 def predict_with_patches(model, img, z, patch_size=512, overlap=100):
-    """Predict using patches with weighted blending, using the same latent vector."""
+    """Predict segmentation using patches."""
     model.eval()
     device = img.device
-    
-    # Get dimensions
-    _, c, h, w = img.shape
-    print(f"Input image shape: {img.shape}")
-    
-    # Initialize the full mask and weight map
-    full_mask = torch.zeros((1, 1, h, w), device=device)
-    weight_map = torch.zeros((1, 1, h, w), device=device)
-    
-    # Create a weight matrix for blending at full resolution
-    y, x = torch.meshgrid(torch.linspace(-1, 1, patch_size), torch.linspace(-1, 1, patch_size), indexing='ij')
-    weight = (1 - x.abs()) * (1 - y.abs())
-    weight = weight.to(device)[None, None, :, :]
-    
-    # Calculate steps with overlap
-    stride = patch_size - overlap
+    B, C, H, W = img.shape
     
     # Calculate number of patches needed
-    n_patches_h = max(1, (h - patch_size + stride) // stride)
-    n_patches_w = max(1, (w - patch_size + stride) // stride)
+    stride = patch_size - overlap
+    n_patches_h = math.ceil((H - overlap) / stride)
+    n_patches_w = math.ceil((W - overlap) / stride)
     
+    print(f"Input image shape: {img.shape}")
     print(f"Processing {n_patches_h}x{n_patches_w} patches")
+    
+    # Initialize output mask with zeros
+    output_mask = torch.zeros((B, 1, H, W), device=device)
+    weight_mask = torch.zeros((B, 1, H, W), device=device)
     
     # Process each patch
     with torch.no_grad():
         for i in range(n_patches_h):
             for j in range(n_patches_w):
                 # Calculate patch coordinates
-                top = min(i * stride, h - patch_size)
-                left = min(j * stride, w - patch_size)
+                start_h = i * stride
+                start_w = j * stride
+                
+                # Handle last row and column
+                if i == n_patches_h - 1:
+                    end_h = H
+                    start_h = max(0, end_h - patch_size)
+                else:
+                    end_h = min(start_h + patch_size, H)
+                    
+                if j == n_patches_w - 1:
+                    end_w = W
+                    start_w = max(0, end_w - patch_size)
+                else:
+                    end_w = min(start_w + patch_size, W)
                 
                 # Extract patch
-                patch = img[:, :, top:top+patch_size, left:left+patch_size]
-                print(f"Patch {i},{j} original size: {patch.shape[-2:]}") 
-                
-                valid_h, valid_w = patch.shape[-2:]
-                
-                if patch.shape[-2:] != (patch_size, patch_size):
-                    # If patch is smaller than patch_size, pad it
-                    temp_patch = torch.zeros((1, c, patch_size, patch_size), device=device)
-                    temp_patch[:, :, :patch.shape[-2], :patch.shape[-1]] = patch
-                    patch = temp_patch
-                    print(f"Padded patch to: {patch.shape[-2:]}")
+                patch = img[:, :, start_h:end_h, start_w:end_w]
+                patch_h, patch_w = patch.shape[2:]
+                print(f"Patch {i},{j} original size: {patch.shape}")
                 
                 # Get encoder features for this patch
                 features = model.encoder(patch)
                 x_enc = features[-1]
                 
-                # Use the same z but interpolate to match encoder output size
+                # Interpolate z to match encoder output size
                 z_patch = F.interpolate(z, size=x_enc.shape[2:], mode='bilinear', align_corners=True)
                 
                 # Initial projection
@@ -102,29 +99,46 @@ def predict_with_patches(model, img, z, patch_size=512, overlap=100):
                 
                 # Final conv and sigmoid
                 patch_pred = torch.sigmoid(model.final_conv(x))
-                print(f"Patch prediction shape: {patch_pred.shape}")
+                print(f"Patch prediction shape before resize: {patch_pred.shape}")
                 
-                # Upscale prediction to full patch size using bicubic interpolation
-                patch_pred = F.interpolate(patch_pred, size=(patch_size, patch_size), 
-                                        mode='bicubic', align_corners=True)
+                # Resize prediction back to original patch size
+                patch_pred = F.interpolate(patch_pred, size=(patch_h, patch_w), mode='bilinear', align_corners=True)
+                print(f"Patch prediction shape after resize: {patch_pred.shape}")
                 
-                # Apply weight for blending
-                patch_pred = patch_pred * weight
+                # Create weight mask for blending
+                weight = torch.ones_like(patch_pred)
                 
-                # Add to full mask (only the valid part if padded)
-                if valid_h != patch_size or valid_w != patch_size:
-                    full_mask[:, :, top:top+valid_h, left:left+valid_w] += patch_pred[:, :, :valid_h, :valid_w]
-                    weight_map[:, :, top:top+valid_h, left:left+valid_w] += weight[:, :, :valid_h, :valid_w]
-                else:
-                    full_mask[:, :, top:top+patch_size, left:left+patch_size] += patch_pred
-                    weight_map[:, :, top:top+patch_size, left:left+patch_size] += weight
+                # Apply tapering at edges for smooth blending
+                if overlap > 0:
+                    for axis in [2, 3]:  # Height and width dimensions
+                        if patch_pred.shape[axis] > overlap:
+                            # Create linear ramp for overlap regions
+                            ramp = torch.linspace(0, 1, overlap, device=device)
+                            
+                            # Apply ramp to start of patch if not at image boundary
+                            if (i > 0 and axis == 2) or (j > 0 and axis == 3):
+                                if axis == 2:
+                                    weight[:, :, :overlap, :] *= ramp.view(-1, 1)
+                                else:
+                                    weight[:, :, :, :overlap] *= ramp.view(-1)
+                            
+                            # Apply ramp to end of patch if not at image boundary
+                            if ((i < n_patches_h - 1 and axis == 2) or 
+                                (j < n_patches_w - 1 and axis == 3)):
+                                if axis == 2:
+                                    weight[:, :, -overlap:, :] *= (1 - ramp).view(-1, 1)
+                                else:
+                                    weight[:, :, :, -overlap:] *= (1 - ramp).view(-1)
+                
+                # Add weighted prediction to output
+                output_mask[:, :, start_h:end_h, start_w:end_w] += patch_pred * weight
+                weight_mask[:, :, start_h:end_h, start_w:end_w] += weight
     
     # Average overlapping regions
-    eps = 1e-7
-    full_mask = full_mask / (weight_map + eps)
-    print(f"Final mask shape: {full_mask.shape}")
+    output_mask = output_mask / (weight_mask + 1e-8)
+    print(f"Final mask shape: {output_mask.shape}")
     
-    return full_mask
+    return output_mask
 
 def get_segmentation_distribution(model, img, num_samples=4, patch_size=512, overlap=100):
     """Generate multiple segmentations using patch-based prediction with consistent latent sampling."""
@@ -190,8 +204,10 @@ def plot_reconstruction(model, img, mask, num_samples=4):
     print(f"Std seg shape: {std_seg.shape}")
     
     # Create figure with subplots
-    fig = plt.figure(figsize=(15, 10))
-    gs = plt.GridSpec(2, 3)
+    plt.rcParams['figure.dpi'] = 300  # Higher DPI for better quality
+    fig = plt.figure(figsize=(20, 12))  # Increased figure size
+    gs = plt.GridSpec(2, 3, figure=fig)
+    gs.update(wspace=0.3, hspace=0.3)  # Increased spacing between plots
     
     # Original image (take first batch)
     ax1 = fig.add_subplot(gs[0, 0])
@@ -201,42 +217,45 @@ def plot_reconstruction(model, img, mask, num_samples=4):
     mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
     std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
     img_display = img_display * std + mean
+    img_display = torch.clamp(img_display, 0, 1)  # Ensure values are in [0, 1]
     
     ax1.imshow(img_display.permute(1, 2, 0).numpy(), interpolation='lanczos')
-    ax1.set_title('Input Image')
+    ax1.set_title('Input Image', fontsize=12, pad=10)
     ax1.axis('off')
     
     # Ground truth mask
     ax2 = fig.add_subplot(gs[0, 1])
     ax2.imshow(mask[0, 0].cpu(), cmap='gray')
-    ax2.set_title('Ground Truth')
+    ax2.set_title('Ground Truth', fontsize=12, pad=10)
     ax2.axis('off')
     
     # Mean prediction
     ax3 = fig.add_subplot(gs[0, 2])
     ax3.imshow(mean_seg[0].cpu(), cmap='gray')
-    ax3.set_title('Mean Prediction')
+    ax3.set_title('Mean Prediction', fontsize=12, pad=10)
     ax3.axis('off')
     
     # Uncertainty (std)
     ax4 = fig.add_subplot(gs[1, 0])
     uncertainty = ax4.imshow(std_seg[0].cpu(), cmap='hot')
-    ax4.set_title('Uncertainty (Std)')
+    ax4.set_title('Uncertainty (Std)', fontsize=12, pad=10)
     ax4.axis('off')
-    plt.colorbar(uncertainty, ax=ax4)
+    cbar = plt.colorbar(uncertainty, ax=ax4)
+    cbar.ax.tick_params(labelsize=10)
     
     # Sample 1
     ax5 = fig.add_subplot(gs[1, 1])
     ax5.imshow(segmentations[0, 0].cpu(), cmap='gray')
-    ax5.set_title('Sample 1')
+    ax5.set_title('Sample 1', fontsize=12, pad=10)
     ax5.axis('off')
     
     # Sample 2
     ax6 = fig.add_subplot(gs[1, 2])
     ax6.imshow(segmentations[1, 0].cpu(), cmap='gray')
-    ax6.set_title('Sample 2')
+    ax6.set_title('Sample 2', fontsize=12, pad=10)
     ax6.axis('off')
     
+    plt.suptitle('VAE-UNet Segmentation Analysis', fontsize=14, y=0.95)
     plt.tight_layout()
     return fig
 
