@@ -219,34 +219,73 @@ class IDRIDDataset(Dataset):
         # Initialize transform for all splits
         if split == 'train':
             self.transform = A.Compose([
-                # SAFE TRANSFORMATIONS - Keep these
-                A.HorizontalFlip(p=0.5),  # Valid since lesions can appear on either side
-                A.VerticalFlip(p=0.5),    # Valid since lesions can appear top/bottom
+                # Geometric Transformations - Safe for medical images
+                A.HorizontalFlip(p=0.5),
+                A.VerticalFlip(p=0.5),
+                A.RandomRotate90(p=0.5),
                 
-                # CAREFUL WITH THESE - Modify parameters
-                A.RandomBrightnessContrast(
-                    brightness_limit=0.1,   # Reduced from 0.2 - hard exudates are bright yellow
-                    contrast_limit=0.1,     # Reduced from 0.2 - preserve lesion contrast
-                    p=0.3                   # Reduced probability
+                # Advanced Color Augmentations for DR
+                A.OneOf([
+                    # Multi-scale CLAHE - helps with varying lesion contrasts
+                    A.CLAHE(
+                        clip_limit=(1.5, 4.0),
+                        tile_grid_size=(8, 8),
+                        p=1.0
+                    ),
+                    # Gamma correction - helps with varying illumination
+                    A.RandomGamma(
+                        gamma_limit=(80, 120),
+                        p=1.0
+                    ),
+                ], p=0.5),
+                
+                # Careful brightness/contrast adjustments
+                A.OneOf([
+                    A.RandomBrightnessContrast(
+                        brightness_limit=0.1,
+                        contrast_limit=0.1,
+                        p=1.0
+                    ),
+                    # Specific for blood vessel enhancement
+                    A.ColorJitter(
+                        brightness=0.1,
+                        contrast=0.1,
+                        saturation=0.1,
+                        hue=0.0,  # No hue changes to preserve lesion colors
+                        p=1.0
+                    ),
+                ], p=0.3),
+                
+                # Using Affine instead of ShiftScaleRotate as recommended
+                A.Affine(
+                    scale=(0.9, 1.1),
+                    translate_percent=(-0.0625, 0.0625),
+                    rotate=(-15, 15),
+                    mode=cv2.BORDER_CONSTANT,
+                    cval=0,
+                    p=0.3
                 ),
                 
-                # ADD THESE - Specific for hard exudates
-                A.CLAHE(                   # Enhance contrast locally - helps with exudate detection
-                    clip_limit=2.0,
-                    tile_grid_size=(8, 8),
-                    p=0.5
+                # Gaussian noise with correct parameters
+                A.GaussNoise(
+                    per_channel=True,
+                    p=0.2
                 ),
                 
-                # BE CAREFUL WITH ROTATION - Modify parameters
-                A.ShiftScaleRotate(
-                    shift_limit=0.1,        # Reduced from 0.2 - avoid displacing lesions too much
-                    scale_limit=0.1,        # Reduced from 0.2
-                    rotate_limit=15,        # Reduced from 30 - small rotations only
-                    p=0.3                   # Reduced probability
-                ),
+                # Blur for motion artifacts
+                A.OneOf([
+                    A.GaussianBlur(blur_limit=(3, 5), p=1.0),
+                    A.MotionBlur(blur_limit=(3, 5), p=1.0),
+                ], p=0.2),
                 
-                # Remove HueSaturationValue as it might alter the characteristic 
-                # yellow color of hard exudates
+                # Grid distortion with correct parameters
+                A.GridDistortion(
+                    num_steps=5,
+                    distort_limit=0.1,
+                    interpolation=cv2.INTER_LINEAR,
+                    border_mode=cv2.BORDER_REFLECT_101,
+                    p=0.2
+                ),
             ])
 
     def is_valid_patch(self, patch: torch.Tensor, threshold: float = 0.1) -> bool:

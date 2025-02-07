@@ -12,6 +12,7 @@ from torchvision import transforms
 from utils.data_loading import IDRIDDataset, load_image  # Import from data_loading
 from unet.unet_resnet import UNetResNet
 import math
+import argparse
 
 def load_image_for_prediction(filename, scale=1.0):
     """Load and preprocess image for the model."""
@@ -313,7 +314,17 @@ def plot_reconstruction(model, img, mask, num_samples=32, temperature=1.0, enabl
     plt.tight_layout()
     return fig
 
+def get_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--lesion_type', type=str, required=True, default='EX', choices=['EX', 'HE', 'MA','OD'], help='Lesion type')
+    parser.add_argument('--temperature', type=float, default=1.0, help='Temperature for sampling (default: 1.0)')
+    parser.add_argument('--patch_size', type=int, default=512, help='Patch size for prediction (default: 512)')
+    parser.add_argument('--scale', type=float, default=1.0, help='Scale factor for resizing (default: 1.0)')
+    parser.add_argument('--samples', type=int, default=1, help='Number of samples for ensemble prediction (default: 1)')
+    args = parser.parse_args()
+    return args
 if __name__ == '__main__':
+    args = get_args() 
     # Load your trained model
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model = UNetResNet(n_channels=3, n_classes=1, latent_dim=32)
@@ -327,7 +338,7 @@ if __name__ == '__main__':
     
     # Process a few test images
     test_dir = Path('./data/imgs/test')
-    mask_dir = Path('./data/masks/test/EX')
+    mask_dir = Path(f"./data/masks/test/{args.lesion_type}")
     
     # Set scale factor to reduce memory usage
     scale = 0.5  # Reduce image size by half
@@ -338,7 +349,7 @@ if __name__ == '__main__':
     for i, img_path in enumerate(image_files):
         # Load image and corresponding mask with scaling
         img = load_image_for_prediction(img_path, scale=scale).to(device)
-        mask_path = mask_dir / f"{img_path.stem}_EX.tif"
+        mask_path = mask_dir / f"{img_path.stem}_{args.lesion_type}.tif"
         mask = load_mask_for_prediction(mask_path, scale=scale).to(device)
         
         # Print memory usage before processing
@@ -348,7 +359,7 @@ if __name__ == '__main__':
             print(f"Reserved:  {torch.cuda.memory_reserved()/1e9:.2f}GB")
         
         # Create visualization with high DPI
-        fig = plot_reconstruction(model, img, mask, temperature=2.0)
+        fig = plot_reconstruction(model, img, mask, num_samples=args.samples, temperature=args.temperature)
         fig.savefig(f'vae_analysis_{i+1}.png', dpi=300, bbox_inches='tight', pad_inches=0.2)
         plt.close(fig)
         

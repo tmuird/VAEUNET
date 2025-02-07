@@ -262,12 +262,14 @@ Initial GPU Status:
                 # Safely log train loss to wandb (catch connection errors)
                 try:
                     wandb.log({
-                        'train loss': loss.item(),
+                        'train/total_loss': loss.item(),
+                        'train/kl_loss': kl_loss.item(),
+                        'train/reconstruction_loss': recon_loss.item(),
                         'step': global_step,
                         'epoch': epoch
                     })
                 except wandb.errors.Error as e:
-                    logging.warning(f"Could not log to W&B (train loss). Error: {e}")
+                    logging.warning(f"Could not log to W&B (train losses). Error: {e}")
 
                 pbar.set_postfix(**{'loss (batch)': loss.item()})
                 pbar.update(1)
