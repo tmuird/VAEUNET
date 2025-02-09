@@ -321,13 +321,16 @@ def get_args():
     parser.add_argument('--patch_size', type=int, default=512, help='Patch size for prediction (default: 512)')
     parser.add_argument('--scale', type=float, default=1.0, help='Scale factor for resizing (default: 1.0)')
     parser.add_argument('--samples', type=int, default=1, help='Number of samples for ensemble prediction (default: 1)')
+    parser.add_argument('--attention', dest='use_attention', action='store_true', help='Enable attention mechanism (default)')
+    parser.add_argument('--no-attention', dest='use_attention', action='store_false', help='Disable attention mechanism')
+    parser.set_defaults(use_attention=True)
     args = parser.parse_args()
     return args
 if __name__ == '__main__':
     args = get_args() 
     # Load your trained model
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model = UNetResNet(n_channels=3, n_classes=1, latent_dim=32)
+    model = UNetResNet(n_channels=3, n_classes=1, latent_dim=32, use_attention=args.use_attention)
     
     # Load the trained weights
     model_path = Path('./checkpoints/best_model.pth')

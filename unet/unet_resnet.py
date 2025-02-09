@@ -29,7 +29,7 @@ class AttentionGate(nn.Module):
         return x * psi
 
 class DecoderBlock(nn.Module):
-    def __init__(self, in_channels, skip_channels, out_channels, latent_dim):
+    def __init__(self, in_channels, skip_channels, out_channels, latent_dim, use_attention=True, use_skip=True):
         super().__init__()
         # Project latent vector to match spatial dimensions
         self.z_proj = nn.Sequential(
@@ -38,8 +38,13 @@ class DecoderBlock(nn.Module):
             nn.ReLU(inplace=True)
         )
         
+        self.use_skip = use_skip
+        # Attention can only be enabled if skip connections are enabled
+        self.use_attention = use_attention and use_skip
+        
         # Attention gate now takes into account the additional latent channels
-        self.attention = AttentionGate(in_channels, skip_channels, in_channels//4)
+        if self.use_attention:
+            self.attention = AttentionGate(in_channels, skip_channels, in_channels//4)
         
         # Convolutions now take additional latent_dim channels from z
         self.conv1 = nn.Sequential(
@@ -68,9 +73,14 @@ class DecoderBlock(nn.Module):
         z_proj = self.z_proj(z_proj)
         
         if skip is not None:
-            # Apply attention and concatenate
-            skip = self.attention(x, skip)
-            x = torch.cat([x, skip, z_proj], dim=1)
+            # Apply attention if enabled
+            if self.use_attention:
+                skip = self.attention(x, skip)
+            # Use skip connection if enabled
+            if self.use_skip:
+                x = torch.cat([x, skip, z_proj], dim=1)
+            else:
+                x = torch.cat([x, z_proj], dim=1)
         else:
             x = torch.cat([x, z_proj], dim=1)
             
@@ -79,7 +89,7 @@ class DecoderBlock(nn.Module):
         return x
 
 class UNetResNet(nn.Module):
-    def __init__(self, n_channels, n_classes, backbone='resnet34', pretrained=True, latent_dim=32):
+    def __init__(self, n_channels, n_classes, backbone='resnet34', pretrained=True, latent_dim=32, use_attention=True, use_skip=True):
         super().__init__()
         self.n_channels = n_channels
         self.n_classes = n_classes
@@ -111,12 +121,15 @@ class UNetResNet(nn.Module):
             nn.ReLU(inplace=True)
         )
         
-        # Decoder blocks now take latent_dim as parameter
+        # Decoder blocks now take latent_dim and skip parameters
+        self.use_skip = use_skip
+        # Attention can only be enabled if skip connections are enabled
+        self.use_attention = use_attention and use_skip
         self.decoder_blocks = nn.ModuleList([
-            DecoderBlock(512, encoder_channels[-2], 512, latent_dim),
-            DecoderBlock(512, encoder_channels[-3], 256, latent_dim),
-            DecoderBlock(256, encoder_channels[-4], 128, latent_dim),
-            DecoderBlock(128, encoder_channels[0], 64, latent_dim)
+            DecoderBlock(512, encoder_channels[-2], 512, latent_dim, use_attention, use_skip),
+            DecoderBlock(512, encoder_channels[-3], 256, latent_dim, use_attention, use_skip),
+            DecoderBlock(256, encoder_channels[-4], 128, latent_dim, use_attention, use_skip),
+            DecoderBlock(128, encoder_channels[0], 64, latent_dim, use_attention, use_skip)
         ])
         
         # Final conv

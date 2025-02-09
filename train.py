@@ -385,91 +385,7 @@ Initial GPU Status:
                 exec(f'del {var}')
         torch.cuda.empty_cache()
         
-        # # Perform end of epoch validation
-        # logging.info(f'Running end of epoch validation for epoch {epoch}')
-        # model.eval()  # Ensure model is in eval mode
-        # val_metrics, val_samples = evaluate(model, val_loader, device, amp, max_samples=4)
-        
-        # try:
-        #     # Log validation metrics
-        #     wandb.log({
-        #         **{f'val/{k}': v for k, v in val_metrics.items()},
-        #         'learning_rate': optimizer.param_groups[0]['lr'],
-        #         'epoch': epoch,
-        #         'step': global_step
-        #     })
-            
-        #     # Log validation images
-        #     for i, (img_np, pred_np, true_np, _) in enumerate(val_samples):
-        #         # Prepare image for visualization
-        #         img_vis = img_np.transpose(1, 2, 0)  # [C,H,W] -> [H,W,C]
-        #         img_vis = (img_vis - img_vis.min()) / (img_vis.max() - img_vis.min())
-        #         img_vis = (img_vis * 255).clip(0, 255).astype('uint8')
-                
-        #         # Prepare masks
-        #         pred_overlay = (pred_np[0] > 0.5).astype('uint8')
-        #         true_overlay = (true_np[0] > 0.5).astype('uint8')
-                
-        #         pred_vis = pred_np[0]
-        #         pred_vis = (pred_vis - pred_vis.min()) / (pred_vis.max() - pred_vis.min() + 1e-8)
-        #         pred_vis = (pred_vis * 255).astype('uint8')
-                
-        #         true_vis = true_np[0] * 255
-                
-        #         img_name = f"epoch_{epoch}_final_sample_{i}"
-                
-        #         wandb.log({
-        #             f"{img_name}_comparison": wandb.Image(
-        #                 img_vis,
-        #                 masks={
-        #                     "predictions": {
-        #                         "mask_data": pred_overlay,
-        #                         "class_labels": {1: "Prediction"}
-        #                     },
-        #                     "ground_truth": {
-        #                         "mask_data": true_overlay,
-        #                         "class_labels": {1: "Ground Truth"}
-        #                     }
-        #                 }
-        #             ),
-        #             f"{img_name}_image": wandb.Image(img_vis),
-        #             f"{img_name}_pred": wandb.Image(pred_vis),
-        #             f"{img_name}_true": wandb.Image(true_vis)
-        #         })
-        #         del img_vis, pred_vis, true_vis, pred_overlay, true_overlay
-        # except wandb.errors.Error as e:
-        #     logging.warning(f"Could not log to W&B (end of epoch validation). Error: {e}")
-
-        # # Update scheduler based on validation metric
-        # val_score = val_metrics['dice']
-        # scheduler.step(val_score)
-        
-        # Save best model if we have an improvement
-        # if val_score > best_val_score:
-        #     best_val_score = val_score
-        #     if save_checkpoint:
-        #         Path(dir_checkpoint).mkdir(parents=True, exist_ok=True)
-        #         checkpoint_path = str(dir_checkpoint / f'best_model.pth')
-        #         torch.save({
-        #             'epoch': epoch,
-        #             'model_state_dict': model.state_dict(),
-        #             'optimizer_state_dict': optimizer.state_dict(),
-        #             'scheduler_state_dict': scheduler.state_dict(),
-        #             'best_val_score': best_val_score,
-        #             'amp_scaler': grad_scaler.state_dict(),
-        #             'global_step': global_step
-        #         }, checkpoint_path)
-        #         logging.info(f'New best model saved! (Dice: {val_score:.4f})')
-        #     no_improvement_count = 0
-        # else:
-        #     no_improvement_count += 1
-        #     if no_improvement_count >= early_stopping_patience:
-        #         logging.info(f'Early stopping triggered after {epoch} epochs')
-        #         return
-
-        # # Cleanup validation data
-        # torch.cuda.empty_cache()
-        # model.train()  # Ensure we're back in training mode for next epoch
+       
 
 
 def get_args():
@@ -493,8 +409,17 @@ def get_args():
     parser.add_argument('--gradient-accumulation-steps', type=int, default=2, help='Gradient accumulation steps')
     parser.add_argument('--early-stopping-patience', type=int, default=10, help='Early stopping patience')
     parser.add_argument('--lesion-type', type=str, default='EX', help='Lesion type')
-    parser.add_argument('--model-type', type=str, default='resnet', choices=['basic', 'resnet'], 
+    parser.add_argument('--model-type', type=str, default='resnet', choices=['basic', 'resnet'],
                       help='Model type: basic (original UNet) or resnet (UNet with ResNet34 encoder)')
+    parser.add_argument('--skip', dest='use_skip', action='store_true',
+                      help='Enable skip connections in the UNet model (default)')
+    parser.add_argument('--no-skip', dest='use_skip', action='store_false',
+                      help='Disable skip connections and attention in the UNet model')
+    parser.add_argument('--attention', dest='use_attention', action='store_true',
+                      help='Enable attention mechanism when skip connections are enabled (default)')
+    parser.add_argument('--no-attention', dest='use_attention', action='store_false',
+                      help='Disable attention mechanism but keep skip connections enabled')
+    parser.set_defaults(use_attention=True, use_skip=True)
     return parser.parse_args()
 
 
@@ -511,7 +436,9 @@ if __name__ == '__main__':
             n_channels=3,
             n_classes=1,
             backbone='resnet34',
-            pretrained=True
+            pretrained=True,
+            use_attention=args.use_attention,
+            use_skip=args.use_skip
         )
     else:
         model = UNet(
