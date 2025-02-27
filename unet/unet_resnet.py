@@ -2,7 +2,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import timm
-
 class AttentionGate(nn.Module):
     def __init__(self, F_g, F_l, F_int):
         super().__init__()

@@ -251,7 +251,7 @@ def plot_reconstruction(model, img, mask, num_samples=32, temperature=1.0, enabl
     metrics = calculate_uncertainty_metrics(segmentations)
     
     # Create figure with subplots
-    plt.rcParams['figure.dpi'] = 300  # Higher DPI for better quality
+    plt.rcParams['figure.dpi'] = 500  # Higher DPI for better quality
     fig = plt.figure(figsize=(20, 16))  # Increased figure size for more plots
     gs = gridspec.GridSpec(3, 3, figure=fig)
     gs.update(wspace=0.3, hspace=0.3)  # Increased spacing between plots
@@ -316,6 +316,7 @@ def plot_reconstruction(model, img, mask, num_samples=32, temperature=1.0, enabl
 
 def get_args():
     parser = argparse.ArgumentParser()
+    parser.add_argument('--model', '-m', default='best_model.pth', metavar='FILE',help='Specify the file in which the model is stored')
     parser.add_argument('--lesion_type', type=str, required=True, default='EX', choices=['EX', 'HE', 'MA','OD'], help='Lesion type')
     parser.add_argument('--temperature', type=float, default=1.0, help='Temperature for sampling (default: 1.0)')
     parser.add_argument('--patch_size', type=int, default=512, help='Patch size for prediction (default: 512)')
@@ -333,7 +334,10 @@ if __name__ == '__main__':
     model = UNetResNet(n_channels=3, n_classes=1, latent_dim=32, use_attention=args.use_attention)
     
     # Load the trained weights
-    model_path = Path('./checkpoints/best_model.pth')
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    logging.info(f'Loading model {args.model}')
+    logging.info(f'Using device {device}')
+    model_path = Path(f'./checkpoints/{args.model}')
     checkpoint = torch.load(model_path, map_location=device, weights_only=True)
     model.load_state_dict(checkpoint['model_state_dict'])
     model.to(device)
@@ -344,7 +348,7 @@ if __name__ == '__main__':
     mask_dir = Path(f"./data/masks/test/{args.lesion_type}")
     
     # Set scale factor to reduce memory usage
-    scale = 0.5  # Reduce image size by half
+    scale = args.scale # Reduce image size by half
     
     # Get all test images
     image_files = sorted(test_dir.glob('*.jpg'))[:3]  # Process first 3 images
