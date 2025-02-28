@@ -5,14 +5,14 @@ from PIL import Image
 import matplotlib.pyplot as plt
 from matplotlib import gridspec
 import numpy as np
-import torch.nn.functional as F
 import logging
 from pathlib import Path
 from torchvision import transforms
-from utils.data_loading import IDRIDDataset, load_image  # Import from data_loading
+from utils.data_loading import IDRIDDataset, load_image
 from unet.unet_resnet import UNetResNet
 import math
 import argparse
+from tqdm import tqdm  # Added for progress tracking
 
 def load_image_for_prediction(filename, scale=1.0):
     """Load and preprocess image for the model."""
@@ -40,6 +40,7 @@ def load_mask_for_prediction(filename, scale=1.0):
     print(f"Mask tensor shape after preprocessing: {mask_tensor.shape}")
     return mask_tensor
 
+# Keep the exact original patch prediction logic that produces good results
 def predict_with_patches(model, img, z, patch_size=512, overlap=100):
     """Predict segmentation using patches."""
     model.eval()
@@ -143,14 +144,7 @@ def predict_with_patches(model, img, z, patch_size=512, overlap=100):
     return output_mask
 
 def calculate_uncertainty_metrics(segmentations):
-    """Calculate various uncertainty metrics from multiple segmentation samples.
-    
-    Args:
-        segmentations: Tensor of shape [num_samples, B, C, H, W]
-    
-    Returns:
-        Dictionary containing different uncertainty metrics
-    """
+    """Calculate various uncertainty metrics from multiple segmentation samples."""
     # Calculate mean prediction
     mean_pred = segmentations.mean(dim=0)  # [B, C, H, W]
     
@@ -180,17 +174,7 @@ def calculate_uncertainty_metrics(segmentations):
     }
 
 def get_segmentation_distribution(model, img, num_samples=32, patch_size=512, overlap=100, temperature=1.0, enable_dropout=True):
-    """Generate multiple segmentations using patch-based prediction with consistent latent sampling.
-    
-    Args:
-        model: VAE-UNet model
-        img: Input image tensor
-        num_samples: Number of samples to generate
-        patch_size: Size of patches to process
-        overlap: Overlap between patches
-        temperature: Controls the variance of the sampling (higher = more diverse samples)
-        enable_dropout: Whether to enable dropout during inference for epistemic uncertainty
-    """
+    """Generate multiple segmentations using patch-based prediction with consistent latent sampling."""
     if enable_dropout:
         model.train()  # Enable dropout
     else:
@@ -211,8 +195,8 @@ def get_segmentation_distribution(model, img, num_samples=32, patch_size=512, ov
     # Initialize list to store segmentations
     segmentations = []
     
-    # Generate multiple samples
-    for i in range(num_samples):
+    # Generate multiple samples with progress bar
+    for i in tqdm(range(num_samples), desc="Generating samples"):
         # Sample from latent space with increased variance
         std = torch.exp(0.5 * logvar) * temperature
         eps = torch.randn_like(std)
@@ -220,10 +204,14 @@ def get_segmentation_distribution(model, img, num_samples=32, patch_size=512, ov
         z = z.unsqueeze(-1).unsqueeze(-1)  # Add spatial dimensions
         print(f"Sample {i} latent shape: {z.shape}")
         
-        # Generate segmentation using patches
+        # Generate segmentation using patches - using the original function for best results
         seg = predict_with_patches(model, img, z, patch_size, overlap)
         print(f"Sample {i} segmentation shape: {seg.shape}")
         segmentations.append(seg)
+        
+        # Free some memory
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
     
     # Stack all segmentations
     segmentations = torch.cat(segmentations, dim=0)
@@ -231,7 +219,7 @@ def get_segmentation_distribution(model, img, num_samples=32, patch_size=512, ov
     
     return segmentations, mu, logvar
 
-def plot_reconstruction(model, img, mask, num_samples=32, temperature=1.0, enable_dropout=True):
+def plot_reconstruction(model, img, mask, num_samples=32, patch_size=512, overlap=100, temperature=1.0, enable_dropout=True):
     """Plot the input image, ground truth mask, and uncertainty analysis from multiple sampled reconstructions."""
     # Ensure correct dimensions
     if img.dim() != 4:
@@ -243,7 +231,8 @@ def plot_reconstruction(model, img, mask, num_samples=32, temperature=1.0, enabl
     
     # Get multiple segmentations
     segmentations, mu, logvar = get_segmentation_distribution(
-        model, img, num_samples=num_samples, temperature=temperature, enable_dropout=enable_dropout
+        model, img, num_samples=num_samples, patch_size=patch_size,
+        overlap=overlap, temperature=temperature, enable_dropout=enable_dropout
     )
     print(f"Segmentations shape after distribution: {segmentations.shape}")
     
@@ -256,15 +245,24 @@ def plot_reconstruction(model, img, mask, num_samples=32, temperature=1.0, enabl
     gs = gridspec.GridSpec(3, 3, figure=fig)
     gs.update(wspace=0.3, hspace=0.3)  # Increased spacing between plots
     
-    # Original image (take first batch)
+    # Original image (take first batch) with improved visualization
     ax1 = fig.add_subplot(gs[0, 0])
     img_display = img[0].cpu().clone()  # [C, H, W]
     
-    # Denormalize image
+    # Proper denormalization for better visualization
+    # ImageNet means and stds used in preprocessing
     mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
     std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+    
+    # Enhanced denormalization with contrast boosting for better visualization
     img_display = img_display * std + mean
-    img_display = torch.clamp(img_display, 0, 1)  # Ensure values are in [0, 1]
+    
+    # Apply additional contrast enhancement for better visualization
+    img_display = torch.clamp((img_display - img_display.min()) / (img_display.max() - img_display.min() + 1e-8), 0, 1)
+    
+    # Apply gamma correction to enhance contrast (gamma < 1 brightens, gamma > 1 darkens)
+    gamma = 0.8  # Adjust as needed
+    img_display = torch.pow(img_display, gamma)
     
     ax1.imshow(img_display.permute(1, 2, 0).numpy(), interpolation='lanczos')
     ax1.set_title('Input Image', fontsize=12, pad=10)
@@ -320,44 +318,58 @@ def get_args():
     parser.add_argument('--lesion_type', type=str, required=True, default='EX', choices=['EX', 'HE', 'MA','OD'], help='Lesion type')
     parser.add_argument('--temperature', type=float, default=1.0, help='Temperature for sampling (default: 1.0)')
     parser.add_argument('--patch_size', type=int, default=512, help='Patch size for prediction (default: 512)')
+    parser.add_argument('--overlap', type=int, default=100, help='Overlap between patches (default: 100)')
     parser.add_argument('--scale', type=float, default=1.0, help='Scale factor for resizing (default: 1.0)')
-    parser.add_argument('--samples', type=int, default=1, help='Number of samples for ensemble prediction (default: 1)')
+    parser.add_argument('--samples', type=int, default=10, help='Number of samples for ensemble prediction (default: 10)')
     parser.add_argument('--attention', dest='use_attention', action='store_true', help='Enable attention mechanism (default)')
     parser.add_argument('--no-attention', dest='use_attention', action='store_false', help='Disable attention mechanism')
-    parser.set_defaults(use_attention=True)
-    args = parser.parse_args()
-    return args
+    parser.add_argument('--enable_dropout', action='store_true', help='Enable dropout during inference')
+    parser.add_argument('--output_dir', type=str, default='./outputs', help='Directory to save output images')
+    parser.set_defaults(use_attention=True, enable_dropout=False)
+    return parser.parse_args()
+
 if __name__ == '__main__':
-    args = get_args() 
+    # Set up logging
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    
+    args = get_args()
+    
+    # Create output directory if it doesn't exist
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
     # Load your trained model
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model = UNetResNet(n_channels=3, n_classes=1, latent_dim=32, use_attention=args.use_attention)
     
     # Load the trained weights
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     logging.info(f'Loading model {args.model}')
     logging.info(f'Using device {device}')
     model_path = Path(f'./checkpoints/{args.model}')
     checkpoint = torch.load(model_path, map_location=device, weights_only=True)
     model.load_state_dict(checkpoint['model_state_dict'])
     model.to(device)
-    model.eval()
+    
+    # Display processing parameters
+    logging.info(f"Temperature: {args.temperature}, Samples: {args.samples}")
+    logging.info(f"Patch size: {args.patch_size}, Overlap: {args.overlap}")
+    logging.info(f"Scale: {args.scale}")
+    logging.info(f"Enable dropout: {args.enable_dropout}")
     
     # Process a few test images
     test_dir = Path('./data/imgs/test')
     mask_dir = Path(f"./data/masks/test/{args.lesion_type}")
     
-    # Set scale factor to reduce memory usage
-    scale = args.scale # Reduce image size by half
-    
     # Get all test images
     image_files = sorted(test_dir.glob('*.jpg'))[:3]  # Process first 3 images
     
     for i, img_path in enumerate(image_files):
+        logging.info(f"Processing image {i+1}/{len(image_files)}: {img_path.name}")
+        
         # Load image and corresponding mask with scaling
-        img = load_image_for_prediction(img_path, scale=scale).to(device)
+        img = load_image_for_prediction(img_path, scale=args.scale).to(device)
         mask_path = mask_dir / f"{img_path.stem}_{args.lesion_type}.tif"
-        mask = load_mask_for_prediction(mask_path, scale=scale).to(device)
+        mask = load_mask_for_prediction(mask_path, scale=args.scale).to(device)
         
         # Print memory usage before processing
         if torch.cuda.is_available():
@@ -366,11 +378,25 @@ if __name__ == '__main__':
             print(f"Reserved:  {torch.cuda.memory_reserved()/1e9:.2f}GB")
         
         # Create visualization with high DPI
-        fig = plot_reconstruction(model, img, mask, num_samples=args.samples, temperature=args.temperature)
-        fig.savefig(f'vae_analysis_{i+1}.png', dpi=300, bbox_inches='tight', pad_inches=0.2)
+        fig = plot_reconstruction(
+            model=model, 
+            img=img, 
+            mask=mask, 
+            num_samples=args.samples, 
+            patch_size=args.patch_size,
+            overlap=args.overlap,
+            temperature=args.temperature,
+            enable_dropout=args.enable_dropout
+        )
+        
+        # Save with descriptive filename
+        out_filename = f"{img_path.stem}_{args.lesion_type}_T{args.temperature}_N{args.samples}_p{args.patch_size}.png"
+        out_path = output_dir / out_filename
+        fig.savefig(out_path, dpi=300, bbox_inches='tight', pad_inches=0.2)
         plt.close(fig)
         
         # Clear some memory
-        torch.cuda.empty_cache()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
     
-    print("High-resolution visualizations saved as PNG files!")
+    print(f"High-resolution visualizations saved to {output_dir}!")
