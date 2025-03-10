@@ -247,24 +247,17 @@ def plot_reconstruction(model, img, mask, num_samples=32, patch_size=512, overla
     
     # Original image (take first batch) with improved visualization
     ax1 = fig.add_subplot(gs[0, 0])
-    img_display = img[0].cpu().clone()  # [C, H, W]
     
-    # Proper denormalization for better visualization
-    # ImageNet means and stds used in preprocessing
-    mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
-    std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+    # Get image from tensor and properly prepare it for visualization
+    # Following the same approach as in data_loading.py but for visualization
+    img_display = img[0].cpu().permute(1, 2, 0).numpy()  # Convert to [H, W, C] format
     
-    # Enhanced denormalization with contrast boosting for better visualization
-    img_display = img_display * std + mean
+    # Convert normalized values to regular RGB range
+    # Simply rescale from normalized 0-1 to 0-255 range
+    img_display = np.clip(img_display, 0, 1)  # Ensure proper range
     
-    # Apply additional contrast enhancement for better visualization
-    img_display = torch.clamp((img_display - img_display.min()) / (img_display.max() - img_display.min() + 1e-8), 0, 1)
-    
-    # Apply gamma correction to enhance contrast (gamma < 1 brightens, gamma > 1 darkens)
-    gamma = 0.8  # Adjust as needed
-    img_display = torch.pow(img_display, gamma)
-    
-    ax1.imshow(img_display.permute(1, 2, 0).numpy(), interpolation='lanczos')
+    # Display the properly scaled image
+    ax1.imshow(img_display)
     ax1.set_title('Input Image', fontsize=12, pad=10)
     ax1.axis('off')
     
@@ -390,7 +383,7 @@ if __name__ == '__main__':
         )
         
         # Save with descriptive filename
-        out_filename = f"{img_path.stem}_{args.lesion_type}_T{args.temperature}_N{args.samples}_p{args.patch_size}.png"
+        out_filename = f"{img_path.stem}_{args.lesion_type}_T{args.temperature}_N{args.samples}_p{args.patch_size}_m{args.model}.png"
         out_path = output_dir / out_filename
         fig.savefig(out_path, dpi=300, bbox_inches='tight', pad_inches=0.2)
         plt.close(fig)
@@ -400,3 +393,4 @@ if __name__ == '__main__':
             torch.cuda.empty_cache()
     
     print(f"High-resolution visualizations saved to {output_dir}!")
+

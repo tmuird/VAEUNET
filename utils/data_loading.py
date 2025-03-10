@@ -38,136 +38,19 @@ def unique_mask_values(idx, mask_dir, mask_suffix):
     mask = np.array(mask_pil, dtype=np.uint8)
     return np.unique(mask)
 
-class BasicDataset(Dataset):
-    """Base dataset that loads (image, mask) pairs at a chosen scale."""
-    def __init__(self, images_dir: str, mask_dir: str, scale: float = 1.0, mask_suffix: str = ''):
-        self.images_dir = Path(images_dir)
-        self.mask_dir = Path(mask_dir)
-        assert 0 < scale <= 1, 'Scale must be between 0 and 1'
-        self.scale = scale
-        self.mask_suffix = mask_suffix
-
-        # Collect IDs from the images_dir
-        self.ids = [
-            splitext(file)[0]
-            for file in listdir(images_dir)
-            if isfile(join(images_dir, file)) and not file.startswith('.')
-        ]
-        if not self.ids:
-            raise RuntimeError(f'No input file found in {images_dir}, check that it is not empty')
-
-        logging.info(f'Creating dataset with {len(self.ids)} examples')
-        logging.info('Scanning mask files to determine unique values')
-        with Pool() as p:
-            all_uniques = list(tqdm(
-                p.imap(
-                    partial(unique_mask_values,
-                            mask_dir=self.mask_dir,
-                            mask_suffix=self.mask_suffix),
-                    self.ids
-                ),
-                total=len(self.ids)
-            ))
-
-        # Flatten + unique the mask values
-        flattened = [u for sublist in all_uniques for u in sublist]  # flatten
-        if flattened:
-            self.mask_values = sorted(np.unique(flattened).tolist())
-        else:
-            self.mask_values = []
-        logging.info(f'Unique mask values: {self.mask_values}')
-
-    def __len__(self):
-        return len(self.ids)
-
-    @staticmethod
-    def preprocess(mask_values, pil_img, scale, is_mask: bool):
-        """Resize image or mask, handle channels and normalization."""
-        w, h = pil_img.size
-        newW, newH = int(scale * w), int(scale * h)
-        if newW < 1 or newH < 1:
-            raise ValueError(f'Scale {scale} too small => resulted in {newW}x{newH}')
-
-        # Resizing: NEAREST if mask, BICUBIC if image
-        pil_img = pil_img.resize((newW, newH),
-                                 resample=Image.NEAREST if is_mask else Image.BICUBIC)
-        img = np.array(pil_img, dtype=np.uint8 if is_mask else np.float32)
-
-        if is_mask:
-            # Force shape = [H, W]. Convert multiple classes if mask_values is known.
-            # If mask is single-channel, shape is (H, W). If your mask is indeed multi-class,
-            # you'd do a loop to map values to class indices, but let's assume binary.
-            if img.ndim == 3:
-                # If it ever comes in as 3D, take a single channel or reduce it
-                img = img[..., 0]  # or however you prefer
-            # If you have pre-scanned mask_values, you can map them to indices if needed:
-            if mask_values:
-                # e.g. if you want to map each unique pixel to an integer label
-                label_mask = np.zeros((newH, newW), dtype=np.int64)
-                for i, val in enumerate(mask_values):
-                    label_mask[img == val] = i
-                return label_mask
-            else:
-                # Assume binary
-                return (img > 0).astype(np.int64)
-
-        else:
-            # Image: force shape to [C, H, W]
-            if img.ndim == 2:
-                # Grayscale => expand dims => shape [1, H, W]
-                img = img[None, ...]  
-            else:
-                # shape is [H, W, C], we want [C, H, W]
-                img = img.transpose((2, 0, 1))  # to [C, H, W]
-            # Normalize 0-255 => 0-1 if not already
-            if img.max() > 1.0:
-                img = img / 255.0
-            return img
-
-    def __getitem__(self, idx):
-        """Load one (image, mask) pair, scaled."""
-        name = self.ids[idx]
-        mask_files = list(self.mask_dir.glob(name + self.mask_suffix + '.*'))
-        img_files  = list(self.images_dir.glob(name + '.*'))
-
-        assert len(img_files) == 1, \
-            f'Either no image or multiple images found for the ID {name}: {img_files}'
-        assert len(mask_files) == 1, \
-            f'Either no mask or multiple masks found for the ID {name}: {mask_files}'
-
-        # Load them (force RGB for image, L for mask)
-        mask_pil = load_image(mask_files[0]).convert('L')
-        img_pil  = load_image(img_files[0]).convert('RGB')
-
-        # Check same size
-        assert img_pil.size == mask_pil.size, \
-            f"Image and mask shapes differ for {name}: {img_pil.size} vs {mask_pil.size}"
-
-        # Preprocess
-        img_array  = self.preprocess(self.mask_values, img_pil,  self.scale, is_mask=False)
-        mask_array = self.preprocess(self.mask_values, mask_pil, self.scale, is_mask=True)
-
-        # Convert to torch Tensors
-        img_tensor  = torch.as_tensor(img_array,  dtype=torch.float32).contiguous()
-        mask_tensor = torch.as_tensor(mask_array, dtype=torch.long).contiguous()
-
-        return {
-            'image': img_tensor,
-            'mask':  mask_tensor
-        }
-
 
 class IDRIDDataset(Dataset):
     """Dataset that loads images, masks, then precomputes overlapping patches."""
     def __init__(self, base_dir: str, split: str = 'train', scale: float = 0.25, 
                  patch_size: Optional[int] = None, lesion_type: str = 'EX',
-                 max_images: Optional[int] = None):
+                 max_images: Optional[int] = None, skip_border_check: bool = False):
         super().__init__()
         self.scale = scale
         self.patch_size = patch_size
         self.base_dir = Path(base_dir)
         self.split = split
         self.transform = None  # Initialize transform as None for all splits
+        self.skip_border_check = skip_border_check  # New parameter to skip border checks
 
         self.images_dir = self.base_dir / 'imgs' / split
         self.masks_dir  = self.base_dir / 'masks' / split
@@ -298,6 +181,10 @@ class IDRIDDataset(Dataset):
         Returns:
             bool: True if patch is valid (contains enough non-border pixels)
         """
+        # Skip the check if explicitly requested (for full images)
+        if self.skip_border_check:
+            return True
+            
         if patch.dim() == 3:
             # For RGB patches, consider a pixel black if mean across channels is very dark
             is_black = (patch.mean(dim=0) < 0.1)  # Adjust threshold as needed
@@ -345,29 +232,27 @@ class IDRIDDataset(Dataset):
 
             # If no patch_size set, store the entire image as a single patch
             if self.patch_size is None:
-                if self.is_valid_patch(img_tensor):
-                    patch_path = self.patches_dir / f"{img_id}_full"
-                    has_lesion = torch.any(mask_tensor > 0.5)
-                    torch.save({
-                        'image': img_tensor,
-                        'mask': mask_tensor,
-                        'coords': (0, 0),
-                        'has_lesion': has_lesion
-                    }, patch_path)
-                    
-                    metadata = {
-                        'path': patch_path,
-                        'coords': (0, 0),
-                        'has_lesion': has_lesion.item(),
-                        'img_id': img_id
-                    }
-                    self.patch_metadata[img_id] = [metadata]
-                    if has_lesion:
-                        positive_count += 1
-                    patch_index.append((img_id, str(patch_path), has_lesion))
-                    logging.info(f"{img_id}: 1 patch (full image) with shape {img_tensor.shape}.")
-                else:
-                    logging.warning(f"{img_id}: full image contains too much black border; skipping.")
+                # Always include full images when patch_size is None, regardless of borders
+                patch_path = self.patches_dir / f"{img_id}_full"
+                has_lesion = torch.any(mask_tensor > 0.5)
+                torch.save({
+                    'image': img_tensor,
+                    'mask': mask_tensor,
+                    'coords': (0, 0),
+                    'has_lesion': has_lesion
+                }, patch_path)
+                
+                metadata = {
+                    'path': patch_path,
+                    'coords': (0, 0),
+                    'has_lesion': has_lesion.item(),
+                    'img_id': img_id
+                }
+                self.patch_metadata[img_id] = [metadata]
+                if has_lesion:
+                    positive_count += 1
+                patch_index.append((img_id, str(patch_path), has_lesion))
+                logging.info(f"{img_id}: 1 patch (full image) with shape {img_tensor.shape}.")
                 continue
 
             if (h < self.patch_size) or (w < self.patch_size):

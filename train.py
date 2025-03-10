@@ -39,11 +39,23 @@ dir_checkpoint = Path('./checkpoints/')
 
 def collate_patches(batch):
     """Custom collate function to handle patches."""
-    return {
-        'image': torch.stack([x['image'] for x in batch]),
-        'mask': torch.stack([x['mask'] for x in batch]),
-        'img_id': [x['img_id'] for x in batch]
-    }
+    # Check if all images are the same shape
+    shapes = [x['image'].shape for x in batch]
+    
+    if len(set(tuple(shape) for shape in shapes)) == 1:
+        # All shapes are the same, stack normally
+        return {
+            'image': torch.stack([x['image'] for x in batch]),
+            'mask': torch.stack([x['mask'] for x in batch]),
+            'img_id': [x['img_id'] for x in batch]
+        }
+    else:
+        # Different shapes - don't stack, just return list
+        return {
+            'image': [x['image'] for x in batch],
+            'mask': [x['mask'] for x in batch],
+            'img_id': [x['img_id'] for x in batch]
+        }
 
 
 def train_model(
@@ -90,18 +102,23 @@ Initial GPU Status:
 
     logging.info(f'Loading datasets with patch size: {patch_size} and max images: {max_images}')
     try:
+        # Set skip_border_check to True when using full images (patch_size=None)
+        skip_border_check = patch_size is None
+        
         train_dataset = IDRIDDataset(base_dir='./data',
                                  split='train',
                                  scale=img_scale,
                                  patch_size=patch_size,
                                  lesion_type=lesion_type,
-                                 max_images=max_images)
+                                 max_images=max_images,
+                                 skip_border_check=skip_border_check)
         val_dataset = IDRIDDataset(base_dir='./data',
                                split='val',
                                scale=img_scale,
                                patch_size=patch_size,
                                lesion_type=lesion_type,
-                               max_images=max_images)
+                               max_images=max_images,
+                               skip_border_check=skip_border_check)
     except ValueError as e:
         logging.error(f"Error creating datasets: {e}")
         logging.error(f"No valid data found for lesion type {lesion_type}. Please check your data directory.")
@@ -124,6 +141,17 @@ Initial GPU Status:
         prefetch_factor=2,
         pin_memory_device='cuda'
     )
+    
+    # Use custom collate function to handle different image sizes when using full images
+    if patch_size is None:
+        loader_args['collate_fn'] = collate_patches
+        # When using full images with potentially different sizes, batch size should be 1
+        # to avoid handling variable-sized tensors in training loop
+        if batch_size > 1:
+            logging.warning(f"Using full-size images with different dimensions. Setting batch_size to 1 (was {batch_size})")
+            batch_size = 1
+            loader_args['batch_size'] = 1
+    
     train_loader = DataLoader(
         train_dataset,
         shuffle=True,
@@ -225,8 +253,15 @@ Initial GPU Status:
 
         with tqdm(total=len(train_loader), desc=f'Epoch {epoch}/{epochs}', unit='batch') as pbar:
             for batch_idx, batch in enumerate(train_loader):
-                images = batch['image'].to(device=device, memory_format=torch.channels_last, non_blocking=True)
-                masks = batch['mask'].to(device=device, non_blocking=True)
+                # Handle both stacked and non-stacked (list) inputs
+                if isinstance(batch['image'], list):
+                    # For non-stacked inputs (mixed dimensions), process one by one
+                    images = batch['image'][0].unsqueeze(0).to(device=device, memory_format=torch.channels_last, non_blocking=True)
+                    masks = batch['mask'][0].unsqueeze(0).to(device=device, non_blocking=True)
+                else:
+                    # For stacked inputs (uniform dimensions)
+                    images = batch['image'].to(device=device, memory_format=torch.channels_last, non_blocking=True)
+                    masks = batch['mask'].to(device=device, non_blocking=True)
 
                 with torch.autocast(device.type if device.type != 'mps' else 'cpu', enabled=amp):
                     # Get model outputs
