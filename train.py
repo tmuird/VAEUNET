@@ -38,7 +38,9 @@ dir_checkpoint = Path('./checkpoints/')
 
 
 def collate_patches(batch):
-    """Custom collate function to handle patches."""
+    """Custom collate function to handle patches.
+    Improved to better handle full images of the same size.
+    """
     # Check if all images are the same shape
     shapes = [x['image'].shape for x in batch]
     
@@ -78,9 +80,12 @@ def train_model(
         pretrained: bool = True,
         beta: float = 0.1  # KL weight
 ):
-    # Clear cache at start
+    # Clear cache at start and set memory limits for better management
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+        # Reserve memory fraction to prevent OOM errors
+        torch.cuda.set_per_process_memory_fraction(0.95)
+        
         logging.info(f"""
 Initial GPU Status:
 - GPU: {torch.cuda.get_device_name()}
@@ -102,23 +107,20 @@ Initial GPU Status:
 
     logging.info(f'Loading datasets with patch size: {patch_size} and max images: {max_images}')
     try:
-        # Set skip_border_check to True when using full images (patch_size=None)
-        skip_border_check = patch_size is None
-        
+        # For full images (patch_size=None), we'll get consistent-sized patches 
+        # through padding in the dataset, so no special handling needed here
         train_dataset = IDRIDDataset(base_dir='./data',
                                  split='train',
                                  scale=img_scale,
                                  patch_size=patch_size,
                                  lesion_type=lesion_type,
-                                 max_images=max_images,
-                                 skip_border_check=skip_border_check)
+                                 max_images=max_images)
         val_dataset = IDRIDDataset(base_dir='./data',
                                split='val',
                                scale=img_scale,
                                patch_size=patch_size,
                                lesion_type=lesion_type,
-                               max_images=max_images,
-                               skip_border_check=skip_border_check)
+                               max_images=max_images)
     except ValueError as e:
         logging.error(f"Error creating datasets: {e}")
         logging.error(f"No valid data found for lesion type {lesion_type}. Please check your data directory.")
@@ -132,7 +134,8 @@ Initial GPU Status:
     logging.info(f'- Training: {len(train_dataset)} images')
     logging.info(f'- Validation: {len(val_dataset)} images')
 
-    # Create data loaders
+    # Create data loaders - now we can use the same approach for both patch and full-image modes
+    # since full images are padded to a consistent size
     loader_args = dict(
         batch_size=batch_size, 
         num_workers=6,
@@ -142,15 +145,7 @@ Initial GPU Status:
         pin_memory_device='cuda'
     )
     
-    # Use custom collate function to handle different image sizes when using full images
-    if patch_size is None:
-        loader_args['collate_fn'] = collate_patches
-        # When using full images with potentially different sizes, batch size should be 1
-        # to avoid handling variable-sized tensors in training loop
-        if batch_size > 1:
-            logging.warning(f"Using full-size images with different dimensions. Setting batch_size to 1 (was {batch_size})")
-            batch_size = 1
-            loader_args['batch_size'] = 1
+    # No special handling needed for patch_size=None anymore
     
     train_loader = DataLoader(
         train_dataset,
@@ -233,8 +228,9 @@ Initial GPU Status:
     for batch in train_loader:
         images = batch['image']
         masks = batch['mask']
-        logging.info(f"Image shape: {images.shape}")
-        logging.info(f"Mask shape: {masks.shape}")
+        logging.info(f"Image shape: {images.shape if not isinstance(images, list) else [img.shape for img in images]}")
+        logging.info(f"Mask shape: {masks.shape if not isinstance(masks, list) else [mask.shape for mask in masks]}")
+        logging.info(f"Batch size: {len(batch['img_id'])}")
         break
 
     if torch.cuda.is_available():
@@ -243,7 +239,13 @@ Initial GPU Status:
         
     # Before training loop
     torch.backends.cudnn.benchmark = True
-    torch.backends.cuda.preferred_linalg_library('cusolver')
+    if torch.cuda.is_available():
+        try:
+            torch.backends.cuda.preferred_linalg_library('cusolver')
+            # Set matmul precision to medium for RTX 30xx series (better memory usage)
+            torch.set_float32_matmul_precision('medium')
+        except:
+            logging.warning("Could not set preferred CUDA libraries - using defaults")
 
     # Training loop
     for epoch in range(1, epochs + 1):
@@ -253,15 +255,9 @@ Initial GPU Status:
 
         with tqdm(total=len(train_loader), desc=f'Epoch {epoch}/{epochs}', unit='batch') as pbar:
             for batch_idx, batch in enumerate(train_loader):
-                # Handle both stacked and non-stacked (list) inputs
-                if isinstance(batch['image'], list):
-                    # For non-stacked inputs (mixed dimensions), process one by one
-                    images = batch['image'][0].unsqueeze(0).to(device=device, memory_format=torch.channels_last, non_blocking=True)
-                    masks = batch['mask'][0].unsqueeze(0).to(device=device, non_blocking=True)
-                else:
-                    # For stacked inputs (uniform dimensions)
-                    images = batch['image'].to(device=device, memory_format=torch.channels_last, non_blocking=True)
-                    masks = batch['mask'].to(device=device, non_blocking=True)
+                # All tensors will have the same shape now, so no need for special handling
+                images = batch['image'].to(device=device, memory_format=torch.channels_last, non_blocking=True)
+                masks = batch['mask'].to(device=device, non_blocking=True)
 
                 with torch.autocast(device.type if device.type != 'mps' else 'cpu', enabled=amp):
                     # Get model outputs
@@ -413,6 +409,10 @@ Initial GPU Status:
                     torch.cuda.empty_cache()
                     model.train()
 
+                # More aggressive memory cleanup after every few steps
+                if batch_idx % 5 == 0:  # Every 5 batches
+                    torch.cuda.empty_cache()
+
         # End of epoch validation and cleanup
         # Safely clean up training variables
         for var in ['images', 'masks', 'seg_output', 'loss']:
@@ -420,7 +420,9 @@ Initial GPU Status:
                 exec(f'del {var}')
         torch.cuda.empty_cache()
         
-       
+    # Final cleanup 
+    torch.cuda.empty_cache()
+    return
 
 
 def get_args():
