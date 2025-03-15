@@ -1,10 +1,24 @@
-*.pyc
+# SageMaker specific
+*.tar.gz
+.sagemaker-uploading
+.sagemaker-uploaded
+
+# Standard Python ignores
 __pycache__/
-checkpoints/
-*.pth
-*.jpg
+*.py[cod]
+*.class
+*.so
+.env
+.venv
+env/
 venv/
-.idea/
+
+# Model files
+*.pth
+checkpoints/
+
+# Output and logs
 wandb/
-data/patches/
-*.identifier
+logs/
+outputs/
+data/patches
