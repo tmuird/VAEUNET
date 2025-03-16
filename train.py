@@ -36,6 +36,8 @@ dir_img = Path('./data/imgs/')
 dir_mask = Path('./data/masks/')
 dir_checkpoint = Path('./checkpoints/')
 
+# Add to imports
+from utils.vae_utils import generate_predictions
 
 def collate_patches(batch):
     """Custom collate function to handle patches.
@@ -59,6 +61,30 @@ def collate_patches(batch):
             'img_id': [x['img_id'] for x in batch]
         }
 
+def multi_temp_training_step(model, images, true_masks, criterion, 
+                           temps=[1.0, 3.0], weight=0.3):
+    """Training step with multi-temperature sampling."""
+    # Standard prediction
+    outputs = model(images)
+    if isinstance(outputs, tuple):
+        pred = outputs[0]  
+    else:
+        pred = outputs
+    standard_loss = criterion(pred, true_masks)
+    
+    # Multi-temperature prediction using shared utilities
+    multi_temp_loss = 0
+    for temp in temps:
+        temp_pred = generate_predictions(
+            model, images, temperature=temp, num_samples=3
+        )
+        multi_temp_loss += criterion(temp_pred, true_masks)
+    
+    multi_temp_loss /= len(temps)
+    
+    # Combined loss
+    total_loss = (1-weight) * standard_loss + weight * multi_temp_loss
+    return total_loss, {'standard_loss': standard_loss.item(), 'multi_temp_loss': multi_temp_loss.item()}
 
 def train_model(
         model,

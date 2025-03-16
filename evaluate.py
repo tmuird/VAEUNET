@@ -6,6 +6,7 @@ from utils import metrics
 import random
 import os
 import logging
+from utils.vae_utils import generate_predictions
 
 # At start of script
 os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
@@ -13,7 +14,8 @@ torch.backends.cuda.matmul.allow_tf32 = True  # Better performance on RTX 3060
 torch.backends.cudnn.allow_tf32 = True
 
 @torch.no_grad()
-def evaluate(model, dataloader, device, amp, max_samples=4):
+def evaluate(model, dataloader, device, amp, max_samples=4, 
+            temperature=1.0, num_samples=5):
     """
     Evaluation function with optimized memory usage for medical image segmentation
     Args:
@@ -22,6 +24,8 @@ def evaluate(model, dataloader, device, amp, max_samples=4):
         device: Computing device (cuda/cpu)
         amp: Boolean for mixed precision
         max_samples: Number of sample images to return for visualization
+        temperature: Sampling temperature for VAE
+        num_samples: Number of samples to generate for VAE
     Returns:
         metrics_mean: Dict of averaged metrics
         samples: List of (image, prediction, ground_truth, global_idx) tuples
@@ -66,14 +70,10 @@ def evaluate(model, dataloader, device, amp, max_samples=4):
                 image = batch['image'].to(device=device, dtype=dtype, non_blocking=True)
                 mask_true = batch['mask'].to(device=device, dtype=dtype, non_blocking=True)
 
-                # Compute prediction
-                mask_pred, _, _ = model(image)  # Unpack only the segmentation output
-                
-                # Take only the main output if in training mode (ignoring deep supervision outputs)
-                if isinstance(mask_pred, list):
-                    mask_pred = mask_pred[0]
-                
-                mask_pred = torch.sigmoid(mask_pred)
+                # Generate predictions using shared utility
+                mask_pred = generate_predictions(
+                    model, image, temperature=temperature, num_samples=num_samples
+                )
 
                 # Compute metrics
                 batch_metrics = get_all_metrics(mask_pred, mask_true)

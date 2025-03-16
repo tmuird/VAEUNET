@@ -15,6 +15,7 @@ import argparse
 from tqdm import tqdm
 from collections import defaultdict
 import shutil
+from utils.vae_utils import generate_predictions, encode_images
 
 def get_image_for_prediction(dataset, img_idx):
     """Get image and mask from dataset for prediction."""
@@ -188,7 +189,7 @@ def get_segmentation_distribution(model, img, img_id, dataset=None, num_samples=
     
     # Get latent distribution parameters
     with torch.no_grad():
-        mu, logvar = model.encode(img)
+        mu, logvar = encode_images(model, img)
     print(f"Latent distribution shapes - mu: {mu.shape}, logvar: {logvar.shape}")
     
     # Initialize list to store segmentations
@@ -323,6 +324,14 @@ def get_args():
     parser.add_argument('--enable_dropout', action='store_true', help='Enable dropout during inference')
     parser.add_argument('--output_dir', type=str, default='./outputs', help='Directory to save output images')
     parser.add_argument('--max_images', type=int, default=3, help='Maximum number of test images to process')
+    parser.add_argument('--temperature-range', type=float, nargs='+',
+                        default=None, help='Multiple temperatures to compare [0.5 1.0 2.0 3.0]')
+    parser.add_argument('--ensemble', action='store_true',
+                        help='Create ensemble prediction from multiple temperatures')
+    parser.add_argument('--weighted-ensemble', action='store_true',
+                        help='Use weighted temperature ensemble (weights favor T=1)')
+    parser.add_argument('--samples-per-temp', type=int, default=5,
+                        help='Number of samples per temperature for ensembling')
     parser.set_defaults(use_attention=True, enable_dropout=False)
     return parser.parse_args()
 
@@ -519,7 +528,9 @@ def get_image_and_mask(dataset, img_id):
         
     return full_img, full_mask, original_shape
 
-def get_segmentation_distribution(model, img_id, dataset, num_samples=32, patch_size=None, overlap=100, temperature=1.0, enable_dropout=True):
+def get_segmentation_distribution(model, img_id, dataset, num_samples=32, 
+                                 patch_size=None, overlap=100, 
+                                 temperature=1.0, enable_dropout=True):
     """Generate multiple segmentations using either full image or patch-based prediction."""
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
@@ -528,6 +539,7 @@ def get_segmentation_distribution(model, img_id, dataset, num_samples=32, patch_
     img = img.unsqueeze(0).to(device)  # Add batch dimension [1, C, H, W]
     print(f"Full image shape for segmentation: {img.shape}")
     
+    # Set model mode based on dropout preference
     if enable_dropout:
         model.train()  # Enable dropout
     else:
@@ -535,7 +547,7 @@ def get_segmentation_distribution(model, img_id, dataset, num_samples=32, patch_
     
     # Get latent distribution parameters
     with torch.no_grad():
-        mu, logvar = model.encode(img)
+        mu, logvar = encode_images(model, img)
     print(f"Latent distribution shapes - mu: {mu.shape}, logvar: {logvar.shape}")
     
     # Initialize list to store segmentations
@@ -543,28 +555,27 @@ def get_segmentation_distribution(model, img_id, dataset, num_samples=32, patch_
     
     # Generate multiple samples
     for i in tqdm(range(num_samples), desc="Generating samples"):
-        # Sample from latent space with temperature
-        std = torch.exp(0.5 * logvar) * temperature
-        eps = torch.randn_like(std)
-        z = mu + eps * std
-        z = z.unsqueeze(-1).unsqueeze(-1)  # Add spatial dimensions
-        
-        # Choose prediction method based on patch size
-        if patch_size is not None:
-            # Use patch-based prediction (original working method)
+        # Use the shared utility for prediction
+        if patch_size is not None and patch_size > 0:
+            # For patch-based, we still need the custom function
+            # First sample from latent space
+            std = torch.exp(0.5 * logvar) * temperature
+            eps = torch.randn_like(std)
+            z = mu + eps * std
+            z = z.unsqueeze(-1).unsqueeze(-1)  # Add spatial dimensions
             seg = predict_with_patches(model, img, z, patch_size, overlap)
         else:
-            # Use full image prediction (no patches)
-            seg = predict_full_image(model, img, z)
+            # For full image, use generate_predictions
+            seg = generate_predictions(model, img, temperature=temperature, num_samples=1)
             
         print(f"Sample {i} segmentation shape: {seg.shape}")
         segmentations.append(seg)
         
-        # Free some memory
+        # Free memory
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
     
-    # Stack all segmentations along batch dimension
+    # Stack all segmentations
     segmentations = torch.cat(segmentations, dim=0)
     print(f"Final stacked segmentations shape: {segmentations.shape}")
     
@@ -652,6 +663,275 @@ def plot_reconstruction(model, img_id, dataset, num_samples=32, patch_size=None,
     plt.tight_layout()
     return fig
 
+def visualize_temperature_sampling(model, image, mask=None, 
+                                  temperatures=[0.5, 1.0, 2.0, 3.0],
+                                  samples_per_temp=10):
+    """Memory-optimized visualization of temperature effects."""
+    device = image.device
+    plt.figure(figsize=(15, 8))
+    
+    # Plot original image
+    plt.subplot(2, len(temperatures) + 1, 1)
+    plt.imshow(image[0].cpu().permute(1, 2, 0).numpy())
+    plt.title("Original Image")
+    plt.axis('off')
+    
+    # Plot ground truth if available
+    if mask is not None:
+        plt.subplot(2, len(temperatures) + 1, len(temperatures) + 2)
+        plt.imshow(mask[0, 0].cpu().numpy(), cmap='gray')
+        plt.title("Ground Truth")
+        plt.axis('off')
+    
+    # Process one temperature at a time
+    mean_preds = []
+    std_preds = []
+    
+    for i, temp in enumerate(temperatures):
+        # Get latent distribution parameters
+        with torch.no_grad():
+            mu, logvar = encode_images(model, image)
+            
+        # Generate predictions with specific temperature
+        all_samples = []
+        for _ in range(samples_per_temp):
+            # Sample from latent space
+            std = torch.exp(0.5 * logvar) * temp
+            eps = torch.randn_like(std)
+            z = mu + eps * std
+            
+            # Add spatial dimensions for proper z injection
+            z_spatial = z.unsqueeze(-1).unsqueeze(-1)  # [B, latent_dim, 1, 1]
+            
+            # Generate prediction using the same technique as your patch prediction
+            with torch.no_grad():
+                # Get encoder features
+                features = model.encoder(image)
+                x_enc = features[-1]
+                
+                # Interpolate z to match encoder output size
+                z_full = F.interpolate(z_spatial, size=x_enc.shape[2:], mode='bilinear', align_corners=True)
+                
+                # Initial projection
+                x = model.z_initial(z_full)
+                
+                # Decode with z injection at each stage
+                for k, decoder_block in enumerate(model.decoder_blocks):
+                    skip = features[-(k+2)] if k < len(features)-1 else None
+                    x = decoder_block(x, skip, z_full)
+                
+                # Final conv and sigmoid
+                pred = torch.sigmoid(model.final_conv(x))
+                
+                all_samples.append(pred.detach())
+                
+        # Stack samples just for this temperature
+        temp_samples = torch.stack(all_samples)
+        
+        # Calculate mean and std
+        mean_pred = torch.mean(temp_samples, dim=0)
+        std_pred = torch.std(temp_samples, dim=0)
+        
+        # Store for visualization
+        mean_preds.append(mean_pred.cpu())
+        std_preds.append(std_pred.cpu())
+        
+        # Free memory immediately
+        del temp_samples, all_samples
+        torch.cuda.empty_cache()
+    
+    # Now plot each temperature's results
+    for i, temp in enumerate(temperatures):
+        # Mean prediction
+        plt.subplot(2, len(temperatures) + 1, i + 2)
+        plt.imshow(mean_preds[i][0, 0].numpy(), cmap='gray')
+        plt.title(f"T={temp}\nMean")
+        plt.axis('off')
+        
+        # Standard deviation (uncertainty)
+        plt.subplot(2, len(temperatures) + 1, i + len(temperatures) + 3)
+        plt.imshow(std_preds[i][0, 0].numpy(), cmap='hot')
+        plt.title(f"T={temp}\nUncertainty")
+        plt.axis('off')
+    
+    plt.tight_layout()
+    return plt.gcf()
+
+def generate_and_compare_ensemble(model, image, mask, temperatures=[0.5, 1.0, 2.0, 3.0], 
+                                 samples_per_temp=5, weighted=True):
+    """Generate and visualize ensemble prediction with proper resizing."""
+    device = image.device
+    
+    # Log dimensions for debugging
+    logging.info(f"Input image shape: {image.shape}, Mask shape: {mask.shape}")
+    
+    # Get predictions at each temperature
+    temp_preds = {}
+    dice_scores = []
+    
+    for temp in temperatures:
+        # Generate prediction at this temperature
+        temp_pred = generate_predictions(
+            model, 
+            image, 
+            temperature=temp,
+            num_samples=samples_per_temp
+        )
+        
+        # Resize prediction to match mask dimensions
+        if temp_pred.shape[2] != mask.shape[2] or temp_pred.shape[3] != mask.shape[3]:
+            logging.info(f"Resizing prediction from {temp_pred.shape} to match mask {mask.shape}")
+            temp_pred = F.interpolate(
+                temp_pred, 
+                size=(mask.shape[2], mask.shape[3]), 
+                mode='bilinear', 
+                align_corners=False
+            )
+        
+        temp_preds[temp] = temp_pred
+        
+        # Calculate dice score
+        dice = ((temp_pred > 0.5) & (mask > 0.5)).sum() / ((temp_pred > 0.5).sum() + (mask > 0.5).sum() + 1e-8)
+        dice_scores.append(dice.item() * 2)
+    
+    # Generate ensemble prediction
+    ensemble_pred = generate_ensemble_prediction(
+        model,
+        image,
+        temps=temperatures,
+        samples_per_temp=samples_per_temp,
+        weighted=weighted
+    )
+    
+    # Resize ensemble prediction
+    if ensemble_pred.shape[2] != mask.shape[2] or ensemble_pred.shape[3] != mask.shape[3]:
+        ensemble_pred = F.interpolate(
+            ensemble_pred, 
+            size=(mask.shape[2], mask.shape[3]), 
+            mode='bilinear', 
+            align_corners=False
+        )
+    
+    # Calculate ensemble dice score
+    ensemble_dice = ((ensemble_pred > 0.5) & (mask > 0.5)).sum() / ((ensemble_pred > 0.5).sum() + (mask > 0.5).sum() + 1e-8)
+    ensemble_dice = ensemble_dice.item() * 2
+    
+    # Downsample for visualization
+    def downsample_for_display(tensor, max_size=512):
+        if tensor is None:
+            return None
+        if tensor.shape[-1] > max_size or tensor.shape[-2] > max_size:
+            h, w = tensor.shape[-2], tensor.shape[-1]
+            scale = max_size / max(h, w)
+            new_h, new_w = int(h * scale), int(w * scale)
+            return F.interpolate(tensor, size=(new_h, new_w), mode='bilinear', align_corners=False)
+        return tensor
+    
+    # Downsample tensors for display
+    image_vis = downsample_for_display(image)
+    mask_vis = downsample_for_display(mask)
+    ensemble_pred_vis = downsample_for_display(ensemble_pred)
+    temp_preds_vis = {t: downsample_for_display(p) for t, p in temp_preds.items()}
+    
+    # Create visualization figure
+    fig = plt.figure(figsize=(15, 10))
+    
+    # Row 1: Original image, ground truth, ensemble prediction
+    plt.subplot(2, len(temperatures) + 1, 1)
+    plt.imshow(image_vis[0].cpu().permute(1, 2, 0).numpy())
+    plt.title("Original Image")
+    plt.axis('off')
+    
+    plt.subplot(2, len(temperatures) + 1, 2)
+    plt.imshow(mask_vis[0, 0].cpu().numpy(), cmap='gray')
+    plt.title("Ground Truth")
+    plt.axis('off')
+    
+    plt.subplot(2, len(temperatures) + 1, 3)
+    plt.imshow(ensemble_pred_vis[0, 0].cpu().numpy(), cmap='gray')
+    plt.title(f"Ensemble\nDice: {ensemble_dice:.4f}")
+    plt.axis('off')
+    
+    # Row 2: Individual temperature predictions
+    for i, temp in enumerate(temperatures):
+        plt.subplot(2, len(temperatures) + 1, len(temperatures) + i + 2)
+        plt.imshow(temp_preds_vis[temp][0, 0].cpu().numpy(), cmap='gray')
+        plt.title(f"T={temp}\nDice: {dice_scores[i]:.4f}")
+        plt.axis('off')
+    
+    # Bar chart for dice scores
+    plt.subplot(2, len(temperatures) + 1, len(temperatures) + 1)
+    bars = plt.bar(['Ensemble'] + [f'T={t}' for t in temperatures], [ensemble_dice] + dice_scores)
+    bars[0].set_color('green')  # Highlight ensemble
+    plt.ylim(0, 1)
+    plt.title("Dice Score Comparison")
+    plt.xticks(rotation=45)
+    
+    plt.tight_layout()
+    
+    # Critical fix: Make sure we return the figure object
+    return fig  # This was likely missing before
+
+def generate_ensemble_prediction(model, image, temps=[0.5, 1.0, 2.0, 3.0], 
+                                samples_per_temp=5, weighted=True):
+    """Generate ensemble prediction combining multiple temperatures."""
+    device = image.device
+    all_preds = []
+    weights = []
+    
+    for temp in temps:
+        # Generate predictions at this temperature
+        result = generate_predictions(
+            model, 
+            image, 
+            temperature=temp, 
+            num_samples=samples_per_temp,
+            return_all=True
+        )
+        
+        # Add mean prediction to ensemble
+        all_preds.append(result['mean'])
+        
+        # Higher weight for middle temperatures if weighted
+        if weighted:
+            # Weight based on temperature - favoring middle range (around 1.0)
+            weight = 1.0 / (abs(temp - 1.0) + 0.5)
+        else:
+            weight = 1.0
+            
+        weights.append(weight)
+    
+    # Normalize weights
+    weights = torch.tensor(weights, device=device)
+    weights = weights / weights.sum()
+    
+    # Compute weighted ensemble
+    ensemble = torch.zeros_like(all_preds[0])
+    for pred, w in zip(all_preds, weights):
+        ensemble += pred * w
+        
+    return ensemble
+
+# Downsample large images for display to avoid memory issues
+def downsample_for_display(image_tensor, max_size=512):
+    """Downsample large tensor for display purposes"""
+    if image_tensor is None:
+        return None
+        
+    if image_tensor.shape[-1] > max_size or image_tensor.shape[-2] > max_size:
+        h, w = image_tensor.shape[-2], image_tensor.shape[-1]
+        scale = max_size / max(h, w)
+        new_h, new_w = int(h * scale), int (w * scale)
+        
+        # Downsample
+        return F.interpolate(
+            image_tensor, 
+            size=(new_h, new_w),
+            mode='bilinear', 
+            align_corners=False
+        )
+    return image_tensor
+
 if __name__ == '__main__':
     # Set up logging - FIX THE TYPO in the format string
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -693,6 +973,30 @@ if __name__ == '__main__':
         logging.info(f"Patch size: {args.patch_size}, Overlap: {args.overlap}")
     logging.info(f"Scale: {args.scale}")
     logging.info(f"Enable dropout: {args.enable_dropout}")
+    
+    # Base output directory
+    base_output_dir = Path(args.output_dir)
+    base_output_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Create model-specific subdirectory
+    model_name = os.path.basename(args.model).replace('.pth', '')
+    model_dir = base_output_dir / model_name
+    
+    # Create lesion type subdirectory
+    lesion_dir = model_dir / args.lesion_type
+    
+    # Create patch size subdirectory
+    mode_suffix = "full" if is_full_image else f"p{original_patch_size}"
+    patch_dir = lesion_dir / mode_suffix
+    
+    # Create temperature subdirectory
+    temp_dir = patch_dir / f"T{args.temperature}"
+    
+    # Create samples subdirectory
+    samples_dir = temp_dir / f"N{args.samples}"
+    
+    # Ensure all directories exist
+    samples_dir.mkdir(parents=True, exist_ok=True)
     
     try:
         # First try to load with requested mode
@@ -768,21 +1072,58 @@ if __name__ == '__main__':
                     enable_dropout=args.enable_dropout
                 )
                 
-                # Save with descriptive filename
-                # Use original_patch_size in filename to reflect what was requested
-                mode_suffix = "full" if is_full_image else f"p{original_patch_size}"
-                model_name = os.path.basename(args.model).replace('.pth', '')
-                
-                # Add fallback indicator if mode was changed
-                if not is_full_image or original_patch_size == 0:
-                    fallback_indicator = ""
-                else:
-                    fallback_indicator = "_fallback"
+                # Temperature comparison if requested
+                if args.temperature_range:
+                    logging.info(f"Comparing temperatures: {args.temperature_range}")
                     
-                out_filename = f"{img_id}_{args.lesion_type}_T{args.temperature}_N{args.samples}_{mode_suffix}{fallback_indicator}_{model_name}.png"
-                out_path = output_dir / out_filename
+                    # Get image and mask
+                    raw_img, mask, _ = get_image_and_mask(test_dataset, img_id)
+                    image = raw_img.unsqueeze(0).to(device)
+                    mask = mask.unsqueeze(0).to(device)
+                    
+                    # Generate temperature comparison
+                    temp_fig = visualize_temperature_sampling(
+                        model=model,
+                        image=image,
+                        mask=mask,
+                        temperatures=args.temperature_range,
+                        samples_per_temp=args.samples_per_temp
+                    )
+                    
+                    # Save temperature comparison
+                    temp_path = samples_dir / f"{img_id}_temp_comparison.png"
+                    temp_fig.savefig(temp_path, dpi=300, bbox_inches='tight')
+                    plt.close(temp_fig)
+                    logging.info(f"Saved temperature comparison to {temp_path}")
+                
+                    # Generate ensemble if requested
+                    if args.ensemble:
+                        ensemble_fig = generate_and_compare_ensemble(
+                            model=model,
+                            image=image,
+                            mask=mask,
+                            temperatures=args.temperature_range,
+                            samples_per_temp=args.samples_per_temp,
+                            weighted=args.weighted_ensemble
+                        )
+                        
+                        # Save ensemble comparison
+                        ensemble_path = samples_dir / f"{img_id}_ensemble.png"
+                        ensemble_fig.savefig(ensemble_path, dpi=300, bbox_inches='tight')
+                        plt.close(ensemble_fig)
+                        logging.info(f"Saved ensemble visualization to {ensemble_path}")
+                
+                # Create timestamp for unique filename
+                from datetime import datetime
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                
+                # Save with timestamp in the filename in the hierarchical directory
+                out_filename = f"{img_id}_{timestamp}.png"
+                out_path = samples_dir / out_filename
                 fig.savefig(out_path, dpi=300, bbox_inches='tight', pad_inches=0.2)
                 plt.close(fig)
+                
+                logging.info(f"Saved visualization to {out_path}")
                 
             except Exception as e:
                 logging.error(f"Error processing image {img_id}: {e}")
@@ -799,7 +1140,15 @@ if __name__ == '__main__':
         import traceback
         traceback.print_exc()
     
-    print(f"High-resolution visualizations saved to {output_dir}!")
+    # Print the folder structure at the end
+    print(f"\nHigh-resolution visualizations saved in the following structure:")
+    print(f"{base_output_dir}/")
+    print(f"└── {model_name}/")
+    print(f"    └── {args.lesion_type}/")
+    print(f"        └── {mode_suffix}/")
+    print(f"            └── T{args.temperature}/")
+    print(f"                └── N{args.samples}/")
+    print(f"                    └── [image_id]_[timestamp].png")
 
 
 
