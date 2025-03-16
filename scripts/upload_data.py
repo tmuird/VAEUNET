@@ -3,15 +3,10 @@ import os
 from pathlib import Path
 import argparse
 
-def upload_data_to_s3(data_dir, bucket, prefix, profile_name=None):
-    """Upload training and validation data to S3 (excluding patches)"""
-    # Use profile if provided
-    session = boto3.Session(profile_name=profile_name) if profile_name else boto3.Session()
-    s3 = session.client('s3')
+def upload_data_to_s3(data_dir, bucket, prefix):
+    """Upload training and validation data to S3"""
+    s3 = boto3.client('s3')
     data_dir = Path(data_dir)
-    
-    # Ensure we're not uploading the patches directory
-    patches_dir = data_dir / 'patches'
     
     # Prepare data directories
     for split in ['train', 'val']:
@@ -20,10 +15,6 @@ def upload_data_to_s3(data_dir, bucket, prefix, profile_name=None):
         if img_dir.exists():
             print(f"Uploading {split} images...")
             for img_file in img_dir.glob('*.jpg'):
-                # Skip if in patches
-                if patches_dir in img_file.parents:
-                    continue
-                    
                 key = f"{prefix}/{split}/imgs/{img_file.name}"
                 print(f"  Uploading {img_file} to s3://{bucket}/{key}")
                 s3.upload_file(str(img_file), bucket, key)
@@ -34,16 +25,11 @@ def upload_data_to_s3(data_dir, bucket, prefix, profile_name=None):
             if mask_dir.exists():
                 print(f"Uploading {split} masks for {lesion}...")
                 for mask_file in mask_dir.glob('*.tif'):
-                    # Skip if in patches
-                    if patches_dir in mask_file.parents:
-                        continue
-                        
                     key = f"{prefix}/{split}/masks/{lesion}/{mask_file.name}"
                     print(f"  Uploading {mask_file} to s3://{bucket}/{key}")
                     s3.upload_file(str(mask_file), bucket, key)
     
     print("Data upload complete!")
-    print("Note: The 'patches' directory was excluded from upload.")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Upload IDRID dataset to S3')
@@ -51,10 +37,8 @@ if __name__ == "__main__":
                         help='Local directory with your IDRID dataset')
     parser.add_argument('--bucket', type=str, required=True,
                         help='S3 bucket name')
-    parser.add_argument('--prefix', type=str, default='vaeunet-data',
+    parser.add_argument('--prefix', type=str, default='data',
                         help='S3 prefix for your data')
-    parser.add_argument('--profile', type=str, default=None,
-                        help='AWS profile name')
     
     args = parser.parse_args()
-    upload_data_to_s3(args.data_dir, args.bucket, args.prefix, args.profile)
+    upload_data_to_s3(args.data_dir, args.bucket, args.prefix)

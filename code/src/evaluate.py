@@ -60,20 +60,20 @@ def evaluate(model, dataloader, device, amp, max_samples=4):
         for batch in dataloader:
             torch.cuda.empty_cache()
             
-            with torch.autocast(device.type if device.type != 'mps' else 'cpu', enabled=amp):
+            with torch.cuda.amp.autocast(enabled=amp):
                 # Ensure consistent dtype across validation
                 dtype = torch.float16 if amp else torch.float32
                 image = batch['image'].to(device=device, dtype=dtype, non_blocking=True)
                 mask_true = batch['mask'].to(device=device, dtype=dtype, non_blocking=True)
 
                 # Compute prediction
-                mask_pred, _, _ = model(image)  # Unpack only the segmentation output
-                
-                # Take only the main output if in training mode (ignoring deep supervision outputs)
-                if isinstance(mask_pred, list):
-                    mask_pred = mask_pred[0]
-                
-                mask_pred = torch.sigmoid(mask_pred)
+                with torch.cuda.amp.autocast(enabled=amp):
+                    outputs = model(image)
+                    if isinstance(outputs, tuple):
+                        mask_pred = outputs[0]
+                    else:
+                        mask_pred = outputs
+                    mask_pred = torch.sigmoid(mask_pred)
 
                 # Compute metrics
                 batch_metrics = get_all_metrics(mask_pred, mask_true)
