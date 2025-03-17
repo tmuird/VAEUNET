@@ -16,6 +16,36 @@ from tqdm import tqdm
 from collections import defaultdict
 import shutil
 from utils.vae_utils import generate_predictions, encode_images
+import gc
+import psutil
+
+def track_memory(func):
+    """Decorator to track memory usage."""
+    def wrapper(*args, **kwargs):
+        # Before function call
+        gc.collect()
+        torch.cuda.empty_cache()
+        
+        gpu_mem_before = torch.cuda.memory_allocated() / 1024**2
+        ram_before = psutil.Process().memory_info().rss / 1024**2
+        
+        logging.info(f"Memory before {func.__name__}: GPU: {gpu_mem_before:.1f} MB, RAM: {ram_before:.1f} MB")
+        
+        # Call function
+        result = func(*args, **kwargs)
+        
+        # After function call
+        gc.collect()
+        torch.cuda.empty_cache()
+        
+        gpu_mem_after = torch.cuda.memory_allocated() / 1024**2
+        ram_after = psutil.Process().memory_info().rss / 1024**2
+        
+        logging.info(f"Memory after {func.__name__}: GPU: {gpu_mem_after:.1f} MB, RAM: {ram_after:.1f} MB")
+        logging.info(f"Memory change: GPU: {gpu_mem_after-gpu_mem_before:.1f} MB, RAM: {ram_after-ram_before:.1f} MB")
+        
+        return result
+    return wrapper
 
 def get_image_for_prediction(dataset, img_idx):
     """Get image and mask from dataset for prediction."""
@@ -336,7 +366,7 @@ def get_args():
     return parser.parse_args()
 
 def predict_with_patches(model, img, z, patch_size=512, overlap=100):
-    """Predict segmentation using patches."""
+    """Predict segmentation using patches with memory optimization and mixed precision fallback."""
     model.eval()
     device = img.device
     B, C, H, W = img.shape
@@ -349,9 +379,9 @@ def predict_with_patches(model, img, z, patch_size=512, overlap=100):
     print(f"Input image shape: {img.shape}")
     print(f"Processing {n_patches_h}x{n_patches_w} patches")
     
-    # Initialize output mask with zeros
-    output_mask = torch.zeros((B, 1, H, W), device=device)
-    weight_mask = torch.zeros((B, 1, H, W), device=device)
+    # Initialize output mask with zeros on CPU to save memory
+    output_mask = torch.zeros((B, 1, H, W), dtype=torch.float32)
+    weight_mask = torch.zeros((B, 1, H, W), dtype=torch.float32)
     
     # Process each patch
     with torch.no_grad():
@@ -377,25 +407,56 @@ def predict_with_patches(model, img, z, patch_size=512, overlap=100):
                 # Extract patch
                 patch = img[:, :, start_h:end_h, start_w:end_w]
                 patch_h, patch_w = patch.shape[2:]
-                print(f"Patch {i},{j} original size: {patch.shape}")
                 
-                # Get encoder features for this patch
-                features = model.encoder(patch)
-                x_enc = features[-1]
-                
-                # Interpolate z to match encoder output size
-                z_patch = F.interpolate(z, size=x_enc.shape[2:], mode='bilinear', align_corners=True)
-                
-                # Initial projection and decoding
-                x = model.z_initial(z_patch)
-                
-                # Decode with z injection at each stage
-                for k, decoder_block in enumerate(model.decoder_blocks):
-                    skip = features[-(k+2)] if k < len(features)-1 else None
-                    x = decoder_block(x, skip, z_patch)
-                
-                # Final conv and sigmoid
-                patch_pred = torch.sigmoid(model.final_conv(x))
+                # Try processing patch with full precision first
+                try:
+                    # Get encoder features for this patch
+                    features = model.encoder(patch)
+                    x_enc = features[-1]
+                    
+                    # Interpolate z to match encoder output size
+                    z_patch = F.interpolate(z, size=x_enc.shape[2:], mode='bilinear', align_corners=True)
+                    
+                    # Initial projection
+                    x = model.z_initial(z_patch)
+                    
+                    # Decode with z injection at each stage
+                    for k, decoder_block in enumerate(model.decoder_blocks):
+                        skip = features[-(k+2)] if k < len(features)-1 else None
+                        x = decoder_block(x, skip, z_patch)
+                    
+                    # Final conv and sigmoid
+                    patch_pred = torch.sigmoid(model.final_conv(x))
+                    
+                except RuntimeError as e:
+                    # If we run out of memory, try with half precision
+                    if 'out of memory' in str(e):
+                        print(f"WARNING: Out of memory for patch {i},{j}. Trying with half precision.")
+                        # Free memory
+                        torch.cuda.empty_cache()
+                        
+                        # Retry with half precision
+                        with torch.autocast(device_type="cuda", dtype=torch.float16):
+                            # Get encoder features for this patch
+                            features = model.encoder(patch)
+                            x_enc = features[-1]
+                            
+                            # Interpolate z to match encoder output size
+                            z_patch = F.interpolate(z, size=x_enc.shape[2:], mode='bilinear', align_corners=True)
+                            
+                            # Initial projection
+                            x = model.z_initial(z_patch)
+                            
+                            # Decode with z injection at each stage
+                            for k, decoder_block in enumerate(model.decoder_blocks):
+                                skip = features[-(k+2)] if k < len(features)-1 else None
+                                x = decoder_block(x, skip, z_patch)
+                            
+                            # Final conv and sigmoid
+                            patch_pred = torch.sigmoid(model.final_conv(x))
+                    else:
+                        # Re-raise other errors
+                        raise e
                 
                 # Resize prediction back to original patch size if needed
                 if patch_pred.shape[2:] != patch.shape[2:]:
@@ -426,15 +487,29 @@ def predict_with_patches(model, img, z, patch_size=512, overlap=100):
                                 else:
                                     weight[:, :, :, -overlap:] *= (1 - ramp).view(-1)
                 
-                # Add weighted prediction to output
-                output_mask[:, :, start_h:end_h, start_w:end_w] += patch_pred * weight
-                weight_mask[:, :, start_h:end_h, start_w:end_w] += weight
+                # Move to CPU immediately to save GPU memory
+                patch_pred_cpu = patch_pred.cpu()
+                weight_cpu = weight.cpu()
+                
+                # Add to CPU output mask
+                output_mask[:, :, start_h:end_h, start_w:end_w] += patch_pred_cpu * weight_cpu
+                weight_mask[:, :, start_h:end_h, start_w:end_w] += weight_cpu
+                
+                # Free memory
+                del patch_pred, weight, patch_pred_cpu, weight_cpu, features, x_enc, x, z_patch
+                torch.cuda.empty_cache()
     
     # Average overlapping regions
     output_mask = output_mask / (weight_mask + 1e-8)
-    print(f"Final mask shape: {output_mask.shape}")
     
-    return output_mask
+    # Move back to GPU for further processing
+    result = output_mask.to(device)
+    
+    # Clean up
+    del output_mask, weight_mask
+    torch.cuda.empty_cache()
+    
+    return result
 
 def get_image_and_mask(dataset, img_id):
     """Get full image and mask for a specific image ID by finding its full image or combining patches."""
@@ -665,136 +740,181 @@ def plot_reconstruction(model, img_id, dataset, num_samples=32, patch_size=None,
 
 def visualize_temperature_sampling(model, image, mask=None, 
                                   temperatures=[0.5, 1.0, 2.0, 3.0],
-                                  samples_per_temp=10):
-    """Memory-optimized visualization of temperature effects."""
+                                  samples_per_temp=10,
+                                  patch_size=512,   
+                                  overlap=100): 
+    """Ultra memory-optimized visualization processing one sample at a time."""
     device = image.device
+    
+    # Create figure first
     plt.figure(figsize=(15, 8))
     
-    # Plot original image
-    plt.subplot(2, len(temperatures) + 1, 1)
-    plt.imshow(image[0].cpu().permute(1, 2, 0).numpy())
-    plt.title("Original Image")
-    plt.axis('off')
+    # Plot original image (downsampled)
+    with torch.no_grad():
+        img_display = downsample_for_display(image, max_size=512)
+        plt.subplot(2, len(temperatures) + 1, 1)
+        plt.imshow(img_display[0].cpu().permute(1, 2, 0).numpy())
+        plt.title("Original Image")
+        plt.axis('off')
+        # Free immediately
+        del img_display
     
     # Plot ground truth if available
     if mask is not None:
+        mask_display = downsample_for_display(mask, max_size=512)
         plt.subplot(2, len(temperatures) + 1, len(temperatures) + 2)
-        plt.imshow(mask[0, 0].cpu().numpy(), cmap='gray')
+        plt.imshow(mask_display[0, 0].cpu().numpy(), cmap='gray')
         plt.title("Ground Truth")
         plt.axis('off')
+        del mask_display
     
-    # Process one temperature at a time
-    mean_preds = []
-    std_preds = []
-    
-    for i, temp in enumerate(temperatures):
-        # Get latent distribution parameters
-        with torch.no_grad():
-            mu, logvar = encode_images(model, image)
+    # Process each temperature separately
+    for temp_idx, temp in enumerate(temperatures):
+        logging.info(f"Processing temperature {temp}")
+        
+        # Create CPU tensors to store results
+        B, C, H, W = image.shape
+        mean_accumulator = torch.zeros((1, 1, H, W), dtype=torch.float32)
+        sq_accumulator = torch.zeros((1, 1, H, W), dtype=torch.float32)
+        
+        # Process one sample at a time
+        for s in range(samples_per_temp):
+            logging.info(f"  Sample {s+1}/{samples_per_temp}")
             
-        # Generate predictions with specific temperature
-        all_samples = []
-        for _ in range(samples_per_temp):
-            # Sample from latent space
-            std = torch.exp(0.5 * logvar) * temp
-            eps = torch.randn_like(std)
-            z = mu + eps * std
-            
-            # Add spatial dimensions for proper z injection
-            z_spatial = z.unsqueeze(-1).unsqueeze(-1)  # [B, latent_dim, 1, 1]
-            
-            # Generate prediction using the same technique as your patch prediction
+            # Get sample with patch-based prediction
             with torch.no_grad():
-                # Get encoder features
-                features = model.encoder(image)
-                x_enc = features[-1]
-                
-                # Interpolate z to match encoder output size
-                z_full = F.interpolate(z_spatial, size=x_enc.shape[2:], mode='bilinear', align_corners=True)
-                
-                # Initial projection
-                x = model.z_initial(z_full)
-                
-                # Decode with z injection at each stage
-                for k, decoder_block in enumerate(model.decoder_blocks):
-                    skip = features[-(k+2)] if k < len(features)-1 else None
-                    x = decoder_block(x, skip, z_full)
-                
-                # Final conv and sigmoid
-                pred = torch.sigmoid(model.final_conv(x))
-                
-                all_samples.append(pred.detach())
-                
-        # Stack samples just for this temperature
-        temp_samples = torch.stack(all_samples)
-        
+                # Generate latent vector
+                outputs = model(image)
+                if isinstance(outputs, tuple) and len(outputs) == 3:
+                    _, mu, logvar = outputs
+                    
+                    # Sample with temperature
+                    std = torch.exp(0.5 * logvar) * temp
+                    eps = torch.randn_like(std)
+                    z = mu + eps * std
+                    z = z.unsqueeze(-1).unsqueeze(-1)  # Add spatial dimensions
+                    
+                    # Use existing patch prediction function
+                    pred = predict_with_patches(model, image, z, patch_size, overlap)
+                    
+                    # Move to CPU immediately and accumulate
+                    pred_cpu = pred.detach().cpu()
+                    mean_accumulator += pred_cpu
+                    sq_accumulator += (pred_cpu ** 2)
+                    
+                    # Free GPU memory
+                    del pred, z, mu, logvar, std, eps, outputs
+                    torch.cuda.empty_cache()
+            
         # Calculate mean and std
-        mean_pred = torch.mean(temp_samples, dim=0)
-        std_pred = torch.std(temp_samples, dim=0)
+        mean_pred = mean_accumulator / samples_per_temp
+        var_pred = (sq_accumulator / samples_per_temp) - (mean_pred ** 2)
+        std_pred = torch.sqrt(torch.clamp(var_pred, min=1e-8))
         
-        # Store for visualization
-        mean_preds.append(mean_pred.cpu())
-        std_preds.append(std_pred.cpu())
+        # Downsample for display
+        mean_display = downsample_for_display(mean_pred, max_size=512)
+        std_display = downsample_for_display(std_pred, max_size=512)
         
-        # Free memory immediately
-        del temp_samples, all_samples
-        torch.cuda.empty_cache()
-    
-    # Now plot each temperature's results
-    for i, temp in enumerate(temperatures):
-        # Mean prediction
-        plt.subplot(2, len(temperatures) + 1, i + 2)
-        plt.imshow(mean_preds[i][0, 0].numpy(), cmap='gray')
+        # Plot
+        plt.subplot(2, len(temperatures) + 1, temp_idx + 2)
+        plt.imshow(mean_display[0].numpy() if mean_display.dim() > 2 else mean_display.numpy(), cmap='gray')
         plt.title(f"T={temp}\nMean")
         plt.axis('off')
         
-        # Standard deviation (uncertainty)
-        plt.subplot(2, len(temperatures) + 1, i + len(temperatures) + 3)
-        plt.imshow(std_preds[i][0, 0].numpy(), cmap='hot')
+        plt.subplot(2, len(temperatures) + 1, temp_idx + len(temperatures) + 3)
+        plt.imshow(std_display[0].numpy() if std_display.dim() > 2 else std_display.numpy(), cmap='hot')
         plt.title(f"T={temp}\nUncertainty")
         plt.axis('off')
+        
+        # Free memory
+        del mean_pred, var_pred, std_pred, mean_display, std_display
+        del mean_accumulator, sq_accumulator
+        gc.collect()  # Force garbage collection
+        torch.cuda.empty_cache()
     
     plt.tight_layout()
     return plt.gcf()
 
+@track_memory
 def generate_and_compare_ensemble(model, image, mask, temperatures=[0.5, 1.0, 2.0, 3.0], 
-                                 samples_per_temp=5, weighted=True):
-    """Generate and visualize ensemble prediction with proper resizing."""
+                                samples_per_temp=5, weighted=True, patch_size=512, overlap=100):
+    """Memory-optimized ensemble visualization that processes one temperature at a time."""
     device = image.device
+
+    # Downsample images for display first
+    image_vis = downsample_for_display(image.cpu(), max_size=512)
+    mask_vis = downsample_for_display(mask.cpu(), max_size=512)
     
     # Log dimensions for debugging
     logging.info(f"Input image shape: {image.shape}, Mask shape: {mask.shape}")
+    logging.info(f"Visualization shape: {image_vis.shape}")
     
-    # Get predictions at each temperature
-    temp_preds = {}
+    # Create visualization figure early
+    fig = plt.figure(figsize=(15, 10))
+    
+    # Plot original image and ground truth
+    plt.subplot(2, len(temperatures) + 1, 1)
+    plt.imshow(image_vis[0].permute(1, 2, 0).numpy())
+    plt.title("Original Image")
+    plt.axis('off')
+    
+    plt.subplot(2, len(temperatures) + 1, 2)
+    plt.imshow(mask_vis[0, 0].numpy(), cmap='gray')
+    plt.title("Ground Truth")
+    plt.axis('off')
+    
+    # Free memory for visualizations we no longer need
+    del image_vis, mask_vis
+    
+    # Get predictions at each temperature one at a time
     dice_scores = []
+    temp_pred_small = {}  # Store only downsampled versions
+    
+    # Get latent distribution once to reuse
+    with torch.no_grad():
+        mu, logvar = encode_images(model, image)
     
     for temp in temperatures:
-        # Generate prediction at this temperature
-        temp_pred = generate_predictions(
-            model, 
-            image, 
-            temperature=temp,
-            num_samples=samples_per_temp
-        )
+        logging.info(f"Processing temperature {temp}")
         
-        # Resize prediction to match mask dimensions
-        if temp_pred.shape[2] != mask.shape[2] or temp_pred.shape[3] != mask.shape[3]:
-            logging.info(f"Resizing prediction from {temp_pred.shape} to match mask {mask.shape}")
-            temp_pred = F.interpolate(
-                temp_pred, 
-                size=(mask.shape[2], mask.shape[3]), 
-                mode='bilinear', 
-                align_corners=False
-            )
+        # Generate prediction for this temperature
+        temp_pred = torch.zeros((1, 1, image.shape[2], image.shape[3]), device=device)
         
-        temp_preds[temp] = temp_pred
+        for s in range(samples_per_temp):
+            logging.info(f"  Sample {s+1}/{samples_per_temp}")
+            
+            with torch.no_grad():
+                # Sample latent vector
+                std = torch.exp(0.5 * logvar) * temp
+                eps = torch.randn_like(std)
+                z = mu + eps * std
+                z = z.unsqueeze(-1).unsqueeze(-1)
+                
+                # Generate using patches
+                pred = predict_with_patches(model, image, z, patch_size, overlap)
+                temp_pred += pred
+                
+                # Free memory
+                del pred, eps
+                torch.cuda.empty_cache()
+        
+        # Average samples
+        temp_pred = temp_pred / samples_per_temp
         
         # Calculate dice score
         dice = ((temp_pred > 0.5) & (mask > 0.5)).sum() / ((temp_pred > 0.5).sum() + (mask > 0.5).sum() + 1e-8)
         dice_scores.append(dice.item() * 2)
+        logging.info(f"  Dice score: {dice.item() * 2:.4f}")
+        
+        # Downsample for visualization
+        temp_pred_small[temp] = downsample_for_display(temp_pred.cpu(), max_size=512)
+        
+        # Free full-size prediction
+        del temp_pred
+        torch.cuda.empty_cache()
     
     # Generate ensemble prediction
+    logging.info("Generating ensemble prediction")
     ensemble_pred = generate_ensemble_prediction(
         model,
         image,
@@ -803,59 +923,28 @@ def generate_and_compare_ensemble(model, image, mask, temperatures=[0.5, 1.0, 2.
         weighted=weighted
     )
     
-    # Resize ensemble prediction
-    if ensemble_pred.shape[2] != mask.shape[2] or ensemble_pred.shape[3] != mask.shape[3]:
-        ensemble_pred = F.interpolate(
-            ensemble_pred, 
-            size=(mask.shape[2], mask.shape[3]), 
-            mode='bilinear', 
-            align_corners=False
-        )
-    
     # Calculate ensemble dice score
     ensemble_dice = ((ensemble_pred > 0.5) & (mask > 0.5)).sum() / ((ensemble_pred > 0.5).sum() + (mask > 0.5).sum() + 1e-8)
     ensemble_dice = ensemble_dice.item() * 2
+    logging.info(f"Ensemble dice score: {ensemble_dice:.4f}")
     
-    # Downsample for visualization
-    def downsample_for_display(tensor, max_size=512):
-        if tensor is None:
-            return None
-        if tensor.shape[-1] > max_size or tensor.shape[-2] > max_size:
-            h, w = tensor.shape[-2], tensor.shape[-1]
-            scale = max_size / max(h, w)
-            new_h, new_w = int(h * scale), int(w * scale)
-            return F.interpolate(tensor, size=(new_h, new_w), mode='bilinear', align_corners=False)
-        return tensor
+    # Downsample ensemble for visualization
+    ensemble_vis = downsample_for_display(ensemble_pred.cpu(), max_size=512)
     
-    # Downsample tensors for display
-    image_vis = downsample_for_display(image)
-    mask_vis = downsample_for_display(mask)
-    ensemble_pred_vis = downsample_for_display(ensemble_pred)
-    temp_preds_vis = {t: downsample_for_display(p) for t, p in temp_preds.items()}
+    # Free full-size ensemble
+    del ensemble_pred
+    torch.cuda.empty_cache()
     
-    # Create visualization figure
-    fig = plt.figure(figsize=(15, 10))
-    
-    # Row 1: Original image, ground truth, ensemble prediction
-    plt.subplot(2, len(temperatures) + 1, 1)
-    plt.imshow(image_vis[0].cpu().permute(1, 2, 0).numpy())
-    plt.title("Original Image")
-    plt.axis('off')
-    
-    plt.subplot(2, len(temperatures) + 1, 2)
-    plt.imshow(mask_vis[0, 0].cpu().numpy(), cmap='gray')
-    plt.title("Ground Truth")
-    plt.axis('off')
-    
+    # Plot ensemble prediction
     plt.subplot(2, len(temperatures) + 1, 3)
-    plt.imshow(ensemble_pred_vis[0, 0].cpu().numpy(), cmap='gray')
+    plt.imshow(ensemble_vis[0, 0].numpy(), cmap='gray')
     plt.title(f"Ensemble\nDice: {ensemble_dice:.4f}")
     plt.axis('off')
     
-    # Row 2: Individual temperature predictions
+    # Plot individual temperature predictions
     for i, temp in enumerate(temperatures):
         plt.subplot(2, len(temperatures) + 1, len(temperatures) + i + 2)
-        plt.imshow(temp_preds_vis[temp][0, 0].cpu().numpy(), cmap='gray')
+        plt.imshow(temp_pred_small[temp][0, 0].numpy(), cmap='gray')
         plt.title(f"T={temp}\nDice: {dice_scores[i]:.4f}")
         plt.axis('off')
     
@@ -869,67 +958,130 @@ def generate_and_compare_ensemble(model, image, mask, temperatures=[0.5, 1.0, 2.
     
     plt.tight_layout()
     
-    # Critical fix: Make sure we return the figure object
-    return fig  # This was likely missing before
+    # Free remaining variables
+    del mu, logvar, temp_pred_small, ensemble_vis
+    torch.cuda.empty_cache()
+    
+    return fig
+
 
 def generate_ensemble_prediction(model, image, temps=[0.5, 1.0, 2.0, 3.0], 
-                                samples_per_temp=5, weighted=True):
-    """Generate ensemble prediction combining multiple temperatures."""
+                               samples_per_temp=5, weighted=True,
+                               patch_size=512,    # Add this parameter
+                               overlap=100):
+    """Memory-efficient ensemble prediction using patches directly."""
     device = image.device
-    all_preds = []
-    weights = []
+    B, C, H, W = image.shape
+ 
     
+    logging.info(f"Generating ensemble prediction with temperatures {temps}")
+    
+    # Initialize ensemble prediction tensor
+    ensemble_pred = torch.zeros((1, 1, H, W), device=device)
+    
+    # Initialize weights
+    temp_weights = []
     for temp in temps:
-        # Generate predictions at this temperature
-        result = generate_predictions(
-            model, 
-            image, 
-            temperature=temp, 
-            num_samples=samples_per_temp,
-            return_all=True
-        )
-        
-        # Add mean prediction to ensemble
-        all_preds.append(result['mean'])
-        
-        # Higher weight for middle temperatures if weighted
         if weighted:
             # Weight based on temperature - favoring middle range (around 1.0)
             weight = 1.0 / (abs(temp - 1.0) + 0.5)
         else:
             weight = 1.0
-            
-        weights.append(weight)
+        temp_weights.append(weight)
     
     # Normalize weights
-    weights = torch.tensor(weights, device=device)
-    weights = weights / weights.sum()
+    temp_weights = torch.tensor(temp_weights, device=device)
+    temp_weights = temp_weights / temp_weights.sum()
     
-    # Compute weighted ensemble
-    ensemble = torch.zeros_like(all_preds[0])
-    for pred, w in zip(all_preds, weights):
-        ensemble += pred * w
+    # Process one temperature at a time to save memory
+    for temp_idx, temp in enumerate(temps):
+        logging.info(f"Processing temperature {temp} with weight {temp_weights[temp_idx].item():.4f}")
         
-    return ensemble
+        # Get latent distribution parameters
+        with torch.no_grad():
+            mu, logvar = encode_images(model, image)
+            
+        # Average predictions for this temperature
+        temp_pred = torch.zeros((1, 1, H, W), device=device)
+        
+        # Generate multiple samples for this temperature
+        for s in range(samples_per_temp):
+            logging.info(f"  Sample {s+1}/{samples_per_temp}")
+            
+            # Sample from latent space
+            with torch.no_grad():
+                std = torch.exp(0.5 * logvar) * temp
+                eps = torch.randn_like(std)
+                z = mu + eps * std
+                z = z.unsqueeze(-1).unsqueeze(-1)  # Add spatial dimensions
+                
+                # Generate prediction using patches
+                pred = predict_with_patches(model, image, z, patch_size, overlap)
+                
+                # Add to temperature prediction
+                temp_pred += pred
+                
+                # Free memory
+                del pred
+                torch.cuda.empty_cache()
+        
+        # Average the predictions for this temperature
+        temp_pred = temp_pred / samples_per_temp
+        
+        # Add weighted prediction to ensemble
+        ensemble_pred += temp_pred * temp_weights[temp_idx]
+        
+        # Free memory
+        del temp_pred, mu, logvar
+        torch.cuda.empty_cache()
+    
+    return ensemble_pred
 
 # Downsample large images for display to avoid memory issues
 def downsample_for_display(image_tensor, max_size=512):
-    """Downsample large tensor for display purposes"""
+    """Downsample large tensor for display purposes with robust dimension handling"""
     if image_tensor is None:
         return None
-        
+    
+    # Ensure tensor has 4 dimensions (N, C, H, W) for interpolation
+    original_shape = image_tensor.shape
+    
+    # Fix tensor dimensions based on original shape
+    if len(original_shape) == 2:  # H, W
+        image_tensor = image_tensor.unsqueeze(0).unsqueeze(0)  # Add N, C dimensions
+    elif len(original_shape) == 3:
+        # Could be either [1, H, W] or [C, H, W]
+        image_tensor = image_tensor.unsqueeze(0)  # Add N dimension
+    
+    # Now check if resizing is needed
     if image_tensor.shape[-1] > max_size or image_tensor.shape[-2] > max_size:
         h, w = image_tensor.shape[-2], image_tensor.shape[-1]
         scale = max_size / max(h, w)
-        new_h, new_w = int(h * scale), int (w * scale)
+        new_h, new_w = int(h * scale), int(w * scale)
         
         # Downsample
-        return F.interpolate(
+        result = F.interpolate(
             image_tensor, 
             size=(new_h, new_w),
             mode='bilinear', 
             align_corners=False
         )
+        
+        # Restore original dimension structure
+        if len(original_shape) == 2:
+            result = result.squeeze(0).squeeze(0)
+        elif len(original_shape) == 3:
+            result = result.squeeze(0)
+        
+        return result
+    
+    # Restore original dimension structure if no resizing was done
+    if len(original_shape) != len(image_tensor.shape):
+        if len(original_shape) == 2:
+            image_tensor = image_tensor.squeeze(0).squeeze(0)
+        elif len(original_shape) == 3:
+            image_tensor = image_tensor.squeeze(0)
+    
     return image_tensor
 
 if __name__ == '__main__':
@@ -1087,7 +1239,9 @@ if __name__ == '__main__':
                         image=image,
                         mask=mask,
                         temperatures=args.temperature_range,
-                        samples_per_temp=args.samples_per_temp
+                        samples_per_temp=args.samples_per_temp,
+                        patch_size=args.patch_size,  # Add this
+                        overlap=args.overlap         # Add this
                     )
                     
                     # Save temperature comparison
@@ -1104,7 +1258,9 @@ if __name__ == '__main__':
                             mask=mask,
                             temperatures=args.temperature_range,
                             samples_per_temp=args.samples_per_temp,
-                            weighted=args.weighted_ensemble
+                            weighted=args.weighted_ensemble,
+                            patch_size=args.patch_size,  # Add this
+                            overlap=args.overlap         # Add this
                         )
                         
                         # Save ensemble comparison

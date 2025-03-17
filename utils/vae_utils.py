@@ -37,9 +37,13 @@ def encode_images(model, images):
 
 # Update this function in utils/vae_utils.py
 def generate_predictions(model, images, temperature=1.0, num_samples=1, 
-                        return_all=False):
-    """Generate multiple predictions using the correct VAE-UNet architecture."""
+                        return_all=False, patch_size=512, overlap=100):
+    """Generate multiple predictions using patch-based approach for large images."""
     device = images.device
+    B, C, H, W = images.shape
+    
+    # Use patching for large images
+    use_patching = (H > patch_size or W > patch_size)
     
     # Get latent distribution
     mu, logvar = encode_images(model, images)
@@ -49,33 +53,32 @@ def generate_predictions(model, images, temperature=1.0, num_samples=1,
     
     for _ in range(num_samples):
         # Sample latent vector
-        std = torch.exp(0.5 * logvar) * temperature
-        eps = torch.randn_like(std)
-        z = mu + eps * std
-        
-        # Add spatial dimensions for proper z injection
+        z = sample_from_latent(mu, logvar, temperature)
         z_spatial = z.unsqueeze(-1).unsqueeze(-1)  # [B, latent_dim, 1, 1]
         
+        # Generate prediction
         with torch.no_grad():
-            # Get encoder features
-            features = model.encoder(images)
-            x_enc = features[-1]
+            if use_patching:
+                # Use patch-based prediction for large images
+                pred = predict_with_patches(model, images, z_spatial, patch_size, overlap)
+            else:
+                # Direct prediction for small images
+                features = model.encoder(images)
+                x_enc = features[-1]
+                z_full = F.interpolate(z_spatial, size=x_enc.shape[2:], 
+                                      mode='bilinear', align_corners=True)
+                x = model.z_initial(z_full)
+                
+                for k, decoder_block in enumerate(model.decoder_blocks):
+                    skip = features[-(k+2)] if k < len(features)-1 else None
+                    x = decoder_block(x, skip, z_full)
+                
+                pred = torch.sigmoid(model.final_conv(x))
             
-            # Interpolate z to match encoder output size
-            z_full = F.interpolate(z_spatial, size=x_enc.shape[2:], mode='bilinear', align_corners=True)
-            
-            # Initial projection
-            x = model.z_initial(z_full)
-            
-            # Decode with z injection at each stage
-            for k, decoder_block in enumerate(model.decoder_blocks):
-                skip = features[-(k+2)] if k < len(features)-1 else None
-                x = decoder_block(x, skip, z_full)
-            
-            # Final conv and sigmoid
-            pred = torch.sigmoid(model.final_conv(x))
-            
-            all_preds.append(pred)
+        all_preds.append(pred.detach())  # Use detach to free computation graph
+        
+        # Free memory after each sample
+        torch.cuda.empty_cache()
     
     # Stack all predictions
     all_preds = torch.stack(all_preds)
@@ -90,33 +93,38 @@ def generate_predictions(model, images, temperature=1.0, num_samples=1,
         return torch.mean(all_preds, dim=0)
 
 def generate_ensemble_prediction(model, image, temps=[0.5, 1.0, 2.0, 3.0], 
-                               samples_per_temp=5, weighted=True):
-    """Generate ensemble prediction combining multiple temperatures."""
+                               samples_per_temp=5, weighted=True,
+                               patch_size=512, overlap=100):
+    """Memory-efficient ensemble prediction combining multiple temperatures."""
     device = image.device
     all_preds = []
     weights = []
     
     for temp in temps:
-        # Generate predictions at this temperature
-        result = generate_predictions(
+        logging.info(f"Generating ensemble component for temperature {temp}")
+        # Generate predictions at this temperature with patching
+        temp_pred = generate_predictions(
             model, 
             image, 
             temperature=temp, 
             num_samples=samples_per_temp,
-            return_all=True
+            patch_size=patch_size,
+            overlap=overlap
         )
         
-        # Add mean prediction to ensemble
-        all_preds.append(result['mean'])
+        # Add prediction to ensemble
+        all_preds.append(temp_pred)
         
-        # Higher weight for middle temperatures if weighted
+        # Compute weight
         if weighted:
-            # Weight based on temperature - favoring middle range (around 1.0)
             weight = 1.0 / (abs(temp - 1.0) + 0.5)
         else:
             weight = 1.0
             
         weights.append(weight)
+        
+        # Free memory after each temperature
+        torch.cuda.empty_cache()
     
     # Normalize weights
     weights = torch.tensor(weights, device=device)
