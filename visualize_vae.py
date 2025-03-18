@@ -104,7 +104,7 @@ def get_patches_for_image(dataset, img_id):
     
     return patches, patch_coords
 
-def predict_with_dataset_patches(model, dataset, img_id, z, device):
+def predict_with_dataset_patches(model, dataset, img_id, z, device, overlap=None):
     """Use the dataset's patch mechanism to predict on patches and reassemble."""
     model.eval()
     
@@ -125,53 +125,176 @@ def predict_with_dataset_patches(model, dataset, img_id, z, device):
         max_x = max(x + p.shape[3] for p, (_, x) in zip(patches, patch_coords))
         H, W = max_y, max_x
     
+    # Calculate adaptive overlap if not specified
+    if overlap is None:
+        # Use dataset's patch size to determine overlap
+        patch_size = dataset.patch_size if hasattr(dataset, 'patch_size') else patches[0].shape[2]
+        # Make overlap proportional to patch size (20% of patch size)
+        overlap = max(min(int(patch_size * 0.2), 128), 32)
+    
+    logging.info(f"Using overlap of {overlap} pixels for dataset patches")
+    
     # Initialize output and weight masks
     output_mask = torch.zeros((1, 1, H, W), device=device)
     weight_mask = torch.zeros((1, 1, H, W), device=device)
     
     # Process each patch
     with torch.no_grad():
-        for i, (patch, (y, x)) in enumerate(zip(patches, patch_coords)):
-            patch = patch.to(device)
-            
-            # Get encoder features for this patch
-            features = model.encoder(patch)
-            x_enc = features[-1]
-            
-            # Interpolate z to match encoder output size
-            z_patch = F.interpolate(z, size=x_enc.shape[2:], mode='bilinear', align_corners=True)
-            
-            # Initial projection
-            x_proj = model.z_initial(z_patch)
-            
-            # Decode with z injection
-            for k, decoder_block in enumerate(model.decoder_blocks):
-                skip = features[-(k+2)] if k < len(features)-1 else None
-                x_proj = decoder_block(x_proj, skip, z_patch)
-            
-            # Final prediction
-            patch_pred = torch.sigmoid(model.final_conv(x_proj))
-            
-            # Create tapering weight mask for smooth blending
-            patch_h, patch_w = patch.shape[2], patch.shape[3]
-            weight = torch.ones_like(patch_pred)
-            
-            # Apply smooth tapering at edges (similar to the original function)
-            overlap = 50  # Use a reasonable overlap value
-            for axis in [2, 3]:
-                if patch_pred.shape[axis] > 2*overlap:
-                    ramp = torch.linspace(0, 1, overlap, device=device)
-                    if axis == 2:
-                        weight[:, :, :overlap, :] *= ramp.view(-1, 1)
-                        weight[:, :, -overlap:, :] *= (1 - ramp).view(-1, 1)
+        # Group patches into batches based on size
+        max_batch_size = 10  # Process up to 4 patches at once
+        batches = []
+        current_batch = []
+        current_coords = []
+        
+        # Group patches with similar size
+        for i, (patch, coords) in enumerate(zip(patches, patch_coords)):
+            # If batch is empty or patch size matches the first patch in batch
+            if not current_batch or (current_batch[0].shape == patch.shape):
+                current_batch.append(patch)
+                current_coords.append(coords)
+                
+                # Process batch if we've reached max size
+                if len(current_batch) >= max_batch_size:
+                    batches.append((current_batch.copy(), current_coords.copy()))
+                    current_batch = []
+                    current_coords = []
+            else:
+                # Process current batch and start a new one
+                if current_batch:
+                    batches.append((current_batch.copy(), current_coords.copy()))
+                current_batch = [patch]
+                current_coords = [coords]
+        
+        # Add remaining patches as a batch
+        if current_batch:
+            batches.append((current_batch, current_coords))
+        
+        # Process each batch
+        for batch_patches, batch_coords in batches:
+            try:
+                # Stack patches into a batch tensor
+                batch_size = len(batch_patches)
+                if batch_size > 1:
+                    stacked_patches = torch.cat([p.to(device) for p in batch_patches], dim=0)
+                else:
+                    stacked_patches = batch_patches[0].to(device)
+                
+                # Get encoder features
+                features = model.encoder(stacked_patches)
+                x_enc = features[-1]
+                
+                # Prepare z for the batch
+                if batch_size > 1:
+                    z_batch = z.expand(batch_size, -1, -1, -1)
+                else:
+                    z_batch = z
+                
+                # Interpolate z to match encoder output
+                z_patch = F.interpolate(z_batch, size=x_enc.shape[2:], mode='bilinear', align_corners=True)
+                
+                # Initial projection
+                x_proj = model.z_initial(z_patch)
+                
+                # Decode with z injection
+                for k, decoder_block in enumerate(model.decoder_blocks):
+                    skip = features[-(k+2)] if k < len(features)-1 else None
+                    x_proj = decoder_block(x_proj, skip, z_patch)
+                
+                # Final prediction
+                batch_preds = torch.sigmoid(model.final_conv(x_proj))
+                
+                # Process each prediction in batch
+                for idx in range(batch_size):
+                    if batch_size > 1:
+                        patch = stacked_patches[idx:idx+1]
+                        patch_pred = batch_preds[idx:idx+1]
                     else:
-                        weight[:, :, :, :overlap] *= ramp.view(-1)
-                        weight[:, :, :, -overlap:] *= (1 - ramp).view(-1)
+                        patch = stacked_patches
+                        patch_pred = batch_preds
+                        
+                    y, x = batch_coords[idx]
+                    
+                    # Create weight mask for smooth blending
+                    patch_h, patch_w = patch.shape[2], patch.shape[3]
+                    weight = torch.ones_like(patch_pred)
+                    
+                    # Apply smooth tapering at edges
+                    for axis in [2, 3]:
+                        if patch_pred.shape[axis] > 2*overlap:
+                            ramp = torch.linspace(0, 1, overlap, device=device)
+                            if axis == 2:
+                                weight[:, :, :overlap, :] *= ramp.view(-1, 1)
+                                weight[:, :, -overlap:, :] *= (1 - ramp).view(-1, 1)
+                            else:
+                                weight[:, :, :, :overlap] *= ramp.view(-1)
+                                weight[:, :, :, -overlap:] *= (1 - ramp).view(-1)
+                    
+                    # Add weighted prediction to output
+                    h, w = patch_pred.shape[2], patch_pred.shape[3]
+                    output_mask[:, :, y:y+h, x:x+w] += patch_pred * weight
+                    weight_mask[:, :, y:y+h, x:x+w] += weight
+                    
+            except RuntimeError as e:
+                # Fallback to single patch processing
+                logging.warning(f"Batch processing failed: {e}. Falling back to single patch mode.")
+                torch.cuda.empty_cache()
+                
+                # Process each patch individually
+                for patch, (y, x) in zip(batch_patches, batch_coords):
+                    patch = patch.to(device)
+                    
+                    # Process single patch
+                    features = model.encoder(patch)
+                    x_enc = features[-1]
+                    z_patch = F.interpolate(z, size=x_enc.shape[2:], mode='bilinear', align_corners=True)
+                    x_proj = model.z_initial(z_patch)
+                    
+                    # Decode
+                    for k, decoder_block in enumerate(model.decoder_blocks):
+                        skip = features[-(k+2)] if k < len(features)-1 else None
+                        x_proj = decoder_block(x_proj, skip, z_patch)
+                    
+                    # Final prediction
+                    patch_pred = torch.sigmoid(model.final_conv(x_proj))
+                    
+                    # Weight mask
+                    patch_h, patch_w = patch.shape[2], patch.shape[3]
+                    weight = torch.ones_like(patch_pred)
+                    
+                    # Apply tapering
+                    for axis in [2, 3]:
+                        if patch_pred.shape[axis] > 2*overlap:
+                            ramp = torch.linspace(0, 1, overlap, device=device)
+                            if axis == 2:
+                                weight[:, :, :overlap, :] *= ramp.view(-1, 1)
+                                weight[:, :, -overlap:, :] *= (1 - ramp).view(-1, 1)
+                            else:
+                                weight[:, :, :, :overlap] *= ramp.view(-1)
+                                weight[:, :, :, -overlap:] *= (1 - ramp).view(-1)
+                    
+                    # Add to output
+                    h, w = patch_pred.shape[2], patch_pred.shape[3]
+                    output_mask[:, :, y:y+h, x:x+w] += patch_pred * weight
+                    weight_mask[:, :, y:y+h, x:x+w] += weight
+                    
+                    # Clean up
+                    del patch, features, x_enc, z_patch, x_proj, patch_pred, weight
+                    torch.cuda.empty_cache()
             
-            # Add weighted prediction to output in the correct position
-            h, w = patch_pred.shape[2], patch_pred.shape[3]
-            output_mask[:, :, y:y+h, x:x+w] += patch_pred * weight
-            weight_mask[:, :, y:y+h, x:x+w] += weight
+            # Clean up batch resources
+            if 'stacked_patches' in locals():
+                del stacked_patches
+            if 'features' in locals():
+                del features 
+            if 'x_enc' in locals():
+                del x_enc
+            if 'z_patch' in locals():
+                del z_patch
+            if 'x_proj' in locals():
+                del x_proj
+            if 'batch_preds' in locals():
+                del batch_preds
+            torch.cuda.empty_cache()
     
     # Average overlapping regions
     output_mask = output_mask / (weight_mask + 1e-8)
@@ -208,51 +331,7 @@ def calculate_uncertainty_metrics(segmentations):
         'coeff_var': coeff_var.squeeze(1)
     }
 
-def get_segmentation_distribution(model, img, img_id, dataset=None, num_samples=32, patch_dataset=None, temperature=1.0, enable_dropout=True):
-    """Generate multiple segmentations using either full image or patches from dataset."""
-    if enable_dropout:
-        model.train()  # Enable dropout
-    else:
-        model.eval()
-        
-    device = img.device
-    
-    # Get latent distribution parameters
-    with torch.no_grad():
-        mu, logvar = encode_images(model, img)
-    print(f"Latent distribution shapes - mu: {mu.shape}, logvar: {logvar.shape}")
-    
-    # Initialize list to store segmentations
-    segmentations = []
-    
-    # Generate multiple samples
-    for i in tqdm(range(num_samples), desc="Generating samples"):
-        # Sample from latent space
-        std = torch.exp(0.5 * logvar) * temperature
-        eps = torch.randn_like(std)
-        z = mu + eps * std
-        z = z.unsqueeze(-1).unsqueeze(-1)  # Add spatial dimensions
-        
-        # Choose prediction method based on available datasets
-        if patch_dataset is not None:
-            # Generate segmentation using patches from dataset
-            seg = predict_with_dataset_patches(model, patch_dataset, img_id, z, device)
-        else:
-            # Generate segmentation using full image
-            seg = predict_full_image(model, img, z)
-            
-        print(f"Sample {i} segmentation shape: {seg.shape}")
-        segmentations.append(seg)
-        
-        # Free some memory
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-    
-    # Stack all segmentations
-    segmentations = torch.cat(segmentations, dim=0)
-    print(f"Final stacked segmentations shape: {segmentations.shape}")
-    
-    return segmentations, mu, logvar
+
 
 def plot_reconstruction(model, img, mask, img_id, dataset=None, num_samples=32, patch_dataset=None, temperature=1.0, enable_dropout=True):
     """Plot the input image, ground truth mask, and uncertainty analysis from multiple sampled reconstructions."""
@@ -267,7 +346,7 @@ def plot_reconstruction(model, img, mask, img_id, dataset=None, num_samples=32, 
     # Get multiple segmentations
     segmentations, mu, logvar = get_segmentation_distribution(
         model, img, img_id, dataset=dataset, num_samples=num_samples,
-        patch_dataset=patch_dataset, temperature=temperature, enable_dropout=enable_dropout
+        patch_dataset=patch_dataset, temperature=temperature, enable_dropout=enable_dropout, batch_size=args.batch_size
     )
     print(f"Segmentations shape after distribution: {segmentations.shape}")
     
@@ -362,142 +441,193 @@ def get_args():
                         help='Use weighted temperature ensemble (weights favor T=1)')
     parser.add_argument('--samples-per-temp', type=int, default=5,
                         help='Number of samples per temperature for ensembling')
+    parser.add_argument('--batch_size', type=int, default=4,
+                        help='Batch size for patch processing (default: 4)')
     parser.set_defaults(use_attention=True, enable_dropout=False)
     return parser.parse_args()
 
-def predict_with_patches(model, img, z, patch_size=512, overlap=100):
-    """Predict segmentation using patches with memory optimization and mixed precision fallback."""
+def predict_with_patches(model, img, z, patch_size=512, overlap=None, batch_size=4):
+    """Predict segmentation using patches with memory optimization and batch processing."""
     model.eval()
     device = img.device
     B, C, H, W = img.shape
+    
+    # Calculate adaptive overlap if not specified
+    if overlap is None:
+        # Make overlap proportional to patch size (20% of patch size, min 32px, max 128px)
+        overlap = max(min(int(patch_size * 0.2), 128), 32)
     
     # Calculate number of patches needed
     stride = patch_size - overlap
     n_patches_h = math.ceil((H - overlap) / stride)
     n_patches_w = math.ceil((W - overlap) / stride)
+    total_patches = n_patches_h * n_patches_w
     
+    # Debug prints to verify calculations
     print(f"Input image shape: {img.shape}")
-    print(f"Processing {n_patches_h}x{n_patches_w} patches")
+    print(f"Patch size: {patch_size}, Overlap: {overlap}, Stride: {stride}")
+    print(f"Calculated patches: {n_patches_h} x {n_patches_w} = {total_patches}")
+    print(f"Processing with batch size: {batch_size}")
     
     # Initialize output mask with zeros on CPU to save memory
     output_mask = torch.zeros((B, 1, H, W), dtype=torch.float32)
     weight_mask = torch.zeros((B, 1, H, W), dtype=torch.float32)
     
-    # Process each patch
+    # Create all patch coordinates first
+    patch_info = []
+    for i in range(n_patches_h):
+        for j in range(n_patches_w):
+            # Calculate patch coordinates
+            start_h = i * stride
+            start_w = j * stride
+            
+            # Handle last row and column
+            if i == n_patches_h - 1:
+                end_h = H
+                start_h = max(0, end_h - patch_size)
+            else:
+                end_h = min(start_h + patch_size, H)
+                
+            if j == n_patches_w - 1:
+                end_w = W
+                start_w = max(0, end_w - patch_size)
+            else:
+                end_w = min(start_w + patch_size, W)
+                
+            patch_info.append((start_h, end_h, start_w, end_w))
+    
+    # Process patches in batches
     with torch.no_grad():
-        for i in range(n_patches_h):
-            for j in range(n_patches_w):
-                # Calculate patch coordinates
-                start_h = i * stride
-                start_w = j * stride
-                
-                # Handle last row and column
-                if i == n_patches_h - 1:
-                    end_h = H
-                    start_h = max(0, end_h - patch_size)
-                else:
-                    end_h = min(start_h + patch_size, H)
-                    
-                if j == n_patches_w - 1:
-                    end_w = W
-                    start_w = max(0, end_w - patch_size)
-                else:
-                    end_w = min(start_w + patch_size, W)
-                
-                # Extract patch
+        for batch_idx in range(0, len(patch_info), batch_size):
+            batch_patches = []
+            batch_coords = []
+            
+            # Collect batch of patches
+            for idx in range(batch_idx, min(batch_idx + batch_size, len(patch_info))):
+                start_h, end_h, start_w, end_w = patch_info[idx]
                 patch = img[:, :, start_h:end_h, start_w:end_w]
-                patch_h, patch_w = patch.shape[2:]
+                batch_patches.append(patch)
+                batch_coords.append((start_h, end_h, start_w, end_w))
+            
+            # Stack patches into a batch
+            if len(batch_patches) > 1:
+                # Create padded tensors if patches have different sizes
+                max_h = max(p.shape[2] for p in batch_patches)
+                max_w = max(p.shape[3] for p in batch_patches)
+                padded_patches = []
                 
-                # Try processing patch with full precision first
-                try:
-                    # Get encoder features for this patch
-                    features = model.encoder(patch)
-                    x_enc = features[-1]
-                    
-                    # Interpolate z to match encoder output size
-                    z_patch = F.interpolate(z, size=x_enc.shape[2:], mode='bilinear', align_corners=True)
-                    
-                    # Initial projection
-                    x = model.z_initial(z_patch)
-                    
-                    # Decode with z injection at each stage
-                    for k, decoder_block in enumerate(model.decoder_blocks):
-                        skip = features[-(k+2)] if k < len(features)-1 else None
-                        x = decoder_block(x, skip, z_patch)
-                    
-                    # Final conv and sigmoid
-                    patch_pred = torch.sigmoid(model.final_conv(x))
-                    
-                except RuntimeError as e:
-                    # If we run out of memory, try with half precision
-                    if 'out of memory' in str(e):
-                        print(f"WARNING: Out of memory for patch {i},{j}. Trying with half precision.")
-                        # Free memory
-                        torch.cuda.empty_cache()
-                        
-                        # Retry with half precision
-                        with torch.autocast(device_type="cuda", dtype=torch.float16):
-                            # Get encoder features for this patch
-                            features = model.encoder(patch)
-                            x_enc = features[-1]
-                            
-                            # Interpolate z to match encoder output size
-                            z_patch = F.interpolate(z, size=x_enc.shape[2:], mode='bilinear', align_corners=True)
-                            
-                            # Initial projection
-                            x = model.z_initial(z_patch)
-                            
-                            # Decode with z injection at each stage
-                            for k, decoder_block in enumerate(model.decoder_blocks):
-                                skip = features[-(k+2)] if k < len(features)-1 else None
-                                x = decoder_block(x, skip, z_patch)
-                            
-                            # Final conv and sigmoid
-                            patch_pred = torch.sigmoid(model.final_conv(x))
+                for p in batch_patches:
+                    if p.shape[2] < max_h or p.shape[3] < max_w:
+                        pad_h = max_h - p.shape[2]
+                        pad_w = max_w - p.shape[3]
+                        padded = F.pad(p, (0, pad_w, 0, pad_h))
+                        padded_patches.append(padded)
                     else:
-                        # Re-raise other errors
-                        raise e
+                        padded_patches.append(p)
+                        
+                stacked_patches = torch.cat(padded_patches, dim=0)
+            else:
+                stacked_patches = batch_patches[0]
+            
+            try:
+                # Process batch through encoder
+                features_batch = model.encoder(stacked_patches)
+                x_enc_batch = features_batch[-1]
                 
-                # Resize prediction back to original patch size if needed
-                if patch_pred.shape[2:] != patch.shape[2:]:
-                    patch_pred = F.interpolate(patch_pred, size=(patch_h, patch_w), mode='bilinear', align_corners=True)
+                # Interpolate z to match encoder output size for batch
+                if len(batch_patches) > 1:
+                    z_batch = z.expand(len(batch_patches), -1, -1, -1)
+                else:
+                    z_batch = z
+                    
+                z_resized = F.interpolate(z_batch, size=x_enc_batch.shape[2:], 
+                                         mode='bilinear', align_corners=True)
                 
-                # Create weight mask for blending
-                weight = torch.ones_like(patch_pred)
+                # Initial projection
+                x = model.z_initial(z_resized)
                 
-                # Apply tapering at edges for smooth blending
-                if overlap > 0:
-                    for axis in [2, 3]:  # Height and width dimensions
-                        if patch_pred.shape[axis] > overlap:
-                            # Create linear ramp for overlap regions
+                # Decode with z injection
+                for k, decoder_block in enumerate(model.decoder_blocks):
+                    skip = features_batch[-(k+2)] if k < len(features_batch)-1 else None
+                    x = decoder_block(x, skip, z_resized)
+                
+                # Final conv and sigmoid
+                batch_preds = torch.sigmoid(model.final_conv(x))
+                
+                # Process each prediction in the batch
+                for idx, ((start_h, end_h, start_w, end_w), patch) in enumerate(zip(batch_coords, batch_patches)):
+                    if len(batch_patches) > 1:
+                        patch_pred = batch_preds[idx:idx+1]
+                    else:
+                        patch_pred = batch_preds
+                        
+                    # Resize if needed
+                    patch_h, patch_w = patch.shape[2:]
+                    if patch_pred.shape[2:] != (patch_h, patch_w):
+                        patch_pred = F.interpolate(patch_pred, size=(patch_h, patch_w), 
+                                                mode='bilinear', align_corners=True)
+                    
+                    # Create weight mask for blending
+                    weight = torch.ones_like(patch_pred)
+                    
+                    # Apply tapering for smooth blending
+                    for axis in [2, 3]:
+                        if patch_pred.shape[axis] > 2 * overlap:
                             ramp = torch.linspace(0, 1, overlap, device=device)
                             
-                            # Apply ramp to start of patch if not at image boundary
+                            # Apply ramp to edges
+                            i, j = divmod(idx + batch_idx, n_patches_w)
+                            
+                            # Left/top edge
                             if (i > 0 and axis == 2) or (j > 0 and axis == 3):
                                 if axis == 2:
                                     weight[:, :, :overlap, :] *= ramp.view(-1, 1)
                                 else:
                                     weight[:, :, :, :overlap] *= ramp.view(-1)
-                            
-                            # Apply ramp to end of patch if not at image boundary
-                            if ((i < n_patches_h - 1 and axis == 2) or 
+                                    
+                            # Right/bottom edge
+                            if ((i < n_patches_h - 1 and axis == 2) or
                                 (j < n_patches_w - 1 and axis == 3)):
                                 if axis == 2:
                                     weight[:, :, -overlap:, :] *= (1 - ramp).view(-1, 1)
                                 else:
                                     weight[:, :, :, -overlap:] *= (1 - ramp).view(-1)
+                    
+                    # Move to CPU immediately to save GPU memory
+                    patch_pred_cpu = patch_pred.cpu()
+                    weight_cpu = weight.cpu()
+                    
+                    # Add to output mask
+                    output_mask[:, :, start_h:end_h, start_w:end_w] += patch_pred_cpu * weight_cpu
+                    weight_mask[:, :, start_h:end_h, start_w:end_w] += weight_cpu
                 
-                # Move to CPU immediately to save GPU memory
-                patch_pred_cpu = patch_pred.cpu()
-                weight_cpu = weight.cpu()
-                
-                # Add to CPU output mask
-                output_mask[:, :, start_h:end_h, start_w:end_w] += patch_pred_cpu * weight_cpu
-                weight_mask[:, :, start_h:end_h, start_w:end_w] += weight_cpu
-                
-                # Free memory
-                del patch_pred, weight, patch_pred_cpu, weight_cpu, features, x_enc, x, z_patch
+            except RuntimeError as e:
+                # Handle out of memory errors
                 torch.cuda.empty_cache()
+                if 'out of memory' in str(e) and batch_size > 1:
+                    logging.warning(f"Out of memory with batch_size={batch_size}. Falling back to single patch processing.")
+                    # Process each patch individually
+                    for idx, (start_h, end_h, start_w, end_w) in enumerate(batch_coords):
+                        # Extract single patch
+                        patch = img[:, :, start_h:end_h, start_w:end_w]
+                        # Use single patch prediction with the same method
+                        result = predict_single_patch(model, patch, z, device, overlap, 
+                                                    (n_patches_h, n_patches_w), batch_idx + idx)
+                        
+                        if result is not None:
+                            patch_pred, weight = result
+                            # Move to CPU and add to output
+                            output_mask[:, :, start_h:end_h, start_w:end_w] += patch_pred.cpu()
+                            weight_mask[:, :, start_h:end_h, start_w:end_w] += weight.cpu()
+                else:
+                    logging.error(f"Error processing patch batch: {e}")
+                    raise e
+            
+            # Clean up batch memory
+            del stacked_patches, features_batch, x_enc_batch, z_resized
+            if 'batch_preds' in locals():
+                del batch_preds
+            torch.cuda.empty_cache()
     
     # Average overlapping regions
     output_mask = output_mask / (weight_mask + 1e-8)
@@ -510,6 +640,66 @@ def predict_with_patches(model, img, z, patch_size=512, overlap=100):
     torch.cuda.empty_cache()
     
     return result
+
+def predict_single_patch(model, patch, z, device, overlap, patch_grid, patch_idx):
+    """Helper function to predict a single patch for memory fallback."""
+    try:
+        n_patches_h, n_patches_w = patch_grid
+        i, j = divmod(patch_idx, n_patches_w)
+        
+        # Get encoder features for this patch
+        features = model.encoder(patch)
+        x_enc = features[-1]
+        
+        # Interpolate z to match encoder output size
+        z_patch = F.interpolate(z, size=x_enc.shape[2:], mode='bilinear', align_corners=True)
+        
+        # Initial projection
+        x = model.z_initial(z_patch)
+        
+        # Decode with z injection at each stage
+        for k, decoder_block in enumerate(model.decoder_blocks):
+            skip = features[-(k+2)] if k < len(features)-1 else None
+            x = decoder_block(x, skip, z_patch)
+        
+        # Final conv and sigmoid
+        patch_pred = torch.sigmoid(model.final_conv(x))
+        
+        # Resize if needed
+        patch_h, patch_w = patch.shape[2:]
+        if patch_pred.shape[2:] != (patch_h, patch_w):
+            patch_pred = F.interpolate(patch_pred, size=(patch_h, patch_w), 
+                                      mode='bilinear', align_corners=True)
+                                      
+        # Create weight mask for blending
+        weight = torch.ones_like(patch_pred)
+        
+        # Apply tapering at edges for smooth blending
+        for axis in [2, 3]:
+            if patch_pred.shape[axis] > 2*overlap:
+                ramp = torch.linspace(0, 1, overlap, device=device)
+                
+                # Left/top edge
+                if (i > 0 and axis == 2) or (j > 0 and axis == 3):
+                    if axis == 2:
+                        weight[:, :, :overlap, :] *= ramp.view(-1, 1)
+                    else:
+                        weight[:, :, :, :overlap] *= ramp.view(-1)
+                        
+                # Right/bottom edge
+                if ((i < n_patches_h - 1 and axis == 2) or
+                    (j < n_patches_w - 1 and axis == 3)):
+                    if axis == 2:
+                        weight[:, :, -overlap:, :] *= (1 - ramp).view(-1, 1)
+                    else:
+                        weight[:, :, :, -overlap:] *= (1 - ramp).view(-1)
+        
+        return patch_pred, weight
+        
+    except RuntimeError:
+        torch.cuda.empty_cache()
+        logging.error(f"Failed to process patch {patch_idx} even in single mode")
+        return None
 
 def get_image_and_mask(dataset, img_id):
     """Get full image and mask for a specific image ID by finding its full image or combining patches."""
@@ -545,6 +735,9 @@ def get_image_and_mask(dataset, img_id):
     
     # If we didn't find a full image, we need to stitch patches
     if full_img is None and coords:
+        # Log the dataset patch size to check if correct
+        logging.info(f"Stitching patches with dataset patch size: {dataset.patch_size}")
+        
         # Find the size of the original image from the patch coordinates
         max_h = max(y + dataset.patch_size for y, _ in coords)
         max_w = max(x + dataset.patch_size for _, x in coords)
@@ -553,6 +746,10 @@ def get_image_and_mask(dataset, img_id):
         full_img = torch.zeros((3, max_h, max_w), dtype=torch.float32)
         full_mask = torch.zeros((1, max_h, max_w), dtype=torch.float32)
         weight = torch.zeros((1, max_h, max_w), dtype=torch.float32)
+        
+        # Calculate adaptive overlap for blending
+        patch_size = dataset.patch_size
+        overlap = max(min(int(patch_size * 0.2), 128), 32)  # 20% of patch size, bounded
         
         # Collect all patches for this image ID
         for idx in range(len(dataset)):
@@ -571,7 +768,6 @@ def get_image_and_mask(dataset, img_id):
                 
                 # Create weight mask for smooth blending
                 patch_weight = torch.ones((1, patch_h, patch_w))
-                overlap = dataset.patch_size // 4  # Use 1/4 of patch size as overlap
                 
                 # Apply tapering at edges
                 if overlap > 0:
@@ -604,8 +800,9 @@ def get_image_and_mask(dataset, img_id):
     return full_img, full_mask, original_shape
 
 def get_segmentation_distribution(model, img_id, dataset, num_samples=32, 
-                                 patch_size=None, overlap=100, 
-                                 temperature=1.0, enable_dropout=True):
+                                 patch_size=None, overlap=None, 
+                                 temperature=1.0, enable_dropout=True,
+                                 batch_size=4):
     """Generate multiple segmentations using either full image or patch-based prediction."""
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
@@ -613,6 +810,11 @@ def get_segmentation_distribution(model, img_id, dataset, num_samples=32,
     img, mask, original_shape = get_image_and_mask(dataset, img_id)
     img = img.unsqueeze(0).to(device)  # Add batch dimension [1, C, H, W]
     print(f"Full image shape for segmentation: {img.shape}")
+    
+    # Log the actual patch size being used to check for overrides
+    logging.info(f"Requested patch size: {patch_size}")
+    if hasattr(dataset, 'patch_size'):
+        logging.info(f"Dataset patch size: {dataset.patch_size}")
     
     # Set model mode based on dropout preference
     if enable_dropout:
@@ -626,43 +828,49 @@ def get_segmentation_distribution(model, img_id, dataset, num_samples=32,
     print(f"Latent distribution shapes - mu: {mu.shape}, logvar: {logvar.shape}")
     
     # Initialize list to store segmentations
-    segmentations = []
+    B, H, W = 1, img.shape[2], img.shape[3]
+    segmentations_cpu = torch.zeros((num_samples, 1, H, W), dtype=torch.float32)
     
-    # Generate multiple samples
+    # Generate one sample at a time to save memory
     for i in tqdm(range(num_samples), desc="Generating samples"):
-        # Use the shared utility for prediction
-        if patch_size is not None and patch_size > 0:
-            # For patch-based, we still need the custom function
-            # First sample from latent space
+        # Sample from latent space
+        with torch.no_grad():
             std = torch.exp(0.5 * logvar) * temperature
             eps = torch.randn_like(std)
             z = mu + eps * std
             z = z.unsqueeze(-1).unsqueeze(-1)  # Add spatial dimensions
-            seg = predict_with_patches(model, img, z, patch_size, overlap)
-        else:
-            # For full image, use generate_predictions
-            seg = generate_predictions(model, img, temperature=temperature, num_samples=1)
             
-        print(f"Sample {i} segmentation shape: {seg.shape}")
-        segmentations.append(seg)
-        
-        # Free memory
-        if torch.cuda.is_available():
+            # Choose prediction method based on patch size
+            if patch_size is not None and patch_size > 0:
+                # Calculate adaptive overlap if not specified
+                if overlap is None:
+                    # Make overlap proportional to patch size (20% of patch size)
+                    overlap = max(min(int(patch_size * 0.2), 128), 32)
+                    
+                seg = predict_with_patches(model, img, z, patch_size, overlap, batch_size)
+            else:
+                seg = predict_full_image(model, img, z)
+            
+            # Move result to CPU immediately
+            segmentations_cpu[i] = seg.cpu()
+            
+            # Free memory
+            del seg, eps
             torch.cuda.empty_cache()
     
-    # Stack all segmentations
-    segmentations = torch.cat(segmentations, dim=0)
-    print(f"Final stacked segmentations shape: {segmentations.shape}")
+    print(f"Final stacked segmentations shape: {segmentations_cpu.shape}")
     
-    return segmentations, mask.unsqueeze(0).to(device), mu, logvar
+    # Return with mask on device for further processing
+    return segmentations_cpu.to(device), mask.unsqueeze(0).to(device), mu, logvar
 
-def plot_reconstruction(model, img_id, dataset, num_samples=32, patch_size=None, overlap=100, temperature=1.0, enable_dropout=True):
+def plot_reconstruction(model, img_id, dataset, num_samples=32, patch_size=None, overlap=100, temperature=1.0, enable_dropout=True, batch_size=4):
     """Plot image, mask, and uncertainty analysis using either full image or patch-based prediction."""
     # Get multiple segmentations with either patch-based or full image mode
     segmentations, mask, mu, logvar = get_segmentation_distribution(
         model, img_id, dataset=dataset, num_samples=num_samples,
         patch_size=patch_size, overlap=overlap, 
-        temperature=temperature, enable_dropout=enable_dropout
+        temperature=temperature, enable_dropout=enable_dropout,
+        batch_size=batch_size
     )
     
     # Get the raw image for display
@@ -742,8 +950,9 @@ def visualize_temperature_sampling(model, image, mask=None,
                                   temperatures=[0.5, 1.0, 2.0, 3.0],
                                   samples_per_temp=10,
                                   patch_size=512,   
-                                  overlap=100): 
-    """Ultra memory-optimized visualization processing one sample at a time."""
+                                  overlap=100,
+                                  batch_size=4): 
+    """Memory-optimized visualization processing one temperature at a time."""
     device = image.device
     
     # Create figure first
@@ -751,7 +960,14 @@ def visualize_temperature_sampling(model, image, mask=None,
     
     # Plot original image (downsampled)
     with torch.no_grad():
-        img_display = downsample_for_display(image, max_size=512)
+        # Create a smaller version for display
+        if image.shape[2] > 512 or image.shape[3] > 512:
+            scale = 512 / max(image.shape[2], image.shape[3])
+            display_size = (int(image.shape[2] * scale), int(image.shape[3] * scale))
+            img_display = F.interpolate(image, size=display_size, mode='bilinear', align_corners=False)
+        else:
+            img_display = image
+            
         plt.subplot(2, len(temperatures) + 1, 1)
         plt.imshow(img_display[0].cpu().permute(1, 2, 0).numpy())
         plt.title("Original Image")
@@ -761,74 +977,87 @@ def visualize_temperature_sampling(model, image, mask=None,
     
     # Plot ground truth if available
     if mask is not None:
-        mask_display = downsample_for_display(mask, max_size=512)
+        if mask.shape[2] > 512 or mask.shape[3] > 512:
+            scale = 512 / max(mask.shape[2], mask.shape[3])
+            display_size = (int(mask.shape[2] * scale), int(mask.shape[3] * scale))
+            mask_display = F.interpolate(mask, size=display_size, mode='nearest')
+        else:
+            mask_display = mask
+            
         plt.subplot(2, len(temperatures) + 1, len(temperatures) + 2)
         plt.imshow(mask_display[0, 0].cpu().numpy(), cmap='gray')
         plt.title("Ground Truth")
         plt.axis('off')
         del mask_display
     
+    # Get latent distribution once to reuse
+    with torch.no_grad():
+        mu, logvar = encode_images(model, image)
+    
     # Process each temperature separately
     for temp_idx, temp in enumerate(temperatures):
         logging.info(f"Processing temperature {temp}")
         
-        # Create CPU tensors to store results
+        # Process on CPU to save memory
         B, C, H, W = image.shape
-        mean_accumulator = torch.zeros((1, 1, H, W), dtype=torch.float32)
-        sq_accumulator = torch.zeros((1, 1, H, W), dtype=torch.float32)
+        mean_pred_cpu = torch.zeros((1, 1, H, W), dtype=torch.float32)
+        sq_pred_cpu = torch.zeros((1, 1, H, W), dtype=torch.float32)
         
         # Process one sample at a time
         for s in range(samples_per_temp):
             logging.info(f"  Sample {s+1}/{samples_per_temp}")
             
-            # Get sample with patch-based prediction
             with torch.no_grad():
-                # Generate latent vector
-                outputs = model(image)
-                if isinstance(outputs, tuple) and len(outputs) == 3:
-                    _, mu, logvar = outputs
-                    
-                    # Sample with temperature
-                    std = torch.exp(0.5 * logvar) * temp
-                    eps = torch.randn_like(std)
-                    z = mu + eps * std
-                    z = z.unsqueeze(-1).unsqueeze(-1)  # Add spatial dimensions
-                    
-                    # Use existing patch prediction function
-                    pred = predict_with_patches(model, image, z, patch_size, overlap)
-                    
-                    # Move to CPU immediately and accumulate
-                    pred_cpu = pred.detach().cpu()
-                    mean_accumulator += pred_cpu
-                    sq_accumulator += (pred_cpu ** 2)
-                    
-                    # Free GPU memory
-                    del pred, z, mu, logvar, std, eps, outputs
-                    torch.cuda.empty_cache()
-            
+                # Sample with temperature
+                std = torch.exp(0.5 * logvar) * temp
+                eps = torch.randn_like(std)
+                z = mu + eps * std
+                z = z.unsqueeze(-1).unsqueeze(-1)  # Add spatial dimensions
+                
+                # Use correct prediction method
+                if patch_size is not None and patch_size > 0:
+                    pred = predict_with_patches(model, image, z, patch_size, overlap, batch_size)
+                else:
+                    pred = predict_full_image(model, image, z)
+                
+                # Move to CPU immediately and accumulate
+                pred_cpu = pred.cpu()
+                mean_pred_cpu += pred_cpu
+                sq_pred_cpu += (pred_cpu ** 2)
+                
+                # Free GPU memory
+                del pred, eps, pred_cpu
+                torch.cuda.empty_cache()
+        
         # Calculate mean and std
-        mean_pred = mean_accumulator / samples_per_temp
-        var_pred = (sq_accumulator / samples_per_temp) - (mean_pred ** 2)
+        mean_pred = mean_pred_cpu / samples_per_temp
+        var_pred = (sq_pred_cpu / samples_per_temp) - (mean_pred ** 2)
         std_pred = torch.sqrt(torch.clamp(var_pred, min=1e-8))
         
-        # Downsample for display
-        mean_display = downsample_for_display(mean_pred, max_size=512)
-        std_display = downsample_for_display(std_pred, max_size=512)
+        # Create smaller versions for display
+        if mean_pred.shape[2] > 512 or mean_pred.shape[3] > 512:
+            scale = 512 / max(mean_pred.shape[2], mean_pred.shape[3])
+            display_size = (int(mean_pred.shape[2] * scale), int(mean_pred.shape[3] * scale))
+            mean_display = F.interpolate(mean_pred, size=display_size, mode='bilinear', align_corners=False)
+            std_display = F.interpolate(std_pred, size=display_size, mode='bilinear', align_corners=False)
+        else:
+            mean_display = mean_pred
+            std_display = std_pred
         
         # Plot
         plt.subplot(2, len(temperatures) + 1, temp_idx + 2)
-        plt.imshow(mean_display[0].numpy() if mean_display.dim() > 2 else mean_display.numpy(), cmap='gray')
+        plt.imshow(mean_display[0, 0].numpy(), cmap='gray')
         plt.title(f"T={temp}\nMean")
         plt.axis('off')
         
         plt.subplot(2, len(temperatures) + 1, temp_idx + len(temperatures) + 3)
-        plt.imshow(std_display[0].numpy() if std_display.dim() > 2 else std_display.numpy(), cmap='hot')
+        plt.imshow(std_display[0, 0].numpy(), cmap='hot')
         plt.title(f"T={temp}\nUncertainty")
         plt.axis('off')
         
         # Free memory
         del mean_pred, var_pred, std_pred, mean_display, std_display
-        del mean_accumulator, sq_accumulator
+        del mean_pred_cpu, sq_pred_cpu
         gc.collect()  # Force garbage collection
         torch.cuda.empty_cache()
     
@@ -837,17 +1066,23 @@ def visualize_temperature_sampling(model, image, mask=None,
 
 @track_memory
 def generate_and_compare_ensemble(model, image, mask, temperatures=[0.5, 1.0, 2.0, 3.0], 
-                                samples_per_temp=5, weighted=True, patch_size=512, overlap=100):
+                                samples_per_temp=5, weighted=True, patch_size=512, overlap=100, batch_size=4):
     """Memory-optimized ensemble visualization that processes one temperature at a time."""
     device = image.device
-
-    # Downsample images for display first
-    image_vis = downsample_for_display(image.cpu(), max_size=512)
-    mask_vis = downsample_for_display(mask.cpu(), max_size=512)
+    B, C, H, W = image.shape
+    
+    # Create smaller versions for display
+    if image.shape[2] > 512 or image.shape[3] > 512:
+        scale = 512 / max(image.shape[2], image.shape[3])
+        display_size = (int(image.shape[2] * scale), int(image.shape[3] * scale))
+        image_vis = F.interpolate(image.cpu(), size=display_size, mode='bilinear', align_corners=False)
+        mask_vis = F.interpolate(mask.cpu(), size=display_size, mode='nearest')
+    else:
+        image_vis = image.cpu()
+        mask_vis = mask.cpu()
     
     # Log dimensions for debugging
     logging.info(f"Input image shape: {image.shape}, Mask shape: {mask.shape}")
-    logging.info(f"Visualization shape: {image_vis.shape}")
     
     # Create visualization figure early
     fig = plt.figure(figsize=(15, 10))
@@ -866,19 +1101,20 @@ def generate_and_compare_ensemble(model, image, mask, temperatures=[0.5, 1.0, 2.
     # Free memory for visualizations we no longer need
     del image_vis, mask_vis
     
-    # Get predictions at each temperature one at a time
-    dice_scores = []
-    temp_pred_small = {}  # Store only downsampled versions
-    
     # Get latent distribution once to reuse
     with torch.no_grad():
         mu, logvar = encode_images(model, image)
     
-    for temp in temperatures:
+    # Temperature prediction scores and downsampled predictions
+    dice_scores = []
+    temp_pred_small = {}
+    
+    # Generate individual temperature predictions one at a time
+    for temp_idx, temp in enumerate(temperatures):
         logging.info(f"Processing temperature {temp}")
         
         # Generate prediction for this temperature
-        temp_pred = torch.zeros((1, 1, image.shape[2], image.shape[3]), device=device)
+        temp_pred_cpu = torch.zeros((1, 1, H, W), dtype=torch.float32)
         
         for s in range(samples_per_temp):
             logging.info(f"  Sample {s+1}/{samples_per_temp}")
@@ -890,49 +1126,111 @@ def generate_and_compare_ensemble(model, image, mask, temperatures=[0.5, 1.0, 2.
                 z = mu + eps * std
                 z = z.unsqueeze(-1).unsqueeze(-1)
                 
-                # Generate using patches
-                pred = predict_with_patches(model, image, z, patch_size, overlap)
-                temp_pred += pred
+                # Generate prediction using appropriate method
+                if patch_size is not None and patch_size > 0:
+                    pred = predict_with_patches(model, image, z, patch_size, overlap, batch_size)
+                else:
+                    pred = predict_full_image(model, image, z)
+                    
+                # Accumulate on CPU
+                temp_pred_cpu += pred.cpu()
                 
                 # Free memory
-                del pred, eps
+                del pred, eps, z
                 torch.cuda.empty_cache()
         
         # Average samples
-        temp_pred = temp_pred / samples_per_temp
+        temp_pred_cpu /= samples_per_temp
+        
+        # Move back to device for Dice calculation
+        temp_pred = temp_pred_cpu.to(device)
         
         # Calculate dice score
-        dice = ((temp_pred > 0.5) & (mask > 0.5)).sum() / ((temp_pred > 0.5).sum() + (mask > 0.5).sum() + 1e-8)
-        dice_scores.append(dice.item() * 2)
-        logging.info(f"  Dice score: {dice.item() * 2:.4f}")
+        dice = (2.0 * ((temp_pred > 0.5) & (mask > 0.5)).sum().float()) / ((temp_pred > 0.5).sum() + (mask > 0.5).sum() + 1e-8)
+        dice_scores.append(dice.item())
+        logging.info(f"  Dice score: {dice.item():.4f}")
         
-        # Downsample for visualization
-        temp_pred_small[temp] = downsample_for_display(temp_pred.cpu(), max_size=512)
+        # Create small version for display
+        if H > 512 or W > 512:
+            scale = 512 / max(H, W)
+            display_size = (int(H * scale), int(W * scale))
+            temp_pred_small[temp] = F.interpolate(temp_pred_cpu, size=display_size, mode='bilinear', align_corners=False)
+        else:
+            temp_pred_small[temp] = temp_pred_cpu
         
         # Free full-size prediction
-        del temp_pred
+        del temp_pred, temp_pred_cpu
         torch.cuda.empty_cache()
     
-    # Generate ensemble prediction
+    # Generate ensemble prediction on CPU to save memory
     logging.info("Generating ensemble prediction")
-    ensemble_pred = generate_ensemble_prediction(
-        model,
-        image,
-        temps=temperatures,
-        samples_per_temp=samples_per_temp,
-        weighted=weighted
-    )
+    ensemble_pred_cpu = torch.zeros((1, 1, H, W), dtype=torch.float32)
+    
+    # Initialize weights
+    if weighted:
+        weights = [1.0 / (abs(temp - 1.0) + 0.5) for temp in temperatures]
+    else:
+        weights = [1.0] * len(temperatures)
+    # Normalize weights
+    total_weight = sum(weights)
+    weights = [w / total_weight for w in weights]
+    
+    # Process one temperature at a time
+    for temp_idx, temp in enumerate(temperatures):
+        logging.info(f"Adding temperature {temp} to ensemble with weight {weights[temp_idx]:.4f}")
+        
+        # Generate prediction for this temperature again
+        temp_pred_cpu = torch.zeros((1, 1, H, W), dtype=torch.float32)
+        
+        for s in range(samples_per_temp):
+            logging.info(f"  Sample {s+1}/{samples_per_temp}")
+            
+            with torch.no_grad():
+                # Sample latent vector
+                std = torch.exp(0.5 * logvar) * temp
+                eps = torch.randn_like(std)
+                z = mu + eps * std
+                z = z.unsqueeze(-1).unsqueeze(-1)
+                
+                # Generate prediction
+                if patch_size is not None and patch_size > 0:
+                    pred = predict_with_patches(model, image, z, patch_size, overlap, batch_size)
+                else:
+                    pred = predict_full_image(model, image, z)
+                    
+                # Accumulate on CPU
+                temp_pred_cpu += pred.cpu()
+                
+                # Free memory
+                del pred, eps, z
+                torch.cuda.empty_cache()
+        
+        # Average samples and add weighted contribution to ensemble
+        temp_pred_cpu /= samples_per_temp
+        ensemble_pred_cpu += temp_pred_cpu * weights[temp_idx]
+        
+        # Free memory
+        del temp_pred_cpu
+        torch.cuda.empty_cache()
+    
+    # Move ensemble to device for dice calculation
+    ensemble_pred = ensemble_pred_cpu.to(device)
     
     # Calculate ensemble dice score
-    ensemble_dice = ((ensemble_pred > 0.5) & (mask > 0.5)).sum() / ((ensemble_pred > 0.5).sum() + (mask > 0.5).sum() + 1e-8)
-    ensemble_dice = ensemble_dice.item() * 2
+    ensemble_dice = (2.0 * ((ensemble_pred > 0.5) & (mask > 0.5)).sum().float()) / ((ensemble_pred > 0.5).sum() + (mask > 0.5).sum() + 1e-8)
+    ensemble_dice = ensemble_dice.item()
     logging.info(f"Ensemble dice score: {ensemble_dice:.4f}")
     
-    # Downsample ensemble for visualization
-    ensemble_vis = downsample_for_display(ensemble_pred.cpu(), max_size=512)
+    # Create small version for display
+    if H > 512 or W > 512:
+        scale = 512 / max(H, W)
+        display_size = (int(H * scale), int(W * scale))
+        ensemble_vis = F.interpolate(ensemble_pred_cpu, size=display_size, mode='bilinear', align_corners=False)
+    else:
+        ensemble_vis = ensemble_pred_cpu
     
     # Free full-size ensemble
-    del ensemble_pred
+    del ensemble_pred, ensemble_pred_cpu
     torch.cuda.empty_cache()
     
     # Plot ensemble prediction
@@ -964,11 +1262,11 @@ def generate_and_compare_ensemble(model, image, mask, temperatures=[0.5, 1.0, 2.
     
     return fig
 
-
 def generate_ensemble_prediction(model, image, temps=[0.5, 1.0, 2.0, 3.0], 
                                samples_per_temp=5, weighted=True,
                                patch_size=512,    # Add this parameter
-                               overlap=100):
+                               overlap=100,
+                               batch_size=4):
     """Memory-efficient ensemble prediction using patches directly."""
     device = image.device
     B, C, H, W = image.shape
@@ -1016,7 +1314,7 @@ def generate_ensemble_prediction(model, image, temps=[0.5, 1.0, 2.0, 3.0],
                 z = z.unsqueeze(-1).unsqueeze(-1)  # Add spatial dimensions
                 
                 # Generate prediction using patches
-                pred = predict_with_patches(model, image, z, patch_size, overlap)
+                pred = predict_with_patches(model, image, z, patch_size, overlap, batch_size)
                 
                 # Add to temperature prediction
                 temp_pred += pred
@@ -1125,6 +1423,7 @@ if __name__ == '__main__':
         logging.info(f"Patch size: {args.patch_size}, Overlap: {args.overlap}")
     logging.info(f"Scale: {args.scale}")
     logging.info(f"Enable dropout: {args.enable_dropout}")
+    logging.info(f"Batch size: {args.batch_size}")
     
     # Base output directory
     base_output_dir = Path(args.output_dir)
@@ -1157,12 +1456,24 @@ if __name__ == '__main__':
             base_dir='./data',
             split='test',
             scale=args.scale,
-            patch_size=args.patch_size,
+            patch_size=args.patch_size,  # This is where the patch size is first passed
             lesion_type=args.lesion_type,
-
             max_images=args.max_images,
-            skip_border_check=(not is_full_image)  # Be more permissive with border checks for patch mode
+            skip_border_check=(not is_full_image)
         )
+        
+        # Check patch size just after dataset is loaded
+        if hasattr(test_dataset, 'patch_size'):
+            logging.info(f"Dataset's internal patch_size: {test_dataset.patch_size}")
+        else:
+            logging.info("Dataset has no internal patch_size attribute")
+            
+        # Make sure the dataset's patch size matches what we requested
+        if not is_full_image and hasattr(test_dataset, 'patch_size') and test_dataset.patch_size != args.patch_size:
+            logging.warning(f"Dataset patch size ({test_dataset.patch_size}) doesn't match requested patch size ({args.patch_size})")
+            # Force the dataset to use our patch size - may need to reload the dataset
+            logging.info("Forcing dataset to use the requested patch size")
+            test_dataset.patch_size = args.patch_size
         
         # If patch mode was requested but no patches were found, fall back to full image mode
         if not is_full_image and len(test_dataset) == 0:
@@ -1221,7 +1532,8 @@ if __name__ == '__main__':
                     patch_size=args.patch_size,  # Pass patch_size instead of patch_dataset
                     overlap=args.overlap,
                     temperature=args.temperature,
-                    enable_dropout=args.enable_dropout
+                    enable_dropout=args.enable_dropout,
+                    batch_size=args.batch_size
                 )
                 
                 # Temperature comparison if requested
@@ -1240,8 +1552,9 @@ if __name__ == '__main__':
                         mask=mask,
                         temperatures=args.temperature_range,
                         samples_per_temp=args.samples_per_temp,
-                        patch_size=args.patch_size,  # Add this
-                        overlap=args.overlap         # Add this
+                        patch_size=args.patch_size,
+                        overlap=args.overlap,
+                        batch_size=args.batch_size
                     )
                     
                     # Save temperature comparison
@@ -1259,8 +1572,9 @@ if __name__ == '__main__':
                             temperatures=args.temperature_range,
                             samples_per_temp=args.samples_per_temp,
                             weighted=args.weighted_ensemble,
-                            patch_size=args.patch_size,  # Add this
-                            overlap=args.overlap         # Add this
+                            patch_size=args.patch_size,
+                            overlap=args.overlap,
+                            batch_size=args.batch_size
                         )
                         
                         # Save ensemble comparison

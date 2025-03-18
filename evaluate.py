@@ -70,10 +70,24 @@ def evaluate(model, dataloader, device, amp, max_samples=4,
                 image = batch['image'].to(device=device, dtype=dtype, non_blocking=True)
                 mask_true = batch['mask'].to(device=device, dtype=dtype, non_blocking=True)
 
-                # Generate predictions using shared utility
-                mask_pred = generate_predictions(
-                    model, image, temperature=temperature, num_samples=num_samples
-                )
+                # Handle case where batch has list of images rather than a tensor
+                if isinstance(image, list):
+                    # Process each image individually and combine results
+                    batch_pred = []
+                    for img in image:
+                        img_batch = img.unsqueeze(0) if img.dim() == 3 else img
+                        pred = generate_predictions(
+                            model, img_batch, temperature=temperature, num_samples=num_samples
+                        )
+                        batch_pred.append(pred)
+                    
+                    # Keep batch_pred as a list - metrics function will handle it
+                    mask_pred = batch_pred
+                else:
+                    # Generate predictions using shared utility for tensor batch
+                    mask_pred = generate_predictions(
+                        model, image, temperature=temperature, num_samples=num_samples
+                    )
 
                 # Compute metrics
                 batch_metrics = get_all_metrics(mask_pred, mask_true)

@@ -168,7 +168,8 @@ Initial GPU Status:
         pin_memory=True,
         persistent_workers=True,
         prefetch_factor=2,
-        pin_memory_device='cuda'
+        pin_memory_device='cuda',
+        collate_fn=collate_patches  # Add this line to use the custom collate function
     )
     
     # No special handling needed for patch_size=None anymore
