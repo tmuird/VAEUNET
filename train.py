@@ -62,7 +62,7 @@ def collate_patches(batch):
         }
 
 def multi_temp_training_step(model, images, true_masks, criterion, 
-                           temps=[1.0, 3.0], weight=0.3):
+                        temps=[1.0, 3.0], weight=0.3):
     """Training step with multi-temperature sampling."""
     # Standard prediction
     outputs = model(images)
@@ -136,17 +136,17 @@ Initial GPU Status:
         # For full images (patch_size=None), we'll get consistent-sized patches 
         # through padding in the dataset, so no special handling needed here
         train_dataset = IDRIDDataset(base_dir='./data',
-                                 split='train',
-                                 scale=img_scale,
-                                 patch_size=patch_size,
-                                 lesion_type=lesion_type,
-                                 max_images=max_images)
+                                split='train',
+                                scale=img_scale,
+                                patch_size=patch_size,
+                                lesion_type=lesion_type,
+                                max_images=max_images)
         val_dataset = IDRIDDataset(base_dir='./data',
-                               split='val',
-                               scale=img_scale,
-                               patch_size=patch_size,
-                               lesion_type=lesion_type,
-                               max_images=max_images)
+                            split='val',
+                            scale=img_scale,
+                            patch_size=patch_size,
+                            lesion_type=lesion_type,
+                            max_images=max_images)
     except ValueError as e:
         logging.error(f"Error creating datasets: {e}")
         logging.error(f"No valid data found for lesion type {lesion_type}. Please check your data directory.")
@@ -474,15 +474,15 @@ def get_args():
     parser.add_argument('--early-stopping-patience', type=int, default=10, help='Early stopping patience')
     parser.add_argument('--lesion-type', type=str, default='EX', help='Lesion type')
     parser.add_argument('--model-type', type=str, default='resnet', choices=['basic', 'resnet'],
-                      help='Model type: basic (original UNet) or resnet (UNet with ResNet34 encoder)')
+                    help='Model type: basic (original UNet) or resnet (UNet with ResNet34 encoder)')
     parser.add_argument('--skip', dest='use_skip', action='store_true',
-                      help='Enable skip connections in the UNet model (default)')
+                    help='Enable skip connections in the UNet model (default)')
     parser.add_argument('--no-skip', dest='use_skip', action='store_false',
-                      help='Disable skip connections and attention in the UNet model')
+                    help='Disable skip connections and attention in the UNet model')
     parser.add_argument('--attention', dest='use_attention', action='store_true',
-                      help='Enable attention mechanism when skip connections are enabled (default)')
+                    help='Enable attention mechanism when skip connections are enabled (default)')
     parser.add_argument('--no-attention', dest='use_attention', action='store_false',
-                      help='Disable attention mechanism but keep skip connections enabled')
+                    help='Disable attention mechanism but keep skip connections enabled')
     parser.set_defaults(use_attention=True, use_skip=True)
     return parser.parse_args()
 
@@ -539,7 +539,7 @@ if __name__ == '__main__':
         )
     except torch.cuda.OutOfMemoryError:
         logging.error('Detected OutOfMemoryError! '
-                      'Try reducing the batch size or image scale.')
+                    'Try reducing the batch size or image scale.')
         torch.cuda.empty_cache()
         # If you want to attempt re-training with gradient checkpointing or smaller batch size, do so here.
         model.use_checkpointing()

@@ -13,122 +13,91 @@ os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
 torch.backends.cuda.matmul.allow_tf32 = True  # Better performance on RTX 3060
 torch.backends.cudnn.allow_tf32 = True
 
-@torch.no_grad()
-def evaluate(model, dataloader, device, amp, max_samples=4, 
-            temperature=1.0, num_samples=5):
-    """
-    Evaluation function with optimized memory usage for medical image segmentation
-    Args:
-        model: UNet model
-        dataloader: Validation data loader
-        device: Computing device (cuda/cpu)
-        amp: Boolean for mixed precision
-        max_samples: Number of sample images to return for visualization
-        temperature: Sampling temperature for VAE
-        num_samples: Number of samples to generate for VAE
-    Returns:
-        metrics_mean: Dict of averaged metrics
-        samples: List of (image, prediction, ground_truth, global_idx) tuples
-    """
+@torch.inference_mode()
+def evaluate(model, dataloader, device, amp, max_samples=None):
+    # Set evaluation mode
     model.eval()
     
-    # Reserve CUDA memory at start
-    torch.cuda.empty_cache()
-    torch.cuda.memory.empty_cache()
-    if torch.cuda.is_available():
-        torch.cuda.set_per_process_memory_fraction(0.95)  # Leave some VRAM free
-
-    # Calculate total number of samples
-    total_samples = len(dataloader.dataset)
+    num_val_batches = len(dataloader)
+    metrics_sum = {}
+    samples = []  # To store some samples for visualization
     
-    # Pre-select random indices if we're collecting samples
-    selected_indices = []
-    if max_samples > 0:
-        selected_indices = random.sample(range(total_samples), min(max_samples, total_samples))
-        selected_indices = set(selected_indices)  # Convert to set for O(1) lookup
-
-    metrics_sum = {
-        'dice': 0,
-        'iou': 0,
-        'precision': 0,
-        'recall': 0,
-        'specificity': 0,
-        'accuracy': 0
-    }
-    num_val_batches = 0
-    samples = [(None, None, None, None)] * max_samples if max_samples > 0 else []
-    collected = 0
-
-    # Use tqdm for progress tracking
-    with tqdm(total=len(dataloader), desc='Validation', unit='batch') as pbar:
-        for batch in dataloader:
-            torch.cuda.empty_cache()
+    # Limit number of batches for quick validation if needed
+    if max_samples is not None and max_samples < num_val_batches:
+        num_val_batches = max_samples
+    
+    # Initialize progress bar
+    pbar = tqdm(total=num_val_batches, desc='Validation round', unit='batch', leave=False)
+    
+    for i, batch in enumerate(dataloader):
+        if i >= num_val_batches:
+            break
             
-            with torch.autocast(device.type if device.type != 'mps' else 'cpu', enabled=amp):
-                # Ensure consistent dtype across validation
-                dtype = torch.float16 if amp else torch.float32
-                image = batch['image'].to(device=device, dtype=dtype, non_blocking=True)
-                mask_true = batch['mask'].to(device=device, dtype=dtype, non_blocking=True)
-
-                # Handle case where batch has list of images rather than a tensor
-                if isinstance(image, list):
-                    # Process each image individually and combine results
-                    batch_pred = []
-                    for img in image:
-                        img_batch = img.unsqueeze(0) if img.dim() == 3 else img
-                        pred = generate_predictions(
-                            model, img_batch, temperature=temperature, num_samples=num_samples
-                        )
-                        batch_pred.append(pred)
-                    
-                    # Keep batch_pred as a list - metrics function will handle it
-                    mask_pred = batch_pred
-                else:
-                    # Generate predictions using shared utility for tensor batch
-                    mask_pred = generate_predictions(
-                        model, image, temperature=temperature, num_samples=num_samples
-                    )
-
-                # Compute metrics
-                batch_metrics = get_all_metrics(mask_pred, mask_true)
-
-                # Update metrics
-                for metric in metrics_sum:
-                    metrics_sum[metric] += batch_metrics[metric]
-
-
-                # Sample collection with memory optimization
-                if max_samples > 0:
-                    batch_start_idx = num_val_batches * dataloader.batch_size
-                    for i in range(len(image)):
-                        global_idx = batch_start_idx + i
-                        if global_idx in selected_indices:
-                            with torch.cuda.amp.autocast(enabled=False):
-                                # Ensure samples are in full precision
-                                sample_idx = len([x for x in samples if x[0] is not None])
-                                image_np = image[i].detach().cpu().float().numpy()
-                                pred_np = mask_pred[i].detach().cpu().float().numpy()
-                                true_np = mask_true[i].detach().cpu().float().numpy()
-                                # logging.info(f"Eval image stats - min: {image_np.min():.3f}, max: {image_np.max():.3f}, mean: {image_np.mean():.3f}")
-                                samples[sample_idx] = (
-                                    image_np,
-                                    pred_np,
-                                    true_np,
-                                    global_idx
-                                )
-
-                # Memory cleanup
-                del image, mask_true, mask_pred, batch_metrics
-                torch.cuda.empty_cache()
-
-            num_val_batches += 1
+        # Handle different batch formats
+        if isinstance(batch, dict):
+            images = batch['image']
+            masks = batch['mask']
+        else:
+            images, masks = batch
+        
+        # Handle list batches (from full images)
+        if isinstance(images, list):
+            # Skip for now - not supported
             pbar.update(1)
-
-    # Calculate mean metrics
-    metrics_mean = {metric: value / num_val_batches for metric, value in metrics_sum.items()}
+            continue
+        
+        # Move to device
+        images = images.to(device=device, memory_format=torch.channels_last, non_blocking=True)
+        masks = masks.to(device=device, non_blocking=True)
+        
+        # Inference
+        with torch.autocast(device.type if device.type != 'mps' else 'cpu', enabled=amp):
+            # Get model outputs
+            outputs = model(images)
+            
+            # Handle different output formats
+            if isinstance(outputs, tuple):
+                mask_pred = outputs[0]  # VAE model returns (seg_output, mu, logvar)
+            else:
+                mask_pred = outputs
+            
+            # IMPORTANT FIX: Resize mask_pred to match masks shape
+            if mask_pred.shape != masks.shape:
+                logging.info(f"Resizing predictions from {mask_pred.shape} to {masks.shape}")
+                mask_pred = F.interpolate(
+                    mask_pred, 
+                    size=masks.shape[2:],
+                    mode='bilinear', 
+                    align_corners=False
+                )
+            
+            # Compute metrics
+            batch_metrics = get_all_metrics(mask_pred, masks)
+            
+            # Store some samples for visualization
+            if len(samples) < 4:  # Limit to 4 samples
+                # Apply sigmoid to prediction for visualization
+                mask_pred_sigmoid = torch.sigmoid(mask_pred)
+                
+                # Store samples as numpy arrays for easier visualization later
+                for j in range(min(2, images.shape[0])):  # Take up to 2 samples from the batch
+                    # Get sample image, prediction, and mask
+                    img_np = images[j].cpu().numpy()
+                    pred_np = mask_pred_sigmoid[j].detach().cpu().numpy()
+                    mask_np = masks[j].cpu().numpy()
+                    
+                    # Add to samples list
+                    samples.append((img_np, pred_np, mask_np, batch_metrics))
+        
+        # Add batch metrics to sum
+        for key, value in batch_metrics.items():
+            metrics_sum[key] = metrics_sum.get(key, 0) + value
+        
+        pbar.update(1)
     
-    # Clean up samples list
-    if max_samples > 0:
-        samples = [s for s in samples if s[0] is not None]
-
-    return metrics_mean, samples
+    pbar.close()
+    
+    # Compute average metrics
+    metrics_avg = {key: value / num_val_batches for key, value in metrics_sum.items()}
+    
+    return metrics_avg, samples
