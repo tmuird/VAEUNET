@@ -80,17 +80,17 @@ def predict_full_image(model, img, z):
             x = decoder_block(x, skip, z_full)
         
         # Final conv and sigmoid
-        output = torch.sigmoid(model.final_conv(x))
+        output = model.final_conv(x)
+        
+        # Add interpolation to match input size
+        output = F.interpolate(output, size=img.shape[2:], mode='bilinear', align_corners=True)
+        
+        # Apply sigmoid after resizing
+        output = torch.sigmoid(output)
         
         print(f"Full image prediction shape: {output.shape}")
         
     return output
-
-def get_patches_for_image(dataset, img_id):
-    """Get all patches for a specific image ID."""
-    patches = []
-    patch_coords = []
-    
     # Find all indices in the dataset that belong to the specified image ID
     for idx in range(len(dataset)):
         sample = dataset[idx]
