@@ -104,202 +104,202 @@ def predict_full_image(model, img, z):
     
     return patches, patch_coords
 
-def predict_with_dataset_patches(model, dataset, img_id, z, device, overlap=None):
-    """Use the dataset's patch mechanism to predict on patches and reassemble."""
-    model.eval()
+# def predict_with_dataset_patches(model, dataset, img_id, z, device, overlap=None):
+#     """Use the dataset's patch mechanism to predict on patches and reassemble."""
+#     model.eval()
     
-    # Get all patches for this image
-    patches, patch_coords = get_patches_for_image(dataset, img_id)
+#     # Get all patches for this image
+#     patches, patch_coords = get_patches_for_image(dataset, img_id)
     
-    if not patches:
-        logging.error(f"No patches found for image ID: {img_id}")
-        return None
+#     if not patches:
+#         logging.error(f"No patches found for image ID: {img_id}")
+#         return None
     
-    # Get original image shape from the first patch's metadata
-    patch_data = torch.load(dataset.patch_indices[0][1])
-    if 'original_shape' in patch_data:
-        H, W = patch_data['original_shape']
-    else:
-        # If not available, use a large enough size based on coordinates
-        max_y = max(y + p.shape[2] for p, (y, _) in zip(patches, patch_coords))
-        max_x = max(x + p.shape[3] for p, (_, x) in zip(patches, patch_coords))
-        H, W = max_y, max_x
+#     # Get original image shape from the first patch's metadata
+#     patch_data = torch.load(dataset.patch_indices[0][1])
+#     if 'original_shape' in patch_data:
+#         H, W = patch_data['original_shape']
+#     else:
+#         # If not available, use a large enough size based on coordinates
+#         max_y = max(y + p.shape[2] for p, (y, _) in zip(patches, patch_coords))
+#         max_x = max(x + p.shape[3] for p, (_, x) in zip(patches, patch_coords))
+#         H, W = max_y, max_x
     
-    # Calculate adaptive overlap if not specified
-    if overlap is None:
-        # Use dataset's patch size to determine overlap
-        patch_size = dataset.patch_size if hasattr(dataset, 'patch_size') else patches[0].shape[2]
-        # Make overlap proportional to patch size (20% of patch size)
-        overlap = max(min(int(patch_size * 0.2), 128), 32)
+#     # Calculate adaptive overlap if not specified
+#     if overlap is None:
+#         # Use dataset's patch size to determine overlap
+#         patch_size = dataset.patch_size if hasattr(dataset, 'patch_size') else patches[0].shape[2]
+#         # Make overlap proportional to patch size (20% of patch size)
+#         overlap = max(min(int(patch_size * 0.2), 128), 32)
     
-    logging.info(f"Using overlap of {overlap} pixels for dataset patches")
+#     logging.info(f"Using overlap of {overlap} pixels for dataset patches")
     
-    # Initialize output and weight masks
-    output_mask = torch.zeros((1, 1, H, W), device=device)
-    weight_mask = torch.zeros((1, 1, H, W), device=device)
+#     # Initialize output and weight masks
+#     output_mask = torch.zeros((1, 1, H, W), device=device)
+#     weight_mask = torch.zeros((1, 1, H, W), device=device)
     
-    # Process each patch
-    with torch.no_grad():
-        # Group patches into batches based on size
-        max_batch_size = 10  # Process up to 4 patches at once
-        batches = []
-        current_batch = []
-        current_coords = []
+#     # Process each patch
+#     with torch.no_grad():
+#         # Group patches into batches based on size
+#         max_batch_size = 10  # Process up to 4 patches at once
+#         batches = []
+#         current_batch = []
+#         current_coords = []
         
-        # Group patches with similar size
-        for i, (patch, coords) in enumerate(zip(patches, patch_coords)):
-            # If batch is empty or patch size matches the first patch in batch
-            if not current_batch or (current_batch[0].shape == patch.shape):
-                current_batch.append(patch)
-                current_coords.append(coords)
+#         # Group patches with similar size
+#         for i, (patch, coords) in enumerate(zip(patches, patch_coords)):
+#             # If batch is empty or patch size matches the first patch in batch
+#             if not current_batch or (current_batch[0].shape == patch.shape):
+#                 current_batch.append(patch)
+#                 current_coords.append(coords)
                 
-                # Process batch if we've reached max size
-                if len(current_batch) >= max_batch_size:
-                    batches.append((current_batch.copy(), current_coords.copy()))
-                    current_batch = []
-                    current_coords = []
-            else:
-                # Process current batch and start a new one
-                if current_batch:
-                    batches.append((current_batch.copy(), current_coords.copy()))
-                current_batch = [patch]
-                current_coords = [coords]
+#                 # Process batch if we've reached max size
+#                 if len(current_batch) >= max_batch_size:
+#                     batches.append((current_batch.copy(), current_coords.copy()))
+#                     current_batch = []
+#                     current_coords = []
+#             else:
+#                 # Process current batch and start a new one
+#                 if current_batch:
+#                     batches.append((current_batch.copy(), current_coords.copy()))
+#                 current_batch = [patch]
+#                 current_coords = [coords]
         
-        # Add remaining patches as a batch
-        if current_batch:
-            batches.append((current_batch, current_coords))
+#         # Add remaining patches as a batch
+#         if current_batch:
+#             batches.append((current_batch, current_coords))
         
-        # Process each batch
-        for batch_patches, batch_coords in batches:
-            try:
-                # Stack patches into a batch tensor
-                batch_size = len(batch_patches)
-                if batch_size > 1:
-                    stacked_patches = torch.cat([p.to(device) for p in batch_patches], dim=0)
-                else:
-                    stacked_patches = batch_patches[0].to(device)
+#         # Process each batch
+#         for batch_patches, batch_coords in batches:
+#             try:
+#                 # Stack patches into a batch tensor
+#                 batch_size = len(batch_patches)
+#                 if batch_size > 1:
+#                     stacked_patches = torch.cat([p.to(device) for p in batch_patches], dim=0)
+#                 else:
+#                     stacked_patches = batch_patches[0].to(device)
                 
-                # Get encoder features
-                features = model.encoder(stacked_patches)
-                x_enc = features[-1]
+#                 # Get encoder features
+#                 features = model.encoder(stacked_patches)
+#                 x_enc = features[-1]
                 
-                # Prepare z for the batch
-                if batch_size > 1:
-                    z_batch = z.expand(batch_size, -1, -1, -1)
-                else:
-                    z_batch = z
+#                 # Prepare z for the batch
+#                 if batch_size > 1:
+#                     z_batch = z.expand(batch_size, -1, -1, -1)
+#                 else:
+#                     z_batch = z
                 
-                # Interpolate z to match encoder output
-                z_patch = F.interpolate(z_batch, size=x_enc.shape[2:], mode='bilinear', align_corners=True)
+#                 # Interpolate z to match encoder output
+#                 z_patch = F.interpolate(z_batch, size=x_enc.shape[2:], mode='bilinear', align_corners=True)
                 
-                # Initial projection
-                x_proj = model.z_initial(z_patch)
+#                 # Initial projection
+#                 x_proj = model.z_initial(z_patch)
                 
-                # Decode with z injection
-                for k, decoder_block in enumerate(model.decoder_blocks):
-                    skip = features[-(k+2)] if k < len(features)-1 else None
-                    x_proj = decoder_block(x_proj, skip, z_patch)
+#                 # Decode with z injection
+#                 for k, decoder_block in enumerate(model.decoder_blocks):
+#                     skip = features[-(k+2)] if k < len(features)-1 else None
+#                     x_proj = decoder_block(x_proj, skip, z_patch)
                 
-                # Final prediction
-                batch_preds = torch.sigmoid(model.final_conv(x_proj))
+#                 # Final prediction
+#                 batch_preds = torch.sigmoid(model.final_conv(x_proj))
                 
-                # Process each prediction in batch
-                for idx in range(batch_size):
-                    if batch_size > 1:
-                        patch = stacked_patches[idx:idx+1]
-                        patch_pred = batch_preds[idx:idx+1]
-                    else:
-                        patch = stacked_patches
-                        patch_pred = batch_preds
+#                 # Process each prediction in batch
+#                 for idx in range(batch_size):
+#                     if batch_size > 1:
+#                         patch = stacked_patches[idx:idx+1]
+#                         patch_pred = batch_preds[idx:idx+1]
+#                     else:
+#                         patch = stacked_patches
+#                         patch_pred = batch_preds
                         
-                    y, x = batch_coords[idx]
+#                     y, x = batch_coords[idx]
                     
-                    # Create weight mask for smooth blending
-                    patch_h, patch_w = patch.shape[2], patch.shape[3]
-                    weight = torch.ones_like(patch_pred)
+#                     # Create weight mask for smooth blending
+#                     patch_h, patch_w = patch.shape[2], patch.shape[3]
+#                     weight = torch.ones_like(patch_pred)
                     
-                    # Apply smooth tapering at edges
-                    for axis in [2, 3]:
-                        if patch_pred.shape[axis] > 2*overlap:
-                            ramp = torch.linspace(0, 1, overlap, device=device)
-                            if axis == 2:
-                                weight[:, :, :overlap, :] *= ramp.view(-1, 1)
-                                weight[:, :, -overlap:, :] *= (1 - ramp).view(-1, 1)
-                            else:
-                                weight[:, :, :, :overlap] *= ramp.view(-1)
-                                weight[:, :, :, -overlap:] *= (1 - ramp).view(-1)
+#                     # Apply smooth tapering at edges
+#                     for axis in [2, 3]:
+#                         if patch_pred.shape[axis] > 2*overlap:
+#                             ramp = torch.linspace(0, 1, overlap, device=device)
+#                             if axis == 2:
+#                                 weight[:, :, :overlap, :] *= ramp.view(-1, 1)
+#                                 weight[:, :, -overlap:, :] *= (1 - ramp).view(-1, 1)
+#                             else:
+#                                 weight[:, :, :, :overlap] *= ramp.view(-1)
+#                                 weight[:, :, :, -overlap:] *= (1 - ramp).view(-1)
                     
-                    # Add weighted prediction to output
-                    h, w = patch_pred.shape[2], patch_pred.shape[3]
-                    output_mask[:, :, y:y+h, x:x+w] += patch_pred * weight
-                    weight_mask[:, :, y:y+h, x:x+w] += weight
+#                     # Add weighted prediction to output
+#                     h, w = patch_pred.shape[2], patch_pred.shape[3]
+#                     output_mask[:, :, y:y+h, x:x+w] += patch_pred * weight
+#                     weight_mask[:, :, y:y+h, x:x+w] += weight
                     
-            except RuntimeError as e:
-                # Fallback to single patch processing
-                logging.warning(f"Batch processing failed: {e}. Falling back to single patch mode.")
-                torch.cuda.empty_cache()
+#             except RuntimeError as e:
+#                 # Fallback to single patch processing
+#                 logging.warning(f"Batch processing failed: {e}. Falling back to single patch mode.")
+#                 torch.cuda.empty_cache()
                 
-                # Process each patch individually
-                for patch, (y, x) in zip(batch_patches, batch_coords):
-                    patch = patch.to(device)
+#                 # Process each patch individually
+#                 for patch, (y, x) in zip(batch_patches, batch_coords):
+#                     patch = patch.to(device)
                     
-                    # Process single patch
-                    features = model.encoder(patch)
-                    x_enc = features[-1]
-                    z_patch = F.interpolate(z, size=x_enc.shape[2:], mode='bilinear', align_corners=True)
-                    x_proj = model.z_initial(z_patch)
+#                     # Process single patch
+#                     features = model.encoder(patch)
+#                     x_enc = features[-1]
+#                     z_patch = F.interpolate(z, size=x_enc.shape[2:], mode='bilinear', align_corners=True)
+#                     x_proj = model.z_initial(z_patch)
                     
-                    # Decode
-                    for k, decoder_block in enumerate(model.decoder_blocks):
-                        skip = features[-(k+2)] if k < len(features)-1 else None
-                        x_proj = decoder_block(x_proj, skip, z_patch)
+#                     # Decode
+#                     for k, decoder_block in enumerate(model.decoder_blocks):
+#                         skip = features[-(k+2)] if k < len(features)-1 else None
+#                         x_proj = decoder_block(x_proj, skip, z_patch)
                     
-                    # Final prediction
-                    patch_pred = torch.sigmoid(model.final_conv(x_proj))
+#                     # Final prediction
+#                     patch_pred = torch.sigmoid(model.final_conv(x_proj))
                     
-                    # Weight mask
-                    patch_h, patch_w = patch.shape[2], patch.shape[3]
-                    weight = torch.ones_like(patch_pred)
+#                     # Weight mask
+#                     patch_h, patch_w = patch.shape[2], patch.shape[3]
+#                     weight = torch.ones_like(patch_pred)
                     
-                    # Apply tapering
-                    for axis in [2, 3]:
-                        if patch_pred.shape[axis] > 2*overlap:
-                            ramp = torch.linspace(0, 1, overlap, device=device)
-                            if axis == 2:
-                                weight[:, :, :overlap, :] *= ramp.view(-1, 1)
-                                weight[:, :, -overlap:, :] *= (1 - ramp).view(-1, 1)
-                            else:
-                                weight[:, :, :, :overlap] *= ramp.view(-1)
-                                weight[:, :, :, -overlap:] *= (1 - ramp).view(-1)
+#                     # Apply tapering
+#                     for axis in [2, 3]:
+#                         if patch_pred.shape[axis] > 2*overlap:
+#                             ramp = torch.linspace(0, 1, overlap, device=device)
+#                             if axis == 2:
+#                                 weight[:, :, :overlap, :] *= ramp.view(-1, 1)
+#                                 weight[:, :, -overlap:, :] *= (1 - ramp).view(-1, 1)
+#                             else:
+#                                 weight[:, :, :, :overlap] *= ramp.view(-1)
+#                                 weight[:, :, :, -overlap:] *= (1 - ramp).view(-1)
                     
-                    # Add to output
-                    h, w = patch_pred.shape[2], patch_pred.shape[3]
-                    output_mask[:, :, y:y+h, x:x+w] += patch_pred * weight
-                    weight_mask[:, :, y:y+h, x:x+w] += weight
+#                     # Add to output
+#                     h, w = patch_pred.shape[2], patch_pred.shape[3]
+#                     output_mask[:, :, y:y+h, x:x+w] += patch_pred * weight
+#                     weight_mask[:, :, y:y+h, x:x+w] += weight
                     
-                    # Clean up
-                    del patch, features, x_enc, z_patch, x_proj, patch_pred, weight
-                    torch.cuda.empty_cache()
+#                     # Clean up
+#                     del patch, features, x_enc, z_patch, x_proj, patch_pred, weight
+#                     torch.cuda.empty_cache()
             
-            # Clean up batch resources
-            if 'stacked_patches' in locals():
-                del stacked_patches
-            if 'features' in locals():
-                del features 
-            if 'x_enc' in locals():
-                del x_enc
-            if 'z_patch' in locals():
-                del z_patch
-            if 'x_proj' in locals():
-                del x_proj
-            if 'batch_preds' in locals():
-                del batch_preds
-            torch.cuda.empty_cache()
+#             # Clean up batch resources
+#             if 'stacked_patches' in locals():
+#                 del stacked_patches
+#             if 'features' in locals():
+#                 del features 
+#             if 'x_enc' in locals():
+#                 del x_enc
+#             if 'z_patch' in locals():
+#                 del z_patch
+#             if 'x_proj' in locals():
+#                 del x_proj
+#             if 'batch_preds' in locals():
+#                 del batch_preds
+#             torch.cuda.empty_cache()
     
-    # Average overlapping regions
-    output_mask = output_mask / (weight_mask + 1e-8)
+#     # Average overlapping regions
+#     output_mask = output_mask / (weight_mask + 1e-8)
     
-    return output_mask
+#     return output_mask
 
 def calculate_uncertainty_metrics(segmentations):
     """Calculate various uncertainty metrics from multiple segmentation samples."""
