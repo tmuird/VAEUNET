@@ -19,6 +19,11 @@ from utils.vae_utils import generate_predictions, encode_images
 import gc
 import psutil
 
+# Import the new uncertainty metrics module
+from utils.uncertainty_metrics import calculate_expected_calibration_error, brier_score, plot_reliability_diagram
+from utils.uncertainty_metrics import calculate_sparsification_metrics, plot_sparsification_curve
+from utils.uncertainty_metrics import create_comprehensive_uncertainty_report
+
 def track_memory(func):
     """Decorator to track memory usage."""
     def wrapper(*args, **kwargs):
@@ -881,23 +886,30 @@ def plot_reconstruction(model, img_id, dataset, num_samples=32, patch_size=None,
     print(f"Mask shape: {mask.shape}")
     print(f"Image shape for display: {raw_img.shape}")
     
-    # Calculate uncertainty metrics
+    # Calculate basic uncertainty metrics
     metrics = calculate_uncertainty_metrics(segmentations)
     
-    # Create figure with subplots
-    plt.rcParams['figure.dpi'] = 500  # Higher DPI for better quality
-    fig = plt.figure(figsize=(20, 16))  # Increased figure size for more plots
-    gs = gridspec.GridSpec(3, 3, figure=fig)
-    gs.update(wspace=0.3, hspace=0.3)  # Increased spacing between plots
+    # Calculate calibration metrics
+    ece, bin_accs, bin_confs, bin_counts = calculate_expected_calibration_error(
+        metrics['mean'][0], mask[0, 0]
+    )
     
-    # Original image (take first batch) with improved visualization
+    brier = brier_score(metrics['mean'][0], mask[0, 0])
+    
+    # Calculate sparsification metrics using standard deviation as uncertainty
+    frac_removed, err_random, err_uncertainty = calculate_sparsification_metrics(
+        metrics['mean'], metrics['std'], mask[:, 0], num_points=20
+    )
+    
+    # Create comprehensive report figure
+    fig = plt.figure(figsize=(20, 16))
+    gs = gridspec.GridSpec(4, 3, figure=fig)
+    gs.update(wspace=0.3, hspace=0.3)
+    
+    # Original image
     ax1 = fig.add_subplot(gs[0, 0])
-    
-    # Get image from tensor and properly prepare it for visualization
-    img_display = raw_img[0].cpu().permute(1, 2, 0).numpy()  # Convert to [H, W, C] format
-    img_display = np.clip(img_display, 0, 1)  # Ensure proper range
-    
-    # Display the properly scaled image
+    img_display = raw_img[0].cpu().permute(1, 2, 0).numpy()
+    img_display = np.clip(img_display, 0, 1)
     ax1.imshow(img_display)
     ax1.set_title('Input Image', fontsize=12, pad=10)
     ax1.axis('off')
@@ -935,15 +947,54 @@ def plot_reconstruction(model, img_id, dataset, num_samples=32, patch_size=None,
     ax6.axis('off')
     plt.colorbar(mi_plot, ax=ax6)
     
+    # Plot reliability diagram
+    ax7 = fig.add_subplot(gs[2, 0])
+    plot_reliability_diagram(bin_accs, bin_confs, bin_counts, ax=ax7)
+    ax7.set_title(f'Reliability Diagram\n(ECE={ece:.4f}, Brier={brier:.4f})', fontsize=12, pad=10)
+    
+    # Plot sparsification curve
+    ax8 = fig.add_subplot(gs[2, 1])
+    plot_sparsification_curve(frac_removed, err_random, err_uncertainty, ax=ax8)
+    ax8.set_title('Sparsification Curve', fontsize=12, pad=10)
+    
+    # Coefficient of variation
+    ax9 = fig.add_subplot(gs[2, 2])
+    cov_plot = ax9.imshow(metrics['coeff_var'][0].cpu(), cmap='plasma')
+    ax9.set_title('Coefficient of Variation\n(Normalized Uncertainty)', fontsize=12, pad=10)
+    ax9.axis('off')
+    plt.colorbar(cov_plot, ax=ax9)
+    
     # Sample predictions
     for i in range(3):
-        ax = fig.add_subplot(gs[2, i])
+        ax = fig.add_subplot(gs[3, i])
         ax.imshow(segmentations[i, 0].cpu(), cmap='gray')
         ax.set_title(f'Sample {i+1}', fontsize=12, pad=10)
         ax.axis('off')
     
     plt.suptitle('VAE-UNet Segmentation Analysis', fontsize=14, y=0.95)
     plt.tight_layout()
+    return fig
+
+# Add a new function to generate comprehensive metrics report
+def generate_metrics_report(model, img_id, dataset, output_path=None, num_samples=32, 
+                           patch_size=None, overlap=100, temperature=1.0, 
+                           enable_dropout=True, batch_size=4):
+    """Generate a comprehensive uncertainty and calibration metrics report."""
+    # Get segmentations
+    segmentations, mask, _, _ = get_segmentation_distribution(
+        model, img_id, dataset=dataset, num_samples=num_samples,
+        patch_size=patch_size, overlap=overlap, 
+        temperature=temperature, enable_dropout=enable_dropout,
+        batch_size=batch_size
+    )
+    
+    # Create and save report
+    fig = create_comprehensive_uncertainty_report(
+        segmentations.unsqueeze(1),  # Add channel dimension for the report function
+        mask, 
+        output_path=output_path
+    )
+    
     return fig
 
 def visualize_temperature_sampling(model, image, mask=None, 
@@ -1594,6 +1645,23 @@ if __name__ == '__main__':
                 plt.close(fig)
                 
                 logging.info(f"Saved visualization to {out_path}")
+                
+                # Generate comprehensive metrics report
+                metrics_path = samples_dir / f"{img_id}_metrics_report.png"
+                metrics_fig = generate_metrics_report(
+                    model=model,
+                    img_id=img_id,
+                    dataset=test_dataset,
+                    output_path=metrics_path,
+                    num_samples=args.samples,
+                    patch_size=args.patch_size,
+                    overlap=args.overlap,
+                    temperature=args.temperature,
+                    enable_dropout=args.enable_dropout,
+                    batch_size=args.batch_size
+                )
+                plt.close(metrics_fig)
+                logging.info(f"Saved metrics report to {metrics_path}")
                 
             except Exception as e:
                 logging.error(f"Error processing image {img_id}: {e}")
