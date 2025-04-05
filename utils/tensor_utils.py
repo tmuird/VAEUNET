@@ -1,6 +1,7 @@
 import torch
 import numpy as np
 import pandas as pd
+import logging
 
 def to_python_scalar(value):
     """Convert torch tensors, numpy arrays, or other numeric types to Python scalars."""
@@ -22,45 +23,81 @@ def to_python_scalar(value):
         return value  # Already a Python scalar or other type
 
 def ensure_dict_python_scalars(d):
-    """Recursively convert all torch tensors and numpy arrays in a dict to Python scalars."""
+    """Convert all torch tensors and numpy values in a dictionary to Python scalar types.
+    This is important for proper serialization to CSV and other formats.
+    """
     result = {}
     for k, v in d.items():
-        if isinstance(v, dict):
-            result[k] = ensure_dict_python_scalars(v)
-        elif isinstance(v, (list, tuple)):
-            result[k] = [to_python_scalar(x) for x in v]
+        if isinstance(v, torch.Tensor):
+            # Handle different tensor shapes
+            if v.numel() == 1:  # Single value tensor
+                result[k] = v.item()  # Convert to Python scalar
+            else:
+                # For multi-value tensors, convert to list of Python scalars
+                result[k] = v.detach().cpu().numpy().tolist()
+        elif isinstance(v, np.ndarray):
+            # Handle numpy arrays
+            if v.size == 1:  # Single value array
+                result[k] = v.item()  # Convert to Python scalar
+            else:
+                result[k] = v.tolist()  # Convert to list
+        elif isinstance(v, (np.float32, np.float64, np.int32, np.int64)):
+            # Handle numpy scalar types
+            result[k] = v.item()  # Convert to Python scalar
         else:
-            result[k] = to_python_scalar(v)
+            # Keep other types as is
+            result[k] = v
     return result
 
 def fix_dataframe_tensors(df):
-    """Convert any tensors in a DataFrame to Python scalars."""
-    # Copy the DataFrame to avoid modifying the original
+    """Fix a pandas DataFrame with tensor or numpy values.
+    
+    Args:
+        df: A pandas DataFrame that might contain torch tensors or numpy arrays
+        
+    Returns:
+        A pandas DataFrame with all tensors and numpy arrays converted to Python types
+    """
+    # Create a copy to avoid modifying the original
     fixed_df = df.copy()
     
-    # Process each column
     for col in fixed_df.columns:
-        # Special handling for img_id column
-        if col == 'img_id':
-            fixed_df[col] = fixed_df[col].astype(str)
-            continue
+        # Check if this column contains any tensor or numpy values
+        if any(isinstance(x, (torch.Tensor, np.ndarray, np.float32, np.float64, np.int32, np.int64)) 
+               for x in fixed_df[col] if x is not None):
             
-        # For other columns, convert to numeric when possible
-        try:
-            # Try simple conversion first
-            fixed_df[col] = pd.to_numeric(fixed_df[col], errors='coerce')
-        except:
-            # If that fails, try more detailed conversion
-            if fixed_df[col].dtype == 'object':
-                # Check if column contains tensors or arrays
+            # Create a new column with converted values
+            try:
                 fixed_df[col] = fixed_df[col].apply(
-                    lambda x: to_python_scalar(x) if isinstance(x, (torch.Tensor, np.ndarray)) else x
+                    lambda x: x.item() if isinstance(x, (torch.Tensor, np.ndarray)) and 
+                                         (hasattr(x, 'numel') and x.numel() == 1 or 
+                                          hasattr(x, 'size') and x.size == 1) 
+                             else x.detach().cpu().numpy().tolist() if isinstance(x, torch.Tensor)
+                             else x.tolist() if isinstance(x, np.ndarray)
+                             else x.item() if isinstance(x, (np.float32, np.float64, np.int32, np.int64))
+                             else x
                 )
-                # Now try numeric conversion again
-                try:
-                    fixed_df[col] = pd.to_numeric(fixed_df[col], errors='coerce')
-                except:
-                    pass
+            except Exception as e:
+                logging.warning(f"Could not convert column {col}: {e}")
+                # Try a more direct approach for problematic columns
+                fixed_values = []
+                for x in fixed_df[col]:
+                    if isinstance(x, (torch.Tensor, np.ndarray)):
+                        if hasattr(x, 'numel') and x.numel() == 1 or hasattr(x, 'size') and x.size == 1:
+                            fixed_values.append(float(x.item()))
+                        else:
+                            try:
+                                if isinstance(x, torch.Tensor):
+                                    fixed_values.append(float(x.detach().cpu().numpy().tolist()))
+                                else:
+                                    fixed_values.append(float(x.tolist()))
+                            except:
+                                fixed_values.append(None)
+                    elif isinstance(x, (np.float32, np.float64, np.int32, np.int64)):
+                        fixed_values.append(float(x.item()))
+                    else:
+                        fixed_values.append(x)
+                fixed_df[col] = fixed_values
     
     return fixed_df
 

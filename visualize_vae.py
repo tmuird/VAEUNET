@@ -19,11 +19,6 @@ from utils.vae_utils import generate_predictions, encode_images
 import gc
 import psutil
 
-# Import the new uncertainty metrics module
-from utils.uncertainty_metrics import calculate_expected_calibration_error, brier_score, plot_reliability_diagram
-from utils.uncertainty_metrics import calculate_sparsification_metrics, plot_sparsification_curve
-from utils.uncertainty_metrics import create_comprehensive_uncertainty_report
-
 def track_memory(func):
     """Decorator to track memory usage."""
     def wrapper(*args, **kwargs):
@@ -109,231 +104,229 @@ def predict_full_image(model, img, z):
     
     return patches, patch_coords
 
-# def predict_with_dataset_patches(model, dataset, img_id, z, device, overlap=None):
-#     """Use the dataset's patch mechanism to predict on patches and reassemble."""
-#     model.eval()
+def predict_with_dataset_patches(model, dataset, img_id, z, device, overlap=None):
+    """Use the dataset's patch mechanism to predict on patches and reassemble."""
+    model.eval()
     
-#     # Get all patches for this image
-#     patches, patch_coords = get_patches_for_image(dataset, img_id)
+    # Get all patches for this image
+    patches, patch_coords = get_patches_for_image(dataset, img_id)
     
-#     if not patches:
-#         logging.error(f"No patches found for image ID: {img_id}")
-#         return None
+    if not patches:
+        logging.error(f"No patches found for image ID: {img_id}")
+        return None
     
-#     # Get original image shape from the first patch's metadata
-#     patch_data = torch.load(dataset.patch_indices[0][1])
-#     if 'original_shape' in patch_data:
-#         H, W = patch_data['original_shape']
-#     else:
-#         # If not available, use a large enough size based on coordinates
-#         max_y = max(y + p.shape[2] for p, (y, _) in zip(patches, patch_coords))
-#         max_x = max(x + p.shape[3] for p, (_, x) in zip(patches, patch_coords))
-#         H, W = max_y, max_x
+    # Get original image shape from the first patch's metadata
+    patch_data = torch.load(dataset.patch_indices[0][1])
+    if 'original_shape' in patch_data:
+        H, W = patch_data['original_shape']
+    else:
+        # If not available, use a large enough size based on coordinates
+        max_y = max(y + p.shape[2] for p, (y, _) in zip(patches, patch_coords))
+        max_x = max(x + p.shape[3] for p, (_, x) in zip(patches, patch_coords))
+        H, W = max_y, max_x
     
-#     # Calculate adaptive overlap if not specified
-#     if overlap is None:
-#         # Use dataset's patch size to determine overlap
-#         patch_size = dataset.patch_size if hasattr(dataset, 'patch_size') else patches[0].shape[2]
-#         # Make overlap proportional to patch size (20% of patch size)
-#         overlap = max(min(int(patch_size * 0.2), 128), 32)
+    # Calculate adaptive overlap if not specified
+    if overlap is None:
+        # Use dataset's patch size to determine overlap
+        patch_size = dataset.patch_size if hasattr(dataset, 'patch_size') else patches[0].shape[2]
+        # Make overlap proportional to patch size (20% of patch size)
+        overlap = max(min(int(patch_size * 0.2), 128), 32)
     
-#     logging.info(f"Using overlap of {overlap} pixels for dataset patches")
+    logging.info(f"Using overlap of {overlap} pixels for dataset patches")
     
-#     # Initialize output and weight masks
-#     output_mask = torch.zeros((1, 1, H, W), device=device)
-#     weight_mask = torch.zeros((1, 1, H, W), device=device)
+    # Initialize output and weight masks
+    output_mask = torch.zeros((1, 1, H, W), device=device)
+    weight_mask = torch.zeros((1, 1, H, W), device=device)
     
-#     # Process each patch
-#     with torch.no_grad():
-#         # Group patches into batches based on size
-#         max_batch_size = 10  # Process up to 4 patches at once
-#         batches = []
-#         current_batch = []
-#         current_coords = []
+    # Process each patch
+    with torch.no_grad():
+        # Group patches into batches based on size
+        max_batch_size = 10  # Process up to 4 patches at once
+        batches = []
+        current_batch = []
+        current_coords = []
         
-#         # Group patches with similar size
-#         for i, (patch, coords) in enumerate(zip(patches, patch_coords)):
-#             # If batch is empty or patch size matches the first patch in batch
-#             if not current_batch or (current_batch[0].shape == patch.shape):
-#                 current_batch.append(patch)
-#                 current_coords.append(coords)
+        # Group patches with similar size
+        for i, (patch, coords) in enumerate(zip(patches, patch_coords)):
+            # If batch is empty or patch size matches the first patch in batch
+            if not current_batch or (current_batch[0].shape == patch.shape):
+                current_batch.append(patch)
+                current_coords.append(coords)
                 
-#                 # Process batch if we've reached max size
-#                 if len(current_batch) >= max_batch_size:
-#                     batches.append((current_batch.copy(), current_coords.copy()))
-#                     current_batch = []
-#                     current_coords = []
-#             else:
-#                 # Process current batch and start a new one
-#                 if current_batch:
-#                     batches.append((current_batch.copy(), current_coords.copy()))
-#                 current_batch = [patch]
-#                 current_coords = [coords]
+                # Process batch if we've reached max size
+                if len(current_batch) >= max_batch_size:
+                    batches.append((current_batch.copy(), current_coords.copy()))
+                    current_batch = []
+                    current_coords = []
+            else:
+                # Process current batch and start a new one
+                if current_batch:
+                    batches.append((current_batch.copy(), current_coords.copy()))
+                current_batch = [patch]
+                current_coords = [coords]
         
-#         # Add remaining patches as a batch
-#         if current_batch:
-#             batches.append((current_batch, current_coords))
+        # Add remaining patches as a batch
+        if current_batch:
+            batches.append((current_batch, current_coords))
         
-#         # Process each batch
-#         for batch_patches, batch_coords in batches:
-#             try:
-#                 # Stack patches into a batch tensor
-#                 batch_size = len(batch_patches)
-#                 if batch_size > 1:
-#                     stacked_patches = torch.cat([p.to(device) for p in batch_patches], dim=0)
-#                 else:
-#                     stacked_patches = batch_patches[0].to(device)
+        # Process each batch
+        for batch_patches, batch_coords in batches:
+            try:
+                # Stack patches into a batch tensor
+                batch_size = len(batch_patches)
+                if batch_size > 1:
+                    stacked_patches = torch.cat([p.to(device) for p in batch_patches], dim=0)
+                else:
+                    stacked_patches = batch_patches[0].to(device)
                 
-#                 # Get encoder features
-#                 features = model.encoder(stacked_patches)
-#                 x_enc = features[-1]
+                # Get encoder features
+                features = model.encoder(stacked_patches)
+                x_enc = features[-1]
                 
-#                 # Prepare z for the batch
-#                 if batch_size > 1:
-#                     z_batch = z.expand(batch_size, -1, -1, -1)
-#                 else:
-#                     z_batch = z
+                # Prepare z for the batch
+                if batch_size > 1:
+                    z_batch = z.expand(batch_size, -1, -1, -1)
+                else:
+                    z_batch = z
                 
-#                 # Interpolate z to match encoder output
-#                 z_patch = F.interpolate(z_batch, size=x_enc.shape[2:], mode='bilinear', align_corners=True)
+                # Interpolate z to match encoder output
+                z_patch = F.interpolate(z_batch, size=x_enc.shape[2:], mode='bilinear', align_corners=True)
                 
-#                 # Initial projection
-#                 x_proj = model.z_initial(z_patch)
+                # Initial projection
+                x_proj = model.z_initial(z_patch)
                 
-#                 # Decode with z injection
-#                 for k, decoder_block in enumerate(model.decoder_blocks):
-#                     skip = features[-(k+2)] if k < len(features)-1 else None
-#                     x_proj = decoder_block(x_proj, skip, z_patch)
+                # Decode with z injection
+                for k, decoder_block in enumerate(model.decoder_blocks):
+                    skip = features[-(k+2)] if k < len(features)-1 else None
+                    x_proj = decoder_block(x_proj, skip, z_patch)
                 
-#                 # Final prediction
-#                 batch_preds = torch.sigmoid(model.final_conv(x_proj))
+                # Final prediction
+                batch_preds = torch.sigmoid(model.final_conv(x_proj))
                 
-#                 # Process each prediction in batch
-#                 for idx in range(batch_size):
-#                     if batch_size > 1:
-#                         patch = stacked_patches[idx:idx+1]
-#                         patch_pred = batch_preds[idx:idx+1]
-#                     else:
-#                         patch = stacked_patches
-#                         patch_pred = batch_preds
+                # Process each prediction in batch
+                for idx in range(batch_size):
+                    if batch_size > 1:
+                        patch = stacked_patches[idx:idx+1]
+                        patch_pred = batch_preds[idx:idx+1]
+                    else:
+                        patch = stacked_patches
+                        patch_pred = batch_preds
                         
-#                     y, x = batch_coords[idx]
+                    y, x = batch_coords[idx]
                     
-#                     # Create weight mask for smooth blending
-#                     patch_h, patch_w = patch.shape[2], patch.shape[3]
-#                     weight = torch.ones_like(patch_pred)
+                    # Create weight mask for smooth blending
+                    patch_h, patch_w = patch.shape[2], patch.shape[3]
+                    weight = torch.ones_like(patch_pred)
                     
-#                     # Apply smooth tapering at edges
-#                     for axis in [2, 3]:
-#                         if patch_pred.shape[axis] > 2*overlap:
-#                             ramp = torch.linspace(0, 1, overlap, device=device)
-#                             if axis == 2:
-#                                 weight[:, :, :overlap, :] *= ramp.view(-1, 1)
-#                                 weight[:, :, -overlap:, :] *= (1 - ramp).view(-1, 1)
-#                             else:
-#                                 weight[:, :, :, :overlap] *= ramp.view(-1)
-#                                 weight[:, :, :, -overlap:] *= (1 - ramp).view(-1)
+                    # Apply smooth tapering at edges
+                    for axis in [2, 3]:
+                        if patch_pred.shape[axis] > 2*overlap:
+                            ramp = torch.linspace(0, 1, overlap, device=device)
+                            if axis == 2:
+                                weight[:, :, :overlap, :] *= ramp.view(-1, 1)
+                                weight[:, :, -overlap:, :] *= (1 - ramp).view(-1, 1)
+                            else:
+                                weight[:, :, :, :overlap] *= ramp.view(-1)
+                                weight[:, :, :, -overlap:] *= (1 - ramp).view(-1)
                     
-#                     # Add weighted prediction to output
-#                     h, w = patch_pred.shape[2], patch_pred.shape[3]
-#                     output_mask[:, :, y:y+h, x:x+w] += patch_pred * weight
-#                     weight_mask[:, :, y:y+h, x:x+w] += weight
+                    # Add weighted prediction to output
+                    h, w = patch_pred.shape[2], patch_pred.shape[3]
+                    output_mask[:, :, y:y+h, x:x+w] += patch_pred * weight
+                    weight_mask[:, :, y:y+h, x:x+w] += weight
                     
-#             except RuntimeError as e:
-#                 # Fallback to single patch processing
-#                 logging.warning(f"Batch processing failed: {e}. Falling back to single patch mode.")
-#                 torch.cuda.empty_cache()
+            except RuntimeError as e:
+                # Fallback to single patch processing
+                logging.warning(f"Batch processing failed: {e}. Falling back to single patch mode.")
+                torch.cuda.empty_cache()
                 
-#                 # Process each patch individually
-#                 for patch, (y, x) in zip(batch_patches, batch_coords):
-#                     patch = patch.to(device)
+                # Process each patch individually
+                for patch, (y, x) in zip(batch_patches, batch_coords):
+                    patch = patch.to(device)
                     
-#                     # Process single patch
-#                     features = model.encoder(patch)
-#                     x_enc = features[-1]
-#                     z_patch = F.interpolate(z, size=x_enc.shape[2:], mode='bilinear', align_corners=True)
-#                     x_proj = model.z_initial(z_patch)
+                    # Process single patch
+                    features = model.encoder(patch)
+                    x_enc = features[-1]
+                    z_patch = F.interpolate(z, size=x_enc.shape[2:], mode='bilinear', align_corners=True)
+                    x_proj = model.z_initial(z_patch)
                     
-#                     # Decode
-#                     for k, decoder_block in enumerate(model.decoder_blocks):
-#                         skip = features[-(k+2)] if k < len(features)-1 else None
-#                         x_proj = decoder_block(x_proj, skip, z_patch)
+                    # Decode
+                    for k, decoder_block in enumerate(model.decoder_blocks):
+                        skip = features[-(k+2)] if k < len(features)-1 else None
+                        x_proj = decoder_block(x_proj, skip, z_patch)
                     
-#                     # Final prediction
-#                     patch_pred = torch.sigmoid(model.final_conv(x_proj))
+                    # Final prediction
+                    patch_pred = torch.sigmoid(model.final_conv(x_proj))
                     
-#                     # Weight mask
-#                     patch_h, patch_w = patch.shape[2], patch.shape[3]
-#                     weight = torch.ones_like(patch_pred)
+                    # Weight mask
+                    patch_h, patch_w = patch.shape[2], patch.shape[3]
+                    weight = torch.ones_like(patch_pred)
                     
-#                     # Apply tapering
-#                     for axis in [2, 3]:
-#                         if patch_pred.shape[axis] > 2*overlap:
-#                             ramp = torch.linspace(0, 1, overlap, device=device)
-#                             if axis == 2:
-#                                 weight[:, :, :overlap, :] *= ramp.view(-1, 1)
-#                                 weight[:, :, -overlap:, :] *= (1 - ramp).view(-1, 1)
-#                             else:
-#                                 weight[:, :, :, :overlap] *= ramp.view(-1)
-#                                 weight[:, :, :, -overlap:] *= (1 - ramp).view(-1)
+                    # Apply tapering
+                    for axis in [2, 3]:
+                        if patch_pred.shape[axis] > 2*overlap:
+                            ramp = torch.linspace(0, 1, overlap, device=device)
+                            if axis == 2:
+                                weight[:, :, :overlap, :] *= ramp.view(-1, 1)
+                                weight[:, :, -overlap:, :] *= (1 - ramp).view(-1, 1)
+                            else:
+                                weight[:, :, :, :overlap] *= ramp.view(-1)
+                                weight[:, :, :, -overlap:] *= (1 - ramp).view(-1)
                     
-#                     # Add to output
-#                     h, w = patch_pred.shape[2], patch_pred.shape[3]
-#                     output_mask[:, :, y:y+h, x:x+w] += patch_pred * weight
-#                     weight_mask[:, :, y:y+h, x:x+w] += weight
+                    # Add to output
+                    h, w = patch_pred.shape[2], patch_pred.shape[3]
+                    output_mask[:, :, y:y+h, x:x+w] += patch_pred * weight
+                    weight_mask[:, :, y:y+h, x:x+w] += weight
                     
-#                     # Clean up
-#                     del patch, features, x_enc, z_patch, x_proj, patch_pred, weight
-#                     torch.cuda.empty_cache()
+                    # Clean up
+                    del patch, features, x_enc, z_patch, x_proj, patch_pred, weight
+                    torch.cuda.empty_cache()
             
-#             # Clean up batch resources
-#             if 'stacked_patches' in locals():
-#                 del stacked_patches
-#             if 'features' in locals():
-#                 del features 
-#             if 'x_enc' in locals():
-#                 del x_enc
-#             if 'z_patch' in locals():
-#                 del z_patch
-#             if 'x_proj' in locals():
-#                 del x_proj
-#             if 'batch_preds' in locals():
-#                 del batch_preds
-#             torch.cuda.empty_cache()
+            # Clean up batch resources
+            if 'stacked_patches' in locals():
+                del stacked_patches
+            if 'features' in locals():
+                del features 
+            if 'x_enc' in locals():
+                del x_enc
+            if 'z_patch' in locals():
+                del z_patch
+            if 'x_proj' in locals():
+                del x_proj
+            if 'batch_preds' in locals():
+                del batch_preds
+            torch.cuda.empty_cache()
     
-#     # Average overlapping regions
-#     output_mask = output_mask / (weight_mask + 1e-8)
+    # Average overlapping regions
+    output_mask = output_mask / (weight_mask + 1e-8)
     
-#     return output_mask
+    return output_mask
 
 def calculate_uncertainty_metrics(segmentations):
     """Calculate various uncertainty metrics from multiple segmentation samples."""
     # Calculate mean prediction
     mean_pred = segmentations.mean(dim=0)  # [B, C, H, W]
-    
+    epsilon = 1e-7  # Small value to avoid log(0)
     # Standard deviation (aleatory uncertainty)
-    std_dev = segmentations.std(dim=0)     # [B, C, H, W]
-    
-    # Entropy of the mean prediction (epistemic uncertainty)
-    epsilon = 1e-7  # Small constant to avoid log(0)
+    std_dev = segmentations.std(dim=0)
+
+    # Entropy of the mean prediction (total uncertainty)
     entropy = -(mean_pred * torch.log(mean_pred + epsilon) + 
-               (1 - mean_pred) * torch.log(1 - mean_pred + epsilon))
-    
-    # Mutual information (total uncertainty)
+            (1 - mean_pred) * torch.log(1 - mean_pred + epsilon))
+
+    # Mutual information (epistemic uncertainty)
     sample_entropies = -(segmentations * torch.log(segmentations + epsilon) + 
                         (1 - segmentations) * torch.log(1 - segmentations + epsilon))
     mean_entropy = sample_entropies.mean(dim=0)
-    mutual_info = entropy - mean_entropy
-    
-    # Coefficient of variation
+    mutual_info = entropy - mean_entropy  # Difference captures epistemic uncertainty
+    # Coefficient of variation (normalized measure of dispersion)
     coeff_var = std_dev / (mean_pred + epsilon)
     
     return {
         'mean': mean_pred.squeeze(1),      # Remove channel dim for visualization
-        'std': std_dev.squeeze(1),
-        'entropy': entropy.squeeze(1),
-        'mutual_info': mutual_info.squeeze(1),
-        'coeff_var': coeff_var.squeeze(1)
+        'std': std_dev.squeeze(1),         # Confidence/aleatory uncertainty
+        'entropy': entropy.squeeze(1),     # Binary entropy of mean prediction
+        'mutual_info': mutual_info.squeeze(1),  # Epistemic uncertainty
+        'coeff_var': coeff_var.squeeze(1)  # Normalized uncertainty
     }
 
 
@@ -391,25 +384,25 @@ def plot_reconstruction(model, img, mask, img_id, dataset=None, num_samples=32, 
     ax3.imshow(metrics['mean'][0].cpu(), cmap='gray')
     ax3.set_title(f'Mean Prediction\n(T={temperature}, N={num_samples})', fontsize=12, pad=10)
     ax3.axis('off')
-    
+        
     # Standard deviation
     ax4 = fig.add_subplot(gs[1, 0])
     std_plot = ax4.imshow(metrics['std'][0].cpu(), cmap='hot')
     ax4.set_title('Std Deviation\n(Aleatory Uncertainty)', fontsize=12, pad=10)
     ax4.axis('off')
     plt.colorbar(std_plot, ax=ax4)
-    
+
     # Entropy
     ax5 = fig.add_subplot(gs[1, 1])
     entropy_plot = ax5.imshow(metrics['entropy'][0].cpu(), cmap='hot')
-    ax5.set_title('Entropy\n(Epistemic Uncertainty)', fontsize=12, pad=10)
+    ax5.set_title('Entropy\n(Total Uncertainty)', fontsize=12, pad=10)
     ax5.axis('off')
     plt.colorbar(entropy_plot, ax=ax5)
-    
+
     # Mutual Information
     ax6 = fig.add_subplot(gs[1, 2])
     mi_plot = ax6.imshow(metrics['mutual_info'][0].cpu(), cmap='hot')
-    ax6.set_title('Mutual Information\n(Total Uncertainty)', fontsize=12, pad=10)
+    ax6.set_title('Mutual Information\n(Epistemic Uncertainty)', fontsize=12, pad=10)
     ax6.axis('off')
     plt.colorbar(mi_plot, ax=ax6)
     
@@ -886,30 +879,23 @@ def plot_reconstruction(model, img_id, dataset, num_samples=32, patch_size=None,
     print(f"Mask shape: {mask.shape}")
     print(f"Image shape for display: {raw_img.shape}")
     
-    # Calculate basic uncertainty metrics
+    # Calculate uncertainty metrics
     metrics = calculate_uncertainty_metrics(segmentations)
     
-    # Calculate calibration metrics
-    ece, bin_accs, bin_confs, bin_counts = calculate_expected_calibration_error(
-        metrics['mean'][0], mask[0, 0]
-    )
+    # Create figure with subplots
+    plt.rcParams['figure.dpi'] = 500  # Higher DPI for better quality
+    fig = plt.figure(figsize=(20, 16))  # Increased figure size for more plots
+    gs = gridspec.GridSpec(3, 3, figure=fig)
+    gs.update(wspace=0.3, hspace=0.3)  # Increased spacing between plots
     
-    brier = brier_score(metrics['mean'][0], mask[0, 0])
-    
-    # Calculate sparsification metrics using standard deviation as uncertainty
-    frac_removed, err_random, err_uncertainty = calculate_sparsification_metrics(
-        metrics['mean'], metrics['std'], mask[:, 0], num_points=20
-    )
-    
-    # Create comprehensive report figure
-    fig = plt.figure(figsize=(20, 16))
-    gs = gridspec.GridSpec(4, 3, figure=fig)
-    gs.update(wspace=0.3, hspace=0.3)
-    
-    # Original image
+    # Original image (take first batch) with improved visualization
     ax1 = fig.add_subplot(gs[0, 0])
-    img_display = raw_img[0].cpu().permute(1, 2, 0).numpy()
-    img_display = np.clip(img_display, 0, 1)
+    
+    # Get image from tensor and properly prepare it for visualization
+    img_display = raw_img[0].cpu().permute(1, 2, 0).numpy()  # Convert to [H, W, C] format
+    img_display = np.clip(img_display, 0, 1)  # Ensure proper range
+    
+    # Display the properly scaled image
     ax1.imshow(img_display)
     ax1.set_title('Input Image', fontsize=12, pad=10)
     ax1.axis('off')
@@ -947,54 +933,15 @@ def plot_reconstruction(model, img_id, dataset, num_samples=32, patch_size=None,
     ax6.axis('off')
     plt.colorbar(mi_plot, ax=ax6)
     
-    # Plot reliability diagram
-    ax7 = fig.add_subplot(gs[2, 0])
-    plot_reliability_diagram(bin_accs, bin_confs, bin_counts, ax=ax7)
-    ax7.set_title(f'Reliability Diagram\n(ECE={ece:.4f}, Brier={brier:.4f})', fontsize=12, pad=10)
-    
-    # Plot sparsification curve
-    ax8 = fig.add_subplot(gs[2, 1])
-    plot_sparsification_curve(frac_removed, err_random, err_uncertainty, ax=ax8)
-    ax8.set_title('Sparsification Curve', fontsize=12, pad=10)
-    
-    # Coefficient of variation
-    ax9 = fig.add_subplot(gs[2, 2])
-    cov_plot = ax9.imshow(metrics['coeff_var'][0].cpu(), cmap='plasma')
-    ax9.set_title('Coefficient of Variation\n(Normalized Uncertainty)', fontsize=12, pad=10)
-    ax9.axis('off')
-    plt.colorbar(cov_plot, ax=ax9)
-    
     # Sample predictions
     for i in range(3):
-        ax = fig.add_subplot(gs[3, i])
+        ax = fig.add_subplot(gs[2, i])
         ax.imshow(segmentations[i, 0].cpu(), cmap='gray')
         ax.set_title(f'Sample {i+1}', fontsize=12, pad=10)
         ax.axis('off')
     
     plt.suptitle('VAE-UNet Segmentation Analysis', fontsize=14, y=0.95)
     plt.tight_layout()
-    return fig
-
-# Add a new function to generate comprehensive metrics report
-def generate_metrics_report(model, img_id, dataset, output_path=None, num_samples=32, 
-                           patch_size=None, overlap=100, temperature=1.0, 
-                           enable_dropout=True, batch_size=4):
-    """Generate a comprehensive uncertainty and calibration metrics report."""
-    # Get segmentations
-    segmentations, mask, _, _ = get_segmentation_distribution(
-        model, img_id, dataset=dataset, num_samples=num_samples,
-        patch_size=patch_size, overlap=overlap, 
-        temperature=temperature, enable_dropout=enable_dropout,
-        batch_size=batch_size
-    )
-    
-    # Create and save report
-    fig = create_comprehensive_uncertainty_report(
-        segmentations.unsqueeze(1),  # Add channel dimension for the report function
-        mask, 
-        output_path=output_path
-    )
-    
     return fig
 
 def visualize_temperature_sampling(model, image, mask=None, 
@@ -1645,23 +1592,6 @@ if __name__ == '__main__':
                 plt.close(fig)
                 
                 logging.info(f"Saved visualization to {out_path}")
-                
-                # Generate comprehensive metrics report
-                metrics_path = samples_dir / f"{img_id}_metrics_report.png"
-                metrics_fig = generate_metrics_report(
-                    model=model,
-                    img_id=img_id,
-                    dataset=test_dataset,
-                    output_path=metrics_path,
-                    num_samples=args.samples,
-                    patch_size=args.patch_size,
-                    overlap=args.overlap,
-                    temperature=args.temperature,
-                    enable_dropout=args.enable_dropout,
-                    batch_size=args.batch_size
-                )
-                plt.close(metrics_fig)
-                logging.info(f"Saved metrics report to {metrics_path}")
                 
             except Exception as e:
                 logging.error(f"Error processing image {img_id}: {e}")
