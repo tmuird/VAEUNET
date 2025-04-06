@@ -8,6 +8,11 @@ from pathlib import Path
 from tqdm import tqdm
 import pandas as pd
 import seaborn as sns
+from sklearn.calibration import calibration_curve
+from matplotlib.backends.backend_pdf import PdfPages
+import matplotlib.gridspec as gridspec
+from textwrap import wrap
+
 from utils.data_loading import IDRIDDataset
 from unet.unet_resnet import UNetResNet
 from utils.uncertainty_metrics import (
@@ -16,18 +21,15 @@ from utils.uncertainty_metrics import (
     calculate_sparsification_metrics,
     plot_reliability_diagram,
     plot_sparsification_curve
-    # Remove the reference to interpret_reliability_diagram as it doesn't exist
 )
 from utils.tensor_utils import ensure_dict_python_scalars, fix_dataframe_tensors
 from visualize_vae import get_segmentation_distribution, track_memory
-from matplotlib.backends.backend_pdf import PdfPages
-import matplotlib.gridspec as gridspec
-from textwrap import wrap
 
 def get_args():
-    parser = argparse.ArgumentParser(description='Analyze uncertainty metrics across test images')
+    parser = argparse.ArgumentParser(description='Analyze model performance, calibration and uncertainty')
     parser.add_argument('--model', '-m', default='best_model.pth', metavar='FILE', help='Model file')
-    parser.add_argument('--lesion_type', type=str, required=True, default='EX', choices=['EX', 'HE', 'MA','OD'], help='Lesion type')
+    parser.add_argument('--lesion_type', type=str, required=True, default='EX', 
+                      choices=['EX', 'HE', 'MA','OD'], help='Lesion type')
     parser.add_argument('--temperature', type=float, default=1.0, help='Temperature for sampling')
     parser.add_argument('--samples', type=int, default=30, help='Number of samples for ensemble prediction')
     parser.add_argument('--patch_size', type=int, default=512, help='Patch size (0 for full image)')
@@ -36,7 +38,23 @@ def get_args():
     parser.add_argument('--batch_size', type=int, default=4, help='Batch size for processing')
     parser.add_argument('--max_images', type=int, default=None, help='Maximum number of images to process')
     parser.add_argument('--scale', type=float, default=1.0, help='Scale factor for resizing (default: 1.0)')
+    
+    # Analysis mode flags
+    parser.add_argument('--calibration', action='store_true', help='Run calibration analysis')
+    parser.add_argument('--uncertainty', action='store_true', help='Run uncertainty analysis')
+    parser.add_argument('--temperature_sweep', action='store_true', 
+                       help='Analyze effect of temperature on calibration')
+    parser.add_argument('--temp_values', type=float, nargs='+', 
+                       default=[0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 3.0],
+                       help='Temperature values to analyze')
+    
     args = parser.parse_args()
+    
+    # If no analysis flag is set, enable all by default
+    if not (args.calibration or args.uncertainty or args.temperature_sweep):
+        args.calibration = True
+        args.uncertainty = True
+        args.temperature_sweep = True
     
     # Convert patch_size=0 to None for full image mode
     if args.patch_size == 0:
@@ -45,8 +63,8 @@ def get_args():
     return args
 
 @track_memory
-def analyze_dataset_uncertainty(model, dataset, args):
-    """Analyze uncertainty metrics across the dataset."""
+def analyze_model(model, dataset, args):
+    """Unified analysis function that handles both uncertainty and calibration analysis."""
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model.eval()
     
@@ -54,8 +72,10 @@ def analyze_dataset_uncertainty(model, dataset, args):
     output_dir = Path(args.output_dir) / f"{args.lesion_type}_T{args.temperature}_N{args.samples}"
     output_dir.mkdir(parents=True, exist_ok=True)
     
-    # Initialize lists to store metrics
+    # Initialize data storage
     metrics_data = []
+    all_predictions = []
+    all_ground_truths = []
     
     # Process each image only once (avoid duplicates from patches)
     processed_ids = set()
@@ -103,25 +123,40 @@ def analyze_dataset_uncertainty(model, dataset, args):
             )
             dice = float(dice_tensor.item())  # Explicitly convert to Python float
             
-            # Calculate sparsification metrics
-            frac_removed, err_random, err_uncertainty = calculate_sparsification_metrics(
-                mean_pred, std_dev, mask_cpu[:, 0], num_points=20
-            )
+            # Store flattened predictions and ground truth for global calibration analysis
+            if args.calibration or args.temperature_sweep:
+                pred_flat = mean_pred[0].flatten().numpy()
+                gt_flat = mask_cpu[0, 0].flatten().numpy()
+                all_predictions.append(pred_flat)
+                all_ground_truths.append(gt_flat)
             
-            # Calculate sparsification error (area between curves)
-            if err_random[0] > 0:
-                norm_random = err_random / err_random[0]
-                norm_uncertainty = err_uncertainty / err_random[0]
-            else:
-                norm_random = err_random
-                norm_uncertainty = err_uncertainty
+            # Calculate sparsification metrics (only if uncertainty analysis is enabled)
+            if args.uncertainty:
+                frac_removed, err_random, err_uncertainty = calculate_sparsification_metrics(
+                    mean_pred, std_dev, mask_cpu[:, 0], num_points=20
+                )
                 
-            se = float(np.trapz(norm_random - norm_uncertainty, frac_removed))  # Ensure Python float
-            
-            # Calculate percent of uncertain pixels (std > threshold)
-            uncertainty_threshold = 0.2
-            uncertain_percent_tensor = (std_dev[0] > uncertainty_threshold).float().mean() * 100
-            uncertain_pixel_percent = float(uncertain_percent_tensor.item())  # Ensure Python float
+                # Calculate sparsification error (area between curves)
+                if err_random[0] > 0:
+                    norm_random = err_random / err_random[0]
+                    norm_uncertainty = err_uncertainty / err_random[0]
+                else:
+                    norm_random = err_random
+                    norm_uncertainty = err_uncertainty
+                    
+                se = float(np.trapz(norm_random - norm_uncertainty, frac_removed))  # Ensure Python float
+                
+                # Calculate percent of uncertain pixels (std > threshold)
+                uncertainty_threshold = 0.2
+                uncertain_percent_tensor = (std_dev[0] > uncertainty_threshold).float().mean() * 100
+                uncertain_pixel_percent = float(uncertain_percent_tensor.item())  # Ensure Python float
+            else:
+                # Default values if not running uncertainty analysis
+                se = 0.0
+                uncertain_pixel_percent = 0.0
+                frac_removed = None
+                err_random = None
+                err_uncertainty = None
             
             # Calculate additional metrics
             max_calibration_error = float(np.max(np.abs(bin_accs - bin_confs)))
@@ -143,69 +178,107 @@ def analyze_dataset_uncertainty(model, dataset, args):
             metrics_dict = ensure_dict_python_scalars(metrics_dict)
             metrics_data.append(metrics_dict)
             
-            # Generate individual image report
+            # Generate individual image reports (conditional on analysis mode)
             img_output_dir = output_dir / "individual_reports"
             img_output_dir.mkdir(exist_ok=True)
             
-            # Create figure with reliability and sparsification plots
-            fig, axes = plt.subplots(1, 2, figsize=(16, 6))
-            
-            # Enhanced reliability plot
-            plot_reliability_diagram(bin_accs, bin_confs, bin_counts, ax=axes[0])
-            axes[0].set_title(f'Reliability Diagram (ECE={ece:.4f}, MCE={max_calibration_error:.4f})')
-            
-            # Enhanced sparsification plot
-            axes[1], se_value = plot_sparsification_curve(frac_removed, err_random, err_uncertainty, ax=axes[1])
-            axes[1].set_title(f'Sparsification Curve (Sparsification Error={se:.4f})')
-            
-            plt.suptitle(f'Image {img_id} (Dice={dice:.4f}, Brier={brier:.4f})')
-            plt.tight_layout()
-            plt.savefig(img_output_dir / f"{img_id}_uncertainty_metrics.png", dpi=200)
-            plt.close(fig)
-            
-            # Generate a more detailed analysis figure
-            fig, axes = plt.subplots(2, 2, figsize=(16, 12))
-            
-            # Show image, mask, and prediction
-            if hasattr(dataset, 'get_display_image'):
-                # If dataset has a method to get display-ready images
-                display_img, display_mask = dataset.get_display_image(img_id)
-                axes[0, 0].imshow(display_img)
-                axes[0, 1].imshow(display_mask, cmap='gray')
-            else:
-                # Just show placeholders
-                axes[0, 0].text(0.5, 0.5, "Original Image", 
-                             ha='center', va='center', transform=axes[0, 0].transAxes, fontsize=12)
-                axes[0, 1].text(0.5, 0.5, "Ground Truth Mask", 
-                             ha='center', va='center', transform=axes[0, 1].transAxes, fontsize=12)
+            # Generate individual calibration report
+            if args.calibration:
+                # Create calibration curve using scikit-learn
+                prob_true, prob_pred = calibration_curve(
+                    gt_flat, pred_flat, n_bins=10, strategy='uniform'
+                )
                 
-            # Show uncertainty map
-            im = axes[1, 0].imshow(std_dev[0].numpy(), cmap='hot')
-            plt.colorbar(im, ax=axes[1, 0], fraction=0.046, pad=0.04)
-            axes[1, 0].set_title(f'Uncertainty Map (Mean Std: {std_dev[0].mean().item():.4f})')
-            axes[1, 0].axis('off')
+                # Create individual calibration plots
+                fig, ax = plt.subplots(figsize=(8, 8))
+                
+                # Plot calibration curve
+                ax.plot(prob_pred, prob_true, marker='o', linewidth=2, 
+                       label=f'Calibration Curve (ECE={ece:.4f})')
+                
+                # Plot the diagonal (perfect calibration)
+                ax.plot([0, 1], [0, 1], 'k--', label='Perfect Calibration')
+                
+                # Add histogram of prediction confidences
+                ax2 = ax.twinx()
+                ax2.hist(pred_flat, bins=20, alpha=0.3, density=True, 
+                        color='gray', label='Prediction Distribution')
+                ax2.set_ylabel('Density')
+                
+                # Set labels and title
+                ax.set_xlabel('Mean Predicted Probability')
+                ax.set_ylabel('Fraction of Positives')
+                ax.set_title(f'Calibration Curve for Image {img_id}')
+                ax.legend(loc='upper left')
+                ax2.legend(loc='upper right')
+                ax.grid(True, alpha=0.3)
+                
+                plt.tight_layout()
+                plt.savefig(img_output_dir / f"{img_id}_calibration_curve.png", dpi=200)
+                plt.close(fig)
             
-            # Show areas of high uncertainty
-            # Create a mask showing where prediction is uncertain but wrong
-            pred_binary_np = pred_binary.numpy()
-            mask_np = mask_cpu[0, 0].numpy()
-            uncertain_mask = (std_dev[0].numpy() > uncertainty_threshold).astype(np.float32)
-            error_mask = (pred_binary_np != mask_np).astype(np.float32)
-            uncertain_errors = uncertain_mask * error_mask
-            
-            # Display this composite mask - red where both high uncertainty and errors
-            rgb_overlay = np.zeros((*uncertain_mask.shape, 3))
-            rgb_overlay[..., 0] = uncertain_mask  # Red channel = high uncertainty
-            rgb_overlay[..., 1] = error_mask      # Green channel = errors
-            
-            axes[1, 1].imshow(rgb_overlay)
-            axes[1, 1].set_title('Red: High Uncertainty, Green: Errors, Yellow: Both')
-            axes[1, 1].axis('off')
-            
-            plt.suptitle(f'Detailed Analysis for Image {img_id}', fontsize=16)
-            plt.tight_layout()
-            plt.savefig(img_output_dir / f"{img_id}_detailed_analysis.png", dpi=200)
-            plt.close(fig)
+            # Generate combined uncertainty metrics visualization
+            if args.uncertainty:
+                # Create figure with reliability and sparsification plots
+                fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+                
+                # Enhanced reliability plot
+                plot_reliability_diagram(bin_accs, bin_confs, bin_counts, ax=axes[0])
+                axes[0].set_title(f'Reliability Diagram (ECE={ece:.4f}, MCE={max_calibration_error:.4f})')
+                
+                # Enhanced sparsification plot
+                axes[1], se_value = plot_sparsification_curve(frac_removed, err_random, err_uncertainty, ax=axes[1])
+                axes[1].set_title(f'Sparsification Curve (Sparsification Error={se:.4f})')
+                
+                plt.suptitle(f'Image {img_id} (Dice={dice:.4f}, Brier={brier:.4f})')
+                plt.tight_layout()
+                plt.savefig(img_output_dir / f"{img_id}_uncertainty_metrics.png", dpi=200)
+                plt.close(fig)
+                
+                # Generate a more detailed analysis figure
+                fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+                
+                # Show image, mask, and prediction
+                if hasattr(dataset, 'get_display_image'):
+                    # If dataset has a method to get display-ready images
+                    display_img, display_mask = dataset.get_display_image(img_id)
+                    axes[0, 0].imshow(display_img)
+                    axes[0, 1].imshow(display_mask, cmap='gray')
+                else:
+                    # Just show placeholders
+                    axes[0, 0].text(0.5, 0.5, "Original Image", 
+                                 ha='center', va='center', transform=axes[0, 0].transAxes, fontsize=12)
+                    axes[0, 1].text(0.5, 0.5, "Ground Truth Mask", 
+                                 ha='center', va='center', transform=axes[0, 1].transAxes, fontsize=12)
+                    
+                # Show uncertainty map
+                im = axes[1, 0].imshow(std_dev[0].numpy(), cmap='hot')
+                plt.colorbar(im, ax=axes[1, 0], fraction=0.046, pad=0.04)
+                axes[1, 0].set_title(f'Uncertainty Map (Mean Std: {std_dev[0].mean().item():.4f})')
+                axes[1, 0].axis('off')
+                
+                # Show areas of high uncertainty
+                # Create a mask showing where prediction is uncertain but wrong
+                uncertainty_threshold = 0.2  # Define threshold for high uncertainty
+                pred_binary_np = pred_binary.numpy()
+                mask_np = mask_cpu[0, 0].numpy()
+                uncertain_mask = (std_dev[0].numpy() > uncertainty_threshold).astype(np.float32)
+                error_mask = (pred_binary_np != mask_np).astype(np.float32)
+                uncertain_errors = uncertain_mask * error_mask
+                
+                # Display this composite mask - red where both high uncertainty and errors
+                rgb_overlay = np.zeros((*uncertain_mask.shape, 3))
+                rgb_overlay[..., 0] = uncertain_mask  # Red channel = high uncertainty
+                rgb_overlay[..., 1] = error_mask      # Green channel = errors
+                
+                axes[1, 1].imshow(rgb_overlay)
+                axes[1, 1].set_title('Red: High Uncertainty, Green: Errors, Yellow: Both')
+                axes[1, 1].axis('off')
+                
+                plt.suptitle(f'Detailed Analysis for Image {img_id}', fontsize=16)
+                plt.tight_layout()
+                plt.savefig(img_output_dir / f"{img_id}_detailed_analysis.png", dpi=200)
+                plt.close(fig)
             
             # Free up memory
             del segmentations_cpu, mask_cpu, mean_pred, std_dev
@@ -220,7 +293,7 @@ def analyze_dataset_uncertainty(model, dataset, args):
         if args.max_images and len(processed_ids) >= args.max_images:
             break
     
-    # Create metrics dataframe and apply our tensor fixing utility
+    # Create metrics dataframe and apply tensor fixing utility
     metrics_df = pd.DataFrame(metrics_data)
     metrics_df = fix_dataframe_tensors(metrics_df)  # Extra safety check before visualization
     
@@ -232,62 +305,38 @@ def analyze_dataset_uncertainty(model, dataset, args):
             except Exception as e:
                 logging.warning(f"Could not convert column {col} to numeric: {e}")
     
-    metrics_csv_path = output_dir / "uncertainty_metrics.csv"
+    # Save metrics to CSV
+    metrics_csv_path = output_dir / "analysis_metrics.csv"
     metrics_df.to_csv(metrics_csv_path, index=False)
     logging.info(f"Saved metrics data to {metrics_csv_path}")
     
-    # Create summary visualizations
-    create_summary_visualizations(metrics_df, output_dir)
+    # Generate appropriate analysis reports based on enabled modes
+    if args.uncertainty:
+        create_uncertainty_visualizations(metrics_df, output_dir)
     
-    # At the end of function, add explanation text to console
-    print("\n" + "="*80)
-    print("UNCERTAINTY METRICS INTERPRETATION GUIDE".center(80))
-    print("="*80)
-    print("\nHere's how to interpret the visualizations created:")
+    if args.calibration:
+        create_calibration_visualizations(all_predictions, all_ground_truths, output_dir)
     
-    print("\n1. RELIABILITY DIAGRAMS (individual image reports)")
-    print("   - Show how well calibrated your model's probabilities are")
-    print("   - Blue bars should match green bars for perfect calibration")
-    print("   - ECE value of 0.005 is excellent - your model is well-calibrated!")
+    if args.temperature_sweep:
+        perform_temperature_analysis(all_predictions, all_ground_truths, output_dir, args.temp_values)
     
-    print("\n2. SPARSIFICATION CURVES (individual image reports)")
-    print("   - Show if uncertainty correlates with actual errors")
-    print("   - Red line below blue line (green area) means good uncertainty")
-    print("   - The red dot shows what fraction of pixels you need to remove to halve the error")
+    # Print summary statistics
+    logging.info("\nSummary Statistics:")
+    logging.info(f"Number of images analyzed: {len(metrics_df)}")
+    logging.info(f"Average Dice Score: {metrics_df['dice'].mean():.4f} ± {metrics_df['dice'].std():.4f}")
+    logging.info(f"Average ECE: {metrics_df['ece'].mean():.4f} ± {metrics_df['ece'].std():.4f}")
+    logging.info(f"Average Brier Score: {metrics_df['brier'].mean():.4f} ± {metrics_df['brier'].std():.4f}")
     
-    print("\n3. UNCERTAINTY SUMMARY (uncertainty_summary.png)")
-    print("   - Shows relationship between accuracy (Dice) and calibration (ECE)")
-    print("   - Shows distribution of uncertainty across all images")
-    print("   - Look for patterns in how uncertainty relates to segmentation quality")
+    if args.uncertainty:
+        logging.info(f"Average Sparsification Error: {metrics_df['sparsification_error'].mean():.4f} ± {metrics_df['sparsification_error'].std():.4f}")
+        logging.info(f"Average Uncertain Pixel %: {metrics_df['uncertain_pixel_percent'].mean():.2f}% ± {metrics_df['uncertain_pixel_percent'].std():.2f}%")
     
-    print("\n4. CORRELATION MATRIX (correlation_matrix.png)")
-    print("   - Shows how different metrics relate to each other")
-    print("   - Strong correlations (close to 1 or -1) indicate related metrics")
-    
-    print("\n5. CALIBRATION ANALYSIS (calibration_analysis.png)")
-    print("   - Shows pattern of calibration errors across different confidence levels")
-    print("   - Ideal models have large points in the bottom-left corner")
-    
-    print("\nCHECK THE PDF REPORT for detailed explanations of all visualizations.")
-    
-    print("\nOPTIMAL TEMPERATURE:")
-    print(f"   - Your model performs best with temperature T={args.temperature}")
-    if args.temperature > 1.0:
-        print("   - This suggests your model was slightly overconfident by default")
-        print("   - Higher temperature 'softens' the predictions appropriately")
-    elif args.temperature < 1.0:
-        print("   - This suggests your model was slightly underconfident by default")
-        print("   - Lower temperature makes predictions more confident")
-        
-    print("\nFor inference, use the following command with optimal temperature:")
-    print(f"   python inference.py --model {os.path.basename(args.model)} --lesion_type {args.lesion_type} --temperature {args.temperature}")
-    
-    print("\n" + "="*80 + "\n")
+    print_interpretation_guide(args)
     
     return metrics_df
 
-def create_summary_visualizations(metrics_df, output_dir):
-    """Create summary visualizations for uncertainty metrics with improved explanations."""
+def create_uncertainty_visualizations(metrics_df, output_dir):
+    """Create visualizations for uncertainty analysis."""
     # Set Seaborn style
     sns.set_style("whitegrid")
     plt.rcParams.update({'font.size': 11})
@@ -550,7 +599,7 @@ def create_summary_visualizations(metrics_df, output_dir):
     except Exception as e:
         logging.error(f"Error creating calibration analysis chart: {e}")
 
-    # Generate an explanation report in PDF format
+    # Generate detailed explanation PDF for uncertainty metrics
     create_explanation_report(metrics_df, output_dir)
 
 def create_explanation_report(metrics_df, output_dir):
@@ -723,6 +772,207 @@ def create_explanation_report(metrics_df, output_dir):
     
     logging.info(f"Created explanation report at {pdf_path}")
 
+def create_calibration_visualizations(all_predictions, all_ground_truths, output_dir):
+    """Create visualizations specifically for calibration analysis."""
+    if not all_predictions or not all_ground_truths:
+        logging.warning("No prediction data available for calibration analysis")
+        return
+        
+    # Concatenate all predictions and ground truths
+    all_pred_flat = np.concatenate(all_predictions)
+    all_gt_flat = np.concatenate(all_ground_truths)
+    
+    # Calculate global calibration curve
+    global_prob_true, global_prob_pred = calibration_curve(
+        all_gt_flat, all_pred_flat, n_bins=10, strategy='uniform'
+    )
+    
+    # Calculate global ECE
+    global_ece = np.sum(
+        np.abs(global_prob_true - global_prob_pred) * 
+        np.histogram(all_pred_flat, bins=10)[0] / len(all_pred_flat)
+    )
+    
+    # Create global calibration plot
+    fig, ax = plt.subplots(figsize=(10, 8))
+    
+    # Plot calibration curve
+    ax.plot(global_prob_pred, global_prob_true, marker='o', linewidth=2,
+           label=f'Calibration Curve (ECE={global_ece:.4f})')
+    
+    # Plot the diagonal (perfect calibration)
+    ax.plot([0, 1], [0, 1], 'k--', label='Perfect Calibration')
+    
+    # Add histogram of prediction confidences
+    ax2 = ax.twinx()
+    ax2.hist(all_pred_flat, bins=20, alpha=0.3, density=True,
+            color='gray', label='Prediction Distribution')
+    ax2.set_ylabel('Density')
+    
+    # Set labels and title
+    ax.set_xlabel('Mean Predicted Probability')
+    ax.set_ylabel('Fraction of Positives')
+    ax.set_title(f'Global Calibration Curve (All Images)')
+    ax.legend(loc='upper left')
+    ax2.legend(loc='upper right')
+    ax.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig(output_dir / "global_calibration_curve.png", dpi=200)
+    plt.close(fig)
+
+def perform_temperature_analysis(all_predictions, all_ground_truths, output_dir, temperatures):
+    """Analyze the effect of temperature on calibration."""
+    if not all_predictions or not all_ground_truths:
+        logging.warning("No prediction data available for temperature analysis")
+        return
+    
+    # Concatenate all predictions and ground truths
+    all_pred_flat = np.concatenate(all_predictions)
+    all_gt_flat = np.concatenate(all_ground_truths)
+    
+    # Temperature scaling analysis
+    ece_values = []
+    
+    for temp in temperatures:
+        # Apply temperature scaling
+        # Scale logits with temperature: logits / T
+        # which means we need to convert probabilities back to logits
+        # logits = log(p / (1-p))
+        # then scale and convert back
+        # p_scaled = sigmoid(logits / T)
+        # This simplifies to:
+        scaled_preds = 1 / (1 + np.exp(-(np.log(all_pred_flat / (1 - all_pred_flat + 1e-7)) / temp)))
+        
+        # Calculate ECE for this temperature
+        temp_prob_true, temp_prob_pred = calibration_curve(
+            all_gt_flat, scaled_preds, n_bins=10, strategy='uniform'
+        )
+        
+        temp_ece = np.sum(
+            np.abs(temp_prob_true - temp_prob_pred) * 
+            np.histogram(scaled_preds, bins=10)[0] / len(scaled_preds)
+        )
+        
+        ece_values.append(temp_ece)
+    
+    # Find optimal temperature (lowest ECE)
+    optimal_temp_idx = np.argmin(ece_values)
+    optimal_temp = temperatures[optimal_temp_idx]
+    optimal_ece = ece_values[optimal_temp_idx]
+    
+    # Plot ECE vs temperature
+    plt.figure(figsize=(10, 6))
+    plt.plot(temperatures, ece_values, marker='o', linewidth=2)
+    plt.axvline(optimal_temp, color='r', linestyle='--', 
+               label=f'Optimal T={optimal_temp:.2f}, ECE={optimal_ece:.4f}')
+    plt.xlabel('Temperature')
+    plt.ylabel('Expected Calibration Error (ECE)')
+    plt.title('Effect of Temperature on Calibration')
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(output_dir / "temperature_effect.png", dpi=200)
+    plt.close()
+    
+    # Create dataframe and save results
+    summary_df = pd.DataFrame({
+        'temperature': temperatures,
+        'ece': ece_values
+    })
+    summary_df.to_csv(output_dir / "temperature_scaling.csv", index=False)
+    
+    # Generate multi-temperature calibration curves
+    plt.figure(figsize=(12, 8))
+    
+    # Plot diagonal reference
+    plt.plot([0, 1], [0, 1], 'k--', label='Perfect Calibration')
+    
+    # Plot curves for selected temperatures
+    selected_temps = [temperatures[0], 1.0, optimal_temp, temperatures[-1]]
+    selected_temps = sorted(list(set(selected_temps)))  # Ensure no duplicates and order properly
+    
+    for temp in selected_temps:
+        # Skip if temp not in our temperature list
+        if temp not in temperatures:
+            continue
+            
+        # Get index of this temperature
+        temp_idx = temperatures.index(temp)
+        
+        # Apply temperature scaling
+        scaled_preds = 1 / (1 + np.exp(-(np.log(all_pred_flat / (1 - all_pred_flat + 1e-7)) / temp)))
+        
+        # Calculate calibration curve
+        temp_prob_true, temp_prob_pred = calibration_curve(
+            all_gt_flat, scaled_preds, n_bins=10, strategy='uniform'
+        )
+        
+        # Special formatting for optimal temperature
+        if temp == optimal_temp:
+            plt.plot(temp_prob_pred, temp_prob_true, marker='o', linewidth=3,
+                   label=f'T={temp:.2f} (Optimal, ECE={ece_values[temp_idx]:.4f})')
+        else:
+            plt.plot(temp_prob_pred, temp_prob_true, marker='o', linewidth=2,
+                   label=f'T={temp:.2f} (ECE={ece_values[temp_idx]:.4f})')
+    
+    plt.xlabel('Predicted Probability')
+    plt.ylabel('Observed Frequency')
+    plt.title('Effect of Temperature on Calibration Curves')
+    plt.grid(True, alpha=0.3)
+    plt.legend(loc='lower right')
+    plt.tight_layout()
+    plt.savefig(output_dir / "temperature_calibration_curves.png", dpi=200)
+    plt.close()
+    
+    # Log the recommendation
+    logging.info(f"TEMPERATURE ANALYSIS RESULTS:")
+    logging.info(f"Optimal temperature: T={optimal_temp:.2f} (ECE={optimal_ece:.4f})")
+    if optimal_temp > 1.0:
+        logging.info(f"Model is likely overconfident at default temperature (T=1.0)")
+    elif optimal_temp < 1.0:
+        logging.info(f"Model is likely underconfident at default temperature (T=1.0)")
+    else:
+        logging.info(f"Default temperature (T=1.0) is optimal")
+    
+    return optimal_temp, optimal_ece
+
+def print_interpretation_guide(args):
+    """Print a guide for interpreting the analysis results."""
+    print("\n" + "="*80)
+    print("ANALYSIS RESULTS INTERPRETATION GUIDE".center(80))
+    print("="*80)
+    
+    if args.uncertainty:
+        print("\n1. UNCERTAINTY ANALYSIS")
+        print("   - Reliability diagrams show if your model's probabilities match actual frequencies")
+        print("   - Blue bars should match green bars closely for well-calibrated models")
+        print("   - Sparsification curves show if uncertainty estimates correlate with errors")
+        print("   - Green area (red line below blue) means good uncertainty estimates")
+        print("   - The red dot shows what fraction of pixels to remove to halve the error")
+    
+    if args.calibration:
+        print("\n2. CALIBRATION ANALYSIS")
+        print("   - Calibration curves show if predicted probabilities match observed frequencies")
+        print("   - Closer to the diagonal line means better calibration")
+        print("   - ECE values under 0.01 are excellent, 0.01-0.05 good, 0.05-0.15 fair, >0.15 poor")
+    
+    if args.temperature_sweep:
+        print("\n3. TEMPERATURE ANALYSIS")
+        print("   - Temperature scaling can improve calibration without affecting rankings")
+        print("   - Higher temperatures (T>1) reduce overconfidence")
+        print("   - Lower temperatures (T<1) reduce underconfidence")
+        print("   - The optimal temperature minimizes calibration error (ECE)")
+    
+    # Provide inference recommendation
+    if args.temperature_sweep:
+        print("\nFor optimal calibration in production, use:")
+        # Get the optimal temperature (this information would need to be available)
+        print(f"   python inference.py --model {os.path.basename(args.model)} --lesion_type {args.lesion_type} --temperature T_OPT")
+        print("   where T_OPT is the optimal temperature shown in temperature_effect.png")
+    
+    print("\n" + "="*80 + "\n")
+
 if __name__ == '__main__':
     # Set up logging
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -757,14 +1007,5 @@ if __name__ == '__main__':
     
     logging.info(f'Found {len(test_dataset)} test items')
     
-    # Run analysis
-    metrics_df = analyze_dataset_uncertainty(model, test_dataset, args)
-    
-    # Print summary statistics
-    logging.info("\nSummary Statistics:")
-    logging.info(f"Number of images analyzed: {len(metrics_df)}")
-    logging.info(f"Average Dice Score: {metrics_df['dice'].mean():.4f} ± {metrics_df['dice'].std():.4f}")
-    logging.info(f"Average ECE: {metrics_df['ece'].mean():.4f} ± {metrics_df['ece'].std():.4f}")
-    logging.info(f"Average Brier Score: {metrics_df['brier'].mean():.4f} ± {metrics_df['brier'].std():.4f}")
-    logging.info(f"Average Sparsification Error: {metrics_df['sparsification_error'].mean():.4f} ± {metrics_df['sparsification_error'].std():.4f}")
-    logging.info(f"Average Uncertain Pixel %: {metrics_df['uncertain_pixel_percent'].mean():.2f}% ± {metrics_df['uncertain_pixel_percent'].std():.2f}%")
+    # Run unified analysis
+    metrics_df = analyze_model(model, test_dataset, args)
