@@ -3,6 +3,7 @@ import numpy as np
 import torch.nn.functional as F
 import logging
 from typing import Dict, List, Tuple, Union, Optional
+from tqdm import tqdm
 
 def sample_from_latent(mu: torch.Tensor, logvar: torch.Tensor, 
                       temperature: float = 1.0) -> torch.Tensor:
@@ -12,92 +13,83 @@ def sample_from_latent(mu: torch.Tensor, logvar: torch.Tensor,
     return mu + eps * std
 
 def encode_images(model, images):
-    """Extract mu and logvar from model in a consistent way."""
-    # First try the (seg_output, mu, logvar) tuple pattern
+    """Extract mean and log variance from input images."""
+    model.eval()
     with torch.no_grad():
-        outputs = model(images)
+        # Get encoder features
+        features = model.encoder(images)
+        x_enc = features[-1]
         
-        if isinstance(outputs, tuple) and len(outputs) == 3:
-            # Model returns (seg_output, mu, logvar)
-            _, mu, logvar = outputs
-            return mu, logvar
+        # Extract latent distribution parameters
+        mu = model.mu_head(x_enc).squeeze(-1).squeeze(-1)  # Shape: [B, latent_dim]
+        logvar = model.logvar_head(x_enc).squeeze(-1).squeeze(-1)  # Shape: [B, latent_dim]
         
-        # Try using encoder + mu_head/logvar_head pattern
-        try:
-            features = model.encoder(images)
-            mu = model.mu_head(features)
-            logvar = model.logvar_head(features)
-            return mu, logvar
-        except (AttributeError, TypeError):
-            # Last attempt: maybe the model has a dedicated encode method
-            try:
-                return model.encode(images)
-            except AttributeError:
-                raise ValueError("Model doesn't provide a standard way to extract mu and logvar.")
+    return mu, logvar
 
-# Update this function in utils/vae_utils.py
-def generate_predictions(model, images, temperature=1.0, num_samples=1, 
-                        return_all=False, patch_size=None, overlap=None):
-    """Generate multiple predictions by sampling from the latent space with temperature control."""
+def generate_predictions(model, images, temperature=1.0, num_samples=10):
+    """
+    Generate multiple predictions from the VAE model and average them.
+    
+    Args:
+        model: The VAE-UNet model
+        images: Input images tensor [B, C, H, W]
+        temperature: Temperature for sampling (higher = more diversity)
+        num_samples: Number of predictions to generate and average
+        
+    Returns:
+        Average prediction after sigmoid [B, 1, H, W]
+    """
+    model.eval()
     device = images.device
-    input_size = images.shape[2:]
+    B, C, H, W = images.shape
+    
+    # Initialize tensor to accumulate predictions
+    accumulated_preds = torch.zeros((B, 1, H, W), device=device)
     
     # Get latent distribution parameters
-    mu, logvar = encode_images(model, images)
-    
-    # Generate samples
-    all_preds = []
-    
-    for _ in range(num_samples):
-        # Sample latent vector with temperature
-        z = sample_from_latent(mu, logvar, temperature)
-        z_spatial = z.unsqueeze(-1).unsqueeze(-1)  # [B, latent_dim, 1, 1]
+    with torch.no_grad():
+        mu, logvar = encode_images(model, images)
         
-        # Generate prediction
-        with torch.no_grad():
-            # For VAE-UNet model
-            features = model.encoder(images)
-            x_enc = features[-1]
+        # Generate multiple samples
+        for _ in range(num_samples):
+            # Sample from latent space with temperature
+            std = torch.exp(0.5 * logvar) * temperature
+            eps = torch.randn_like(std)
+            z = mu + eps * std
             
-            # Interpolate z to match encoder output size
-            z_resized = F.interpolate(z_spatial, size=x_enc.shape[2:], 
-                                     mode='bilinear', align_corners=True)
+            # Add spatial dimensions for the decoder
+            z = z.unsqueeze(-1).unsqueeze(-1)  # [B, latent_dim, 1, 1]
+            
+            # Get encoder features again
+            features = model.encoder(images)
+            
+            # Initial size matches the smallest encoder feature
+            initial_size = features[-1].shape[2:]
+            z_full = F.interpolate(z, size=initial_size, mode='bilinear', align_corners=True)
             
             # Initial projection
-            x = model.z_initial(z_resized)
+            x = model.z_initial(z_full)
             
-            # Decode with z injection
+            # Decode with z injection at each stage
             for k, decoder_block in enumerate(model.decoder_blocks):
                 skip = features[-(k+2)] if k < len(features)-1 else None
-                x = decoder_block(x, skip, z_resized)
+                x = decoder_block(x, skip, z_full)
             
-            # Final conv 
+            # Final conv and resize
             pred = model.final_conv(x)
             
-            # Ensure prediction has the same shape as input
-            if pred.shape[2:] != input_size:
-                pred = F.interpolate(pred, size=input_size, 
-                                    mode='bilinear', align_corners=False)
+            # Ensure output size matches input size
+            if pred.shape[2:] != (H, W):
+                pred = F.interpolate(pred, size=(H, W), mode='bilinear', align_corners=True)
             
-            # Apply sigmoid for final prediction
+            # Apply sigmoid for probability
             pred = torch.sigmoid(pred)
             
-        all_preds.append(pred.detach())  # Use detach to free computation graph
-        
-        # Free memory after each sample
-        torch.cuda.empty_cache()
+            # Accumulate prediction
+            accumulated_preds += pred
     
-    # Stack all predictions
-    all_preds = torch.stack(all_preds)
-    
-    if return_all:
-        return {
-            'mean': torch.mean(all_preds, dim=0),
-            'samples': all_preds,
-            'std': torch.std(all_preds, dim=0)
-        }
-    else:
-        return torch.mean(all_preds, dim=0)
+    # Average the predictions
+    return accumulated_preds / num_samples
 
 def generate_ensemble_prediction(model, image, temps=[0.5, 1.0, 2.0, 3.0], 
                                samples_per_temp=5, weighted=True,
@@ -170,3 +162,55 @@ def resize_or_patch_image(model, image):
         return resized, (orig_h, orig_w)
     
     return image, (orig_h, orig_w)
+
+def kl_with_free_bits(mu, logvar, free_bits=1e-4):
+    """
+    Compute KL divergence with free bits to prevent posterior collapse.
+    
+    Args:
+        mu: Mean vector
+        logvar: Log variance vector
+        free_bits: Minimum value for KL per dimension
+    """
+    # Standard KL calculation
+    kl_per_dim = 0.5 * (mu.pow(2) + logvar.exp() - logvar - 1)
+    
+    # Apply free bits: max(free_bits, kl_i) for each dimension
+    if free_bits > 0:
+        kl_per_dim = torch.max(kl_per_dim, torch.tensor(free_bits, device=kl_per_dim.device))
+    
+    # Sum across latent dimensions
+    kl_loss = kl_per_dim.sum(dim=1).mean()
+    return kl_loss
+
+class KLAnnealer:
+    """
+    Anneals the KL weight over time to prevent posterior collapse.
+    """
+    def __init__(self, kl_start=0.0, kl_end=1.0, warmup_epochs=10, strategy='linear'):
+        self.kl_start = kl_start
+        self.kl_end = kl_end
+        self.warmup_epochs = warmup_epochs
+        self.strategy = strategy
+        
+    def get_weight(self, epoch, batch=None, num_batches=None):
+        if self.strategy == 'constant':
+            return self.kl_end
+            
+        if batch is not None and num_batches is not None:
+            # Batch-level annealing within each epoch
+            progress = (epoch + batch / num_batches) / self.warmup_epochs
+        else:
+            # Epoch-level annealing
+            progress = epoch / self.warmup_epochs
+            
+        progress = min(progress, 1.0)
+        
+        if self.strategy == 'linear':
+            return self.kl_start + progress * (self.kl_end - self.kl_start)
+        elif self.strategy == 'cyclical':
+            # Cycle between min and max values
+            cycle_progress = progress % 1.0
+            return self.kl_start + cycle_progress * (self.kl_end - self.kl_start)
+        else:
+            return self.kl_end

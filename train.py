@@ -20,8 +20,9 @@ from evaluate import evaluate
 from unet import UNet
 from unet.unet_resnet import UNetResNet
 from utils.data_loading import IDRIDDataset
-from utils.loss import CombinedLoss
+from utils.loss import CombinedLoss, MAFocalLoss, MASegmentationLoss, KLAnnealer, kl_with_free_bits
 import numpy as np
+
 
 # Add CUDA error handling
 if torch.cuda.is_available():
@@ -104,7 +105,9 @@ def train_model(
         lesion_type: str = 'EX',
         backbone: str = 'resnet34',
         pretrained: bool = True,
-        beta: float = 0.1  # KL weight
+        beta: float = 0.1,  # KL weight
+        free_bits: float = 1e-3,  # Added free bits parameter
+        kl_anneal_epochs: int = 20  # Added KL annealing epochs
 ):
     # Clear cache at start and set memory limits for better management
     if torch.cuda.is_available():
@@ -234,17 +237,39 @@ Initial GPU Status:
         Pretrained:      {pretrained}
     ''')
 
-    # Use combined loss function with balanced weights
-    criterion = CombinedLoss()
-    optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-5)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, 
-        mode='max',
-        patience=5,
-        min_lr=1e-6,
-        verbose=True,
-        factor=0.5
-    )
+    # Use specialized loss for Microaneurysms
+    if lesion_type == 'MA':
+        criterion = MASegmentationLoss(class_weight=0.9)
+        logging.info(f"Using specialized Microaneurysm loss with class weight 0.9")
+    else:
+        criterion = CombinedLoss()
+    
+    # Initialize KL annealer
+    kl_annealer = KLAnnealer(kl_start=0.0, kl_end=beta, warmup_epochs=kl_anneal_epochs)
+    
+    # Use a more gentle learning rate scheduler for microaneurysms
+    if lesion_type == 'MA':
+        optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-5)
+        # Use ReduceLROnPlateau with more patience and smaller factor
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, 
+            mode='max',
+            patience=8,  # More patience
+            min_lr=1e-5,
+            verbose=True,
+            factor=0.7  # More gentle reduction (0.7 instead of 0.5)
+        )
+        logging.info(f"Using gentle learning rate schedule for Microaneurysms")
+    else:
+        optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-5)
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, 
+            mode='max',
+            patience=5,
+            min_lr=1e-6,
+            verbose=True,
+            factor=0.5
+        )
     grad_scaler = torch.amp.GradScaler(enabled=amp)
     global_step = 0
 
@@ -280,6 +305,10 @@ Initial GPU Status:
         epoch_loss = 0
         optimizer.zero_grad(set_to_none=True)
 
+        # Get current KL weight (beta) from annealer
+        current_beta = kl_annealer.get_weight(epoch)
+        logging.info(f"Epoch {epoch}: KL weight (beta): {current_beta:.6f}")
+
         with tqdm(total=len(train_loader), desc=f'Epoch {epoch}/{epochs}', unit='batch') as pbar:
             for batch_idx, batch in enumerate(train_loader):
                 # All tensors will have the same shape now, so no need for special handling
@@ -293,13 +322,11 @@ Initial GPU Status:
                     # Compute reconstruction loss (dice + BCE)
                     recon_loss = criterion(seg_output, masks)
                     
-                    # Compute KL divergence loss
-                    kl_loss = 0.5 * torch.sum(
-                        torch.exp(logvar) + mu**2 - 1.0 - logvar
-                    ) / (mu.size(0) * mu.size(1))  # Normalize by batch size and latent dim
+                    # Compute KL divergence loss with free bits
+                    kl_loss = kl_with_free_bits(mu, logvar, free_bits=free_bits)
                     
-                    # Combine losses
-                    loss = recon_loss + beta * kl_loss
+                    # Use current annealed beta value
+                    loss = recon_loss + current_beta * kl_loss
                     
                     # Scale loss for gradient accumulation
                     loss = loss / gradient_accumulation_steps
@@ -322,6 +349,7 @@ Initial GPU Status:
                     wandb.log({
                         'train/total_loss': loss.item(),
                         'train/kl_loss': kl_loss.item(),
+                        'train/kl_weight': current_beta,
                         'train/reconstruction_loss': recon_loss.item(),
                         'step': global_step,
                         'epoch': epoch
@@ -483,6 +511,10 @@ def get_args():
                     help='Enable attention mechanism when skip connections are enabled (default)')
     parser.add_argument('--no-attention', dest='use_attention', action='store_false',
                     help='Disable attention mechanism but keep skip connections enabled')
+    parser.add_argument('--kl-anneal-epochs', type=int, default=20, 
+                      help='Number of epochs for KL annealing')
+    parser.add_argument('--free-bits', type=float, default=1e-3,
+                      help='Free bits parameter to prevent posterior collapse')
     parser.set_defaults(use_attention=True, use_skip=True)
     return parser.parse_args()
 
@@ -535,7 +567,9 @@ if __name__ == '__main__':
             lesion_type=args.lesion_type,
             backbone='resnet34',
             pretrained=True,
-            beta=0.1
+            beta=0.1,
+            free_bits=args.free_bits,
+            kl_anneal_epochs=args.kl_anneal_epochs
         )
     except torch.cuda.OutOfMemoryError:
         logging.error('Detected OutOfMemoryError! '

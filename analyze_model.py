@@ -127,6 +127,10 @@ def analyze_model(model, dataset, args):
             if args.calibration or args.temperature_sweep:
                 pred_flat = mean_pred[0].flatten().numpy()
                 gt_flat = mask_cpu[0, 0].flatten().numpy()
+                
+                # Fix for calibration curve - ensure ground truth is exactly 0 or 1
+                gt_flat = np.round(gt_flat).astype(int)
+                
                 all_predictions.append(pred_flat)
                 all_ground_truths.append(gt_flat)
             
@@ -781,6 +785,9 @@ def create_calibration_visualizations(all_predictions, all_ground_truths, output
     # Concatenate all predictions and ground truths
     all_pred_flat = np.concatenate(all_predictions)
     all_gt_flat = np.concatenate(all_ground_truths)
+    
+    # Ensure ground truth values are exactly 0 or 1 for calibration curve
+    all_gt_flat = np.round(all_gt_flat).astype(int)
     
     # Calculate global calibration curve
     global_prob_true, global_prob_pred = calibration_curve(
