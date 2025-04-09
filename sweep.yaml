@@ -1,0 +1,46 @@
+method: bayes
+metric:
+  goal: minimize
+  name: val/loss
+parameters:
+  amp:
+    distribution: categorical
+    values:
+      - "true"
+  batch-size:
+    distribution: int_uniform
+    max: 8
+    min: 2
+  classes:
+    distribution: int_uniform
+    max: 2
+    min: 1
+  epochs:
+    distribution: int_uniform
+    max: 200
+    min: 1
+  scale:
+    distribution: uniform
+    max: 2
+    min: 0.25
+  learning-rate:
+    distribution: uniform
+    max: 0.005
+    min: 5e-05
+  lesion-type:
+    distribution: categorical
+    values:
+      - EX
+  patch-size:
+    distribution: int_uniform
+    max: 700
+    min: 300
+  free-bits:
+    distribution: uniform
+    max: 0.01
+    min: 0.0001
+  kl-anneal-epochs:
+    distribution: int_uniform
+    max: 40
+    min: 5
+program: train.py

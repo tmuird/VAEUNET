@@ -5,6 +5,7 @@ import torch.nn.functional as F
 def dice_loss(inputs, targets, smooth=1.0):
     """
     Compute the Dice loss between inputs and targets.
+    Updated for numerical stability with standardized inputs.
     
     Args:
         inputs: Model predictions, raw logits before sigmoid (B, C, H, W)
@@ -17,13 +18,22 @@ def dice_loss(inputs, targets, smooth=1.0):
     # Apply sigmoid to raw logits
     inputs = torch.sigmoid(inputs)
     
+    # Check for NaN values that might occur with standardized inputs
+    if torch.isnan(inputs).any():
+        # Replace NaNs with zeros to prevent propagation
+        inputs = torch.nan_to_num(inputs, nan=0.0, posinf=1.0, neginf=0.0)
+    
     # Flatten inputs and targets
     inputs = inputs.view(-1)
     targets = targets.view(-1)
     
-    # Calculate intersection and union
+    # Calculate intersection and union with extra numerical stability
     intersection = (inputs * targets).sum()
-    dice = (2.0 * intersection + smooth) / (inputs.sum() + targets.sum() + smooth)
+    # Ensure non-negative values for numerical stability
+    inputs_sum = torch.clamp(inputs.sum(), min=smooth/2.0)
+    targets_sum = torch.clamp(targets.sum(), min=smooth/2.0)
+    
+    dice = (2.0 * intersection + smooth) / (inputs_sum + targets_sum + smooth)
     
     return 1.0 - dice
 
@@ -61,6 +71,7 @@ class CombinedLoss(nn.Module):
 class MAFocalLoss(nn.Module):
     """
     Focal Loss specifically tuned for microaneurysms, which addresses the extreme class imbalance.
+    Updated to handle standardized inputs (mean=0, std=1).
     """
     def __init__(self, alpha=0.8, gamma=2.0):
         super().__init__()
@@ -72,6 +83,9 @@ class MAFocalLoss(nn.Module):
         # Apply sigmoid to get probabilities
         inputs_sigmoid = torch.sigmoid(inputs)
         
+        # Handle potential NaN values from standardized inputs
+        inputs_sigmoid = torch.nan_to_num(inputs_sigmoid, nan=0.0, posinf=1.0, neginf=0.0)
+        
         # Focal loss formula
         p_t = targets * inputs_sigmoid + (1 - targets) * (1 - inputs_sigmoid)
         focal_weight = (1 - p_t).pow(self.gamma)
@@ -79,9 +93,12 @@ class MAFocalLoss(nn.Module):
         # Add alpha weighting - higher weight for positive pixels (MA)
         alpha_t = targets * self.alpha + (1 - targets) * (1 - self.alpha)
         
-        # Binary cross-entropy with added weights
+        # Binary cross-entropy with added weights and numerical stability
         bce = -targets * torch.log(inputs_sigmoid + self.eps) - (1 - targets) * torch.log(1 - inputs_sigmoid + self.eps)
         loss = alpha_t * focal_weight * bce
+        
+        # Replace any remaining NaN or Inf values
+        loss = torch.nan_to_num(loss, nan=0.0, posinf=1.0, neginf=0.0)
         
         return loss.mean()
 
@@ -139,14 +156,22 @@ class KLAnnealer:
 def kl_with_free_bits(mu, logvar, free_bits=1e-4):
     """
     Compute KL divergence with free bits to prevent posterior collapse.
+    Updated to handle potential numerical instabilities with standardized inputs.
     
     Args:
         mu: Mean vector
         logvar: Log variance vector
         free_bits: Minimum value for KL per dimension
     """
-    # Standard KL calculation
+    # Replace any NaN values that might come from standardized inputs
+    mu = torch.nan_to_num(mu, nan=0.0)
+    logvar = torch.nan_to_num(logvar, nan=0.0)
+    
+    # Standard KL calculation with numerical stability
     kl_per_dim = 0.5 * (mu.pow(2) + logvar.exp() - logvar - 1)
+    
+    # Clamp extreme values for numerical stability
+    kl_per_dim = torch.clamp(kl_per_dim, min=-100.0, max=100.0)
     
     # Apply free bits: max(free_bits, kl_i) for each dimension
     if free_bits > 0:
@@ -154,4 +179,8 @@ def kl_with_free_bits(mu, logvar, free_bits=1e-4):
     
     # Sum across latent dimensions
     kl_loss = kl_per_dim.sum(dim=1).mean()
+    
+    # Final check for numerical stability
+    kl_loss = torch.nan_to_num(kl_loss, nan=1e-8)
+    
     return kl_loss

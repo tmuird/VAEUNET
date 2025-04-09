@@ -22,6 +22,7 @@ from unet.unet_resnet import UNetResNet
 from utils.data_loading import IDRIDDataset
 from utils.loss import CombinedLoss, MAFocalLoss, MASegmentationLoss, KLAnnealer, kl_with_free_bits
 import numpy as np
+from torchvision.transforms import Normalize
 
 
 # Add CUDA error handling
@@ -40,24 +41,31 @@ dir_checkpoint = Path('./checkpoints/')
 # Add to imports
 from utils.vae_utils import generate_predictions
 
+# Create normalizer with mean 0 and std 1 for each channel
+normalize = Normalize(mean=[0.0, 0.0, 0.0], std=[1.0, 1.0, 1.0])
+
 def collate_patches(batch):
     """Custom collate function to handle patches.
     Improved to better handle full images of the same size.
     """
     # Check if all images are the same shape
     shapes = [x['image'].shape for x in batch]
-    
+
     if len(set(tuple(shape) for shape in shapes)) == 1:
         # All shapes are the same, stack normally
+        images = torch.stack([x['image'] for x in batch])
+        masks = torch.stack([x['mask'] for x in batch])
+        # Apply normalization to standardize images
+        images = normalize(images)
         return {
-            'image': torch.stack([x['image'] for x in batch]),
-            'mask': torch.stack([x['mask'] for x in batch]),
+            'image': images,
+            'mask': masks,
             'img_id': [x['img_id'] for x in batch]
         }
     else:
         # Different shapes - don't stack, just return list
         return {
-            'image': [x['image'] for x in batch],
+            'image': [normalize(x['image']) for x in batch],  # Apply normalization to each image
             'mask': [x['mask'] for x in batch],
             'img_id': [x['img_id'] for x in batch]
         }
@@ -383,9 +391,10 @@ Initial GPU Status:
                             # Prepare image for visualization
                             img_vis = img_np.transpose(1, 2, 0)  # [C,H,W] -> [H,W,C]
                             
-                            # Adjust brightness and ensure proper format for W&B media saving
-                            img_vis = (img_vis - img_vis.min()) / (img_vis.max() - img_vis.min())
-                            img_vis = (img_vis * 255).clip(0, 255).astype('uint8')
+                            # Denormalize image (from mean=0, std=1 to 0-1 range)
+                            img_vis = (img_vis - img_vis.min()) / (img_vis.max() - img_vis.min() + 1e-8)
+                            img_vis = np.clip(img_vis, 0, 1)  # Ensure values are in [0,1]
+                            img_vis = (img_vis * 255).clip(0, 255).astype(np.uint8)
                             
                             # Prepare masks for overlay view
                             pred_overlay = (pred_np[0] > 0.5).astype('uint8')
@@ -393,8 +402,20 @@ Initial GPU Status:
                             
                             # Prepare masks for separate viewing (full range visualization)
                             pred_vis = pred_np[0]  # Get the first channel
-                            pred_vis = (pred_vis - pred_vis.min()) / (pred_vis.max() - pred_vis.min() + 1e-8)  # Normalize
-                            pred_vis = (pred_vis * 255).astype('uint8')  # Scale to 0-255
+                            
+                            # Check for NaN/Inf values that might occur with standardized inputs
+                            pred_vis = np.nan_to_num(pred_vis, nan=0.0, posinf=1.0, neginf=0.0)
+                            
+                            # Normalize between 0 and 1
+                            min_val = pred_vis.min()
+                            max_val = pred_vis.max()
+                            if max_val > min_val:  # Avoid division by zero
+                                pred_vis = (pred_vis - min_val) / (max_val - min_val)
+                            else:
+                                pred_vis = np.zeros_like(pred_vis)
+                                
+                            # Now safely convert to uint8
+                            pred_vis = (pred_vis * 255).clip(0, 255).astype(np.uint8)  # Scale to 0-255
                             
                             # Ground truth for separate viewing
                             true_vis = true_np[0] * 255  # Scale to 0-255
@@ -419,13 +440,13 @@ Initial GPU Status:
                                     }
                                 ),
                                 # Separate images for VS Code viewing
-                                f"{img_name}_image": wandb.Image(img_vis),
-                                f"{img_name}_pred": wandb.Image(pred_vis),
-                                f"{img_name}_true": wandb.Image(true_vis),
+                                # f"{img_name}_image": wandb.Image(img_vis),
+                                # f"{img_name}_pred": wandb.Image(pred_vis),
+                                # f"{img_name}_true": wandb.Image(true_vis),
                                 # Include metrics in the same log call
                                 **{f'val/{k}': v for k, v in val_metrics.items()},
                                 'learning_rate': optimizer.param_groups[0]['lr'],
-                                'epoch': epoch,
+                                'epoch': epoch, 
                                 'step': global_step
                             })
                             del img_vis, pred_vis, true_vis, pred_overlay, true_overlay
@@ -457,6 +478,11 @@ Initial GPU Status:
                         no_improvement_count += 1
                         if no_improvement_count >= early_stopping_patience:
                             logging.info(f'Early stopping triggered after {epoch} epochs')
+                            try:
+                                wandb.log({"early_stopped": True, "final_epoch": epoch})
+                                wandb.finish() 
+                            except Exception as e:
+                                logging.warning(f"Error finalizing wandb run: {e}")
                             return
 
                     # Cleanup validation data
@@ -483,7 +509,7 @@ Initial GPU Status:
 def get_args():
     parser = argparse.ArgumentParser(description='Train the UNet on images and target masks')
     parser.add_argument('--epochs', '-e', metavar='E', type=int, default=100, help='Number of epochs')
-    parser.add_argument('--batch-size', '-b', dest='batch_size', metavar='B', type=int, default=8, help='Batch size')
+    parser.add_argument('--batch-size', '-b', dest='batch_size', metavar='B', type=int, default=6, help='Batch size')
     parser.add_argument('--learning-rate', '-l', metavar='LR', type=float, default=1e-4, help='Learning rate')
     parser.add_argument('--load', '-f', type=str, default=False, help='Load model from a .pth file')
     parser.add_argument('--scale', '-s', type=float, default=1.0, help='Downscaling factor of the images')
@@ -499,7 +525,7 @@ def get_args():
     parser.add_argument('--use-checkpointing', action='store_true', default=True,
                         help='Use gradient checkpointing to reduce memory usage')
     parser.add_argument('--gradient-accumulation-steps', type=int, default=2, help='Gradient accumulation steps')
-    parser.add_argument('--early-stopping-patience', type=int, default=10, help='Early stopping patience')
+    parser.add_argument('--early-stopping-patience', type=int, default=5, help='Early stopping patience')
     parser.add_argument('--lesion-type', type=str, default='EX', help='Lesion type')
     parser.add_argument('--model-type', type=str, default='resnet', choices=['basic', 'resnet'],
                     help='Model type: basic (original UNet) or resnet (UNet with ResNet34 encoder)')

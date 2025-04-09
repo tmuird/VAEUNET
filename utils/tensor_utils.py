@@ -117,3 +117,4 @@ def ensure_numeric_dataframe(df, exclude_cols=None):
                 print(f"Warning: could not convert column {col} to numeric. Error: {e}")
     
     return result
+

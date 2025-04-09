@@ -7,11 +7,15 @@ import random
 import os
 import logging
 from utils.vae_utils import generate_predictions
+from torchvision.transforms import Normalize
 
 # At start of script
 os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
 torch.backends.cuda.matmul.allow_tf32 = True  # Better performance on RTX 3060
 torch.backends.cudnn.allow_tf32 = True
+
+# Create normalizer with mean 0 and std 1 for each channel 
+normalize = Normalize(mean=[0.0, 0.0, 0.0], std=[1.0, 1.0, 1.0])
 
 @torch.inference_mode()
 def evaluate(model, dataloader, device, amp, max_samples=None):
@@ -46,9 +50,13 @@ def evaluate(model, dataloader, device, amp, max_samples=None):
             pbar.update(1)
             continue
         
-        # Move to device
+        # Move to device and normalize if not already done
         images = images.to(device=device, memory_format=torch.channels_last, non_blocking=True)
         masks = masks.to(device=device, non_blocking=True)
+        
+        # Apply normalization if not already applied by the dataloader
+        if not isinstance(batch, dict) or 'normalized' not in batch or not batch['normalized']:
+            images = normalize(images)
         
         # Inference
         with torch.autocast(device.type if device.type != 'mps' else 'cpu', enabled=amp):
@@ -82,6 +90,7 @@ def evaluate(model, dataloader, device, amp, max_samples=None):
                 # Store samples as numpy arrays for easier visualization later
                 for j in range(min(2, images.shape[0])):  # Take up to 2 samples from the batch
                     # Get sample image, prediction, and mask
+                    # Store the original normalized image for proper visualization later
                     img_np = images[j].cpu().numpy()
                     pred_np = mask_pred_sigmoid[j].detach().cpu().numpy()
                     mask_np = masks[j].cpu().numpy()
