@@ -24,7 +24,7 @@ from utils.loss import CombinedLoss, MAFocalLoss, MASegmentationLoss, KLAnnealer
 import numpy as np
 from torchvision.transforms import Normalize
 from utils.vae_utils import generate_predictions, calculate_latent_stats
-
+import datetime
 
 # Add CUDA error handling
 if torch.cuda.is_available():
@@ -41,6 +41,54 @@ dir_checkpoint = Path('./checkpoints/')
 
 # Create normalizer with mean 0 and std 1 for each channel
 normalize = Normalize(mean=[0.0, 0.0, 0.0], std=[1.0, 1.0, 1.0])
+
+def get_checkpoint_path(
+    lesion_type: str,
+    model_type: str,
+    use_attention: bool,
+    img_scale: float,
+    patch_size: Optional[int],
+    beta: float,
+    free_bits: float,
+    kl_anneal_epochs: int,
+    latent_injection: str = None,
+    learning_rate: float = None
+) -> Path:
+    """
+    Create a structured checkpoint directory path based on model parameters.
+    
+    Returns:
+        Path: Directory path for saving model checkpoints
+    """
+    # Format the patch size for the folder name
+    patch_str = f"patch{patch_size}" if patch_size is not None else "full_img"
+    
+    # Format scale with precision appropriate for the value
+    if img_scale == int(img_scale):
+        scale_str = f"scale{int(img_scale)}"
+    else:
+        scale_str = f"scale{img_scale:.1f}"
+    
+    # Create folder components
+    attention_str = "attn" if use_attention else "no_attn"
+    
+    # Create KL parameters string
+    kl_str = f"beta{beta:.4f}" if beta > 0 else "noKL"
+    if free_bits > 0:
+        kl_str += f"_fb{free_bits:.4f}"
+    if kl_anneal_epochs > 0:
+        kl_str += f"_anneal{kl_anneal_epochs}"
+    
+    # Add latent injection flag if used
+    latent_str = f"_latent{latent_injection}" if latent_injection and latent_injection != "none" else ""
+    
+    # Add learning rate if specified
+    lr_str = f"_lr{learning_rate}" if learning_rate is not None else ""
+    
+    # Combine all components for the directory name
+    dir_name = f"{lesion_type}_{model_type}_{attention_str}_{scale_str}_{patch_str}_{kl_str}{latent_str}{lr_str}"
+    
+    return dir_checkpoint / dir_name
 
 def collate_patches(batch):
     """Custom collate function to handle patches.
@@ -468,18 +516,67 @@ Initial GPU Status:
                     if val_score > best_val_score:
                         best_val_score = val_score
                         if save_checkpoint:
-                            Path(dir_checkpoint).mkdir(parents=True, exist_ok=True)
-                            checkpoint_path = str(dir_checkpoint / f'best_model.pth')
-                            torch.save({
+                            # Create structured checkpoint directory based on parameters
+                            model_type = 'resnet' if hasattr(model, 'backbone') else 'basic'
+                            use_attention = hasattr(model, 'use_attention') and model.use_attention
+                            latent_injection = getattr(model, 'latent_injection', None)
+                            
+                            # Generate structured checkpoint path
+                            checkpoint_dir = get_checkpoint_path(
+                                lesion_type=lesion_type,
+                                model_type=model_type,
+                                use_attention=use_attention,
+                                img_scale=img_scale,
+                                patch_size=patch_size,
+                                beta=beta,
+                                free_bits=free_bits,
+                                kl_anneal_epochs=kl_anneal_epochs,
+                                latent_injection=latent_injection,
+                                learning_rate=learning_rate
+                            )
+                            
+                            # Create directory if it doesn't exist
+                            checkpoint_dir.mkdir(parents=True, exist_ok=True)
+                            
+                            # Generate timestamp for filename
+                            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M")
+                            
+                            # Create checkpoint filename with timestamp, epoch and performance
+                            model_filename = f"model_{timestamp}_ep{epoch}_dice{val_score:.4f}.pth"
+                            checkpoint_path = checkpoint_dir / model_filename
+                            
+                            # Also save as best_model.pth in same directory for compatibility
+                            best_model_path = checkpoint_dir / "best_model.pth"
+                            
+                            # Create checkpoint data with comprehensive metadata
+                            checkpoint_data = {
                                 'epoch': epoch,
                                 'model_state_dict': model.state_dict(),
                                 'optimizer_state_dict': optimizer.state_dict(),
                                 'scheduler_state_dict': scheduler.state_dict(),
                                 'best_val_score': best_val_score,
                                 'amp_scaler': grad_scaler.state_dict(),
-                                'global_step': global_step
-                            }, checkpoint_path)
-                            logging.info(f'New best model saved! (Dice: {val_score:.4f})')
+                                'global_step': global_step,
+                                # Save model parameters for easier identification later
+                                'params': {
+                                    'lesion_type': lesion_type,
+                                    'model_type': model_type,
+                                    'use_attention': use_attention,
+                                    'img_scale': img_scale,
+                                    'patch_size': patch_size,
+                                    'beta': beta,
+                                    'free_bits': free_bits,
+                                    'kl_anneal_epochs': kl_anneal_epochs,
+                                    'latent_injection': latent_injection,
+                                }
+                            }
+                            
+                            # Save both the timestamped file and best_model.pth
+                            torch.save(checkpoint_data, checkpoint_path)
+                            torch.save(checkpoint_data, best_model_path)
+                            
+                            logging.info(f'New best model saved to {checkpoint_path}')
+                            logging.info(f'Also saved as {best_model_path}')
                         no_improvement_count = 0
                     else:
                         no_improvement_count += 1

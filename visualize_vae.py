@@ -247,6 +247,9 @@ def get_args():
     parser.add_argument('--batch_size', type=int, default=4,
                         help='Batch size for patch processing (default: 4)')
     parser.set_defaults(use_attention=True, enable_dropout=False)
+    parser.add_argument('--latent-injection', type=str, default='all', 
+                        choices=['all', 'first', 'last', 'bottleneck', 'none'],
+                        help='Latent space injection strategy: inject at all levels, only first, only last, only bottleneck, or none')
     return parser.parse_args()
 
 def predict_with_patches(model, img, z, patch_size=512, overlap=None, batch_size=4):
@@ -1202,7 +1205,7 @@ if __name__ == '__main__':
     
     # Load your trained model
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model = UNetResNet(n_channels=3, n_classes=1, latent_dim=32, use_attention=args.use_attention)
+    model = UNetResNet(n_channels=3, n_classes=1, latent_dim=32, use_attention=args.use_attention, latent_injection=args.latent_injection)  
     
     # Load the trained weights
     logging.info(f'Loading model {args.model}')
