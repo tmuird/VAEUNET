@@ -7,3 +7,6 @@ venv/
 wandb/
 data/patches/
 *.identifier
+*.jpg
+*.png
+*.jpeg

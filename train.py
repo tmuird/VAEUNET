@@ -113,8 +113,8 @@ def train_model(
         lesion_type: str = 'EX',
         backbone: str = 'resnet34',
         pretrained: bool = True,
-        beta: float = 0.1,  # KL weight
-        free_bits: float = 1e-3,  # Added free bits parameter
+        beta: float = 0.01,  # KL weight
+        free_bits: float = 1e-2,  # Added free bits parameter
         kl_anneal_epochs: int = 20  # Added KL annealing epochs
 ):
     # Clear cache at start and set memory limits for better management
@@ -593,7 +593,7 @@ if __name__ == '__main__':
             lesion_type=args.lesion_type,
             backbone='resnet34',
             pretrained=True,
-            beta=0.1,
+            beta=0.01,
             free_bits=args.free_bits,
             kl_anneal_epochs=args.kl_anneal_epochs
         )
@@ -618,5 +618,5 @@ if __name__ == '__main__':
             lesion_type=args.lesion_type,
             backbone='resnet34',
             pretrained=True,
-            beta=0.1
+            beta=0.01
         )
