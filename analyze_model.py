@@ -30,6 +30,8 @@ def get_args():
     parser.add_argument('--model', '-m', default='best_model.pth', metavar='FILE', help='Model file')
     parser.add_argument('--lesion_type', type=str, required=True, default='EX', 
                       choices=['EX', 'HE', 'MA','OD'], help='Lesion type')
+    parser.add_argument('--attention', dest='use_attention', action='store_true', help='Enable attention mechanism (default)')
+    parser.add_argument('--no-attention', dest='use_attention', action='store_false', help='Disable attention mechanism')
     parser.add_argument('--temperature', type=float, default=1.0, help='Temperature for sampling')
     parser.add_argument('--samples', type=int, default=30, help='Number of samples for ensemble prediction')
     parser.add_argument('--patch_size', type=int, default=512, help='Patch size (0 for full image)')
@@ -47,7 +49,7 @@ def get_args():
     parser.add_argument('--temp_values', type=float, nargs='+', 
                        default=[0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 3.0],
                        help='Temperature values to analyze')
-    
+    parser.set_defaults(use_attention=True, enable_dropout=False)
     args = parser.parse_args()
     
     # If no analysis flag is set, enable all by default
@@ -992,7 +994,7 @@ if __name__ == '__main__':
     
     # Load model
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model = UNetResNet(n_channels=3, n_classes=1, latent_dim=32, use_attention=True)
+    model = UNetResNet(n_channels=3, n_classes=1, latent_dim=32, use_attention=args.use_attention)
     
     logging.info(f'Loading model {args.model}')
     model_path = Path(f'./checkpoints/{args.model}')

@@ -23,6 +23,7 @@ from utils.data_loading import IDRIDDataset
 from utils.loss import CombinedLoss, MAFocalLoss, MASegmentationLoss, KLAnnealer, kl_with_free_bits
 import numpy as np
 from torchvision.transforms import Normalize
+from utils.vae_utils import generate_predictions, calculate_latent_stats
 
 
 # Add CUDA error handling
@@ -37,9 +38,6 @@ if torch.cuda.is_available():
 dir_img = Path('./data/imgs/')
 dir_mask = Path('./data/masks/')
 dir_checkpoint = Path('./checkpoints/')
-
-# Add to imports
-from utils.vae_utils import generate_predictions
 
 # Create normalizer with mean 0 and std 1 for each channel
 normalize = Normalize(mean=[0.0, 0.0, 0.0], std=[1.0, 1.0, 1.0])
@@ -317,6 +315,10 @@ Initial GPU Status:
         current_beta = kl_annealer.get_weight(epoch)
         logging.info(f"Epoch {epoch}: KL weight (beta): {current_beta:.6f}")
 
+        # For latent space monitoring
+        epoch_mu = []
+        epoch_logvar = []
+
         with tqdm(total=len(train_loader), desc=f'Epoch {epoch}/{epochs}', unit='batch') as pbar:
             for batch_idx, batch in enumerate(train_loader):
                 # All tensors will have the same shape now, so no need for special handling
@@ -326,6 +328,11 @@ Initial GPU Status:
                 with torch.autocast(device.type if device.type != 'mps' else 'cpu', enabled=amp):
                     # Get model outputs
                     seg_output, mu, logvar = model(images)
+                    
+                    # Store latent variables for monitoring
+                    if batch_idx % 5 == 0:  # Sample every 5 batches to avoid memory issues
+                        epoch_mu.append(mu.detach().cpu())
+                        epoch_logvar.append(logvar.detach().cpu())
                     
                     # Compute reconstruction loss (dice + BCE)
                     recon_loss = criterion(seg_output, masks)
@@ -494,6 +501,35 @@ Initial GPU Status:
                 if batch_idx % 5 == 0:  # Every 5 batches
                     torch.cuda.empty_cache()
 
+        # End of epoch: analyze latent space
+        if epoch_mu:  # If we collected some latent variables
+            try:
+                # Concatenate all collected latent variables
+                all_mu = torch.cat(epoch_mu, dim=0)
+                all_logvar = torch.cat(epoch_logvar, dim=0)
+                
+                # Calculate latent stats
+                latent_stats = calculate_latent_stats(all_mu, all_logvar)
+                
+                # Log to wandb
+                wandb.log({
+                    'latent/active_dims': latent_stats['active_dims'],
+                    'latent/activity_ratio': latent_stats['activity_ratio'],
+                    'latent/total_kl': latent_stats['total_kl'],
+                    'latent/mean_mu_abs': latent_stats['mean_mu_abs'],
+                    'latent/mean_var': latent_stats['mean_var'],
+                    'epoch': epoch
+                })
+                
+                # Log to console
+                logging.info(f"Latent space stats: Active dims {latent_stats['active_dims']}/{latent_stats['total_dims']} ({latent_stats['activity_ratio']:.2f}), Total KL: {latent_stats['total_kl']:.4f}")
+            except Exception as e:
+                logging.warning(f"Error calculating latent stats: {e}")
+                
+            # Clean up
+            del epoch_mu, epoch_logvar, all_mu, all_logvar
+            torch.cuda.empty_cache()
+
         # End of epoch validation and cleanup
         # Safely clean up training variables
         for var in ['images', 'masks', 'seg_output', 'loss']:
@@ -541,6 +577,9 @@ def get_args():
                       help='Number of epochs for KL annealing')
     parser.add_argument('--free-bits', type=float, default=1e-3,
                       help='Free bits parameter to prevent posterior collapse')
+    parser.add_argument('--latent-injection', type=str, default='all', 
+                        choices=['all', 'first', 'last', 'bottleneck', 'none'],
+                        help='Latent space injection strategy: inject at all levels, only first, only last, only bottleneck, or none')
     parser.set_defaults(use_attention=True, use_skip=True)
     return parser.parse_args()
 
@@ -560,7 +599,8 @@ if __name__ == '__main__':
             backbone='resnet34',
             pretrained=True,
             use_attention=args.use_attention,
-            use_skip=args.use_skip
+            use_skip=args.use_skip,
+            latent_injection=args.latent_injection  # Add the new parameter
         )
     else:
         model = UNet(

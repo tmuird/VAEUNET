@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import timm
+
 class AttentionGate(nn.Module):
     def __init__(self, F_g, F_l, F_int):
         super().__init__()
@@ -28,29 +29,39 @@ class AttentionGate(nn.Module):
         return x * psi
 
 class DecoderBlock(nn.Module):
-    def __init__(self, in_channels, skip_channels, out_channels, latent_dim, use_attention=True, use_skip=True):
+    def __init__(self, in_channels, skip_channels, out_channels, latent_dim, use_attention=True, use_skip=True, use_latent=True):
         super().__init__()
-        # Project latent vector to match spatial dimensions
-        self.z_proj = nn.Sequential(
-            nn.Conv2d(latent_dim, latent_dim, 1),
-            nn.BatchNorm2d(latent_dim),
-            nn.ReLU(inplace=True)
-        )
+        # Project latent vector to match spatial dimensions (only create if used)
+        self.use_latent = use_latent
+        if use_latent:
+            self.z_proj = nn.Sequential(
+                nn.Conv2d(latent_dim, latent_dim, 1),
+                nn.BatchNorm2d(latent_dim),
+                nn.ReLU(inplace=True)
+            )
         
         self.use_skip = use_skip
         # Attention can only be enabled if skip connections are enabled
         self.use_attention = use_attention and use_skip
         
-        # Attention gate now takes into account the additional latent channels
+        # Attention gate (only create if used)
         if self.use_attention:
             self.attention = AttentionGate(in_channels, skip_channels, in_channels//4)
         
-        # Convolutions now take additional latent_dim channels from z
+        # Calculate input channels for first convolution based on what's being used
+        input_channels = in_channels
+        if use_skip:
+            input_channels += skip_channels
+        if use_latent:
+            input_channels += latent_dim
+            
+        # Convolution layers
         self.conv1 = nn.Sequential(
-            nn.Conv2d(in_channels + skip_channels + latent_dim, out_channels, 3, padding=1, bias=False),
+            nn.Conv2d(input_channels, out_channels, 3, padding=1, bias=False),
             nn.BatchNorm2d(out_channels),
             nn.ReLU(inplace=True)
         )
+        
         self.conv2 = nn.Sequential(
             nn.Conv2d(out_channels, out_channels, 3, padding=1, bias=False),
             nn.BatchNorm2d(out_channels),
@@ -67,32 +78,52 @@ class DecoderBlock(nn.Module):
         # Upsample x to match skip connection size
         x = F.interpolate(x, size=output_size, mode='bilinear', align_corners=True)
         
-        # Project z to current spatial dimensions
-        z_proj = F.interpolate(z, size=output_size, mode='bilinear', align_corners=True)
-        z_proj = self.z_proj(z_proj)
+        # Prepare components for concatenation
+        components = [x]
         
-        if skip is not None:
+        # Add skip connection if used
+        if skip is not None and self.use_skip:
             # Apply attention if enabled
             if self.use_attention:
                 skip = self.attention(x, skip)
-            # Use skip connection if enabled
-            if self.use_skip:
-                x = torch.cat([x, skip, z_proj], dim=1)
-            else:
-                x = torch.cat([x, z_proj], dim=1)
-        else:
-            x = torch.cat([x, z_proj], dim=1)
-            
+            components.append(skip)
+        
+        # Add latent injection if used
+        if self.use_latent:
+            z_proj = F.interpolate(z, size=output_size, mode='bilinear', align_corners=True)
+            z_proj = self.z_proj(z_proj)
+            components.append(z_proj)
+        
+        # Concatenate all components and apply convolutions
+        x = torch.cat(components, dim=1)
         x = self.conv1(x)
         x = self.conv2(x)
         return x
 
 class UNetResNet(nn.Module):
-    def __init__(self, n_channels, n_classes, backbone='resnet34', pretrained=True, latent_dim=32, use_attention=True, use_skip=True):
+    def __init__(self, n_channels, n_classes, backbone='resnet34', pretrained=True, latent_dim=32, 
+                 use_attention=True, use_skip=True, latent_injection='all'):
+        """
+        Args:
+            n_channels: Number of input channels
+            n_classes: Number of output classes
+            backbone: ResNet backbone to use
+            pretrained: Whether to use pretrained weights
+            latent_dim: Latent space dimensionality
+            use_attention: Whether to use attention gates
+            use_skip: Whether to use skip connections
+            latent_injection: Strategy for latent space injection
+                - 'all': Inject at all decoder levels (default)
+                - 'first': Inject only at the first decoder level
+                - 'bottleneck': Inject only at the bottleneck (no decoder injection)
+                - 'none': No latent injection at all
+                - list of ints: Inject at specified decoder levels (0-based index)
+        """
         super().__init__()
         self.n_channels = n_channels
         self.n_classes = n_classes
         self.latent_dim = latent_dim
+        self.latent_injection = latent_injection
         
         # Load pretrained backbone
         self.encoder = timm.create_model(
@@ -120,15 +151,34 @@ class UNetResNet(nn.Module):
             nn.ReLU(inplace=True)
         )
         
-        # Decoder blocks now take latent_dim and skip parameters
+        # Determine which decoder blocks should use latent space
+        if isinstance(latent_injection, list):
+            # Specific levels defined by list
+            use_latent_list = [i in latent_injection for i in range(4)]
+        elif latent_injection == 'all':
+            use_latent_list = [True, True, True, True]
+        elif latent_injection == 'first':
+            use_latent_list = [True, False, False, False]
+        elif latent_injection == 'last':
+            use_latent_list = [False, False, False, True]
+        elif latent_injection == 'bottleneck' or latent_injection == 'none':
+            use_latent_list = [False, False, False, False]
+        else:
+            # Default to all
+            use_latent_list = [True, True, True, True]
+            
+        # Whether to use bottleneck injection
+        self.use_bottleneck = latent_injection != 'none'
+            
+        # Decoder blocks with parameterized latent injection
         self.use_skip = use_skip
-        # Attention can only be enabled if skip connections are enabled
         self.use_attention = use_attention and use_skip
+        
         self.decoder_blocks = nn.ModuleList([
-            DecoderBlock(512, encoder_channels[-2], 512, latent_dim, use_attention, use_skip),
-            DecoderBlock(512, encoder_channels[-3], 256, latent_dim, use_attention, use_skip),
-            DecoderBlock(256, encoder_channels[-4], 128, latent_dim, use_attention, use_skip),
-            DecoderBlock(128, encoder_channels[0], 64, latent_dim, use_attention, use_skip)
+            DecoderBlock(512, encoder_channels[-2], 512, latent_dim, use_attention, use_skip, use_latent_list[0]),
+            DecoderBlock(512, encoder_channels[-3], 256, latent_dim, use_attention, use_skip, use_latent_list[1]),
+            DecoderBlock(256, encoder_channels[-4], 128, latent_dim, use_attention, use_skip, use_latent_list[2]),
+            DecoderBlock(128, encoder_channels[0], 64, latent_dim, use_attention, use_skip, use_latent_list[3])
         ])
         
         # Final conv
@@ -147,24 +197,31 @@ class UNetResNet(nn.Module):
         features = self.encoder(x)
         
         # Get latent variables from bottleneck
-        x = features[-1]
-        mu = self.mu_head(x).squeeze(-1).squeeze(-1)  # Shape: [B, latent_dim]
-        logvar = self.logvar_head(x).squeeze(-1).squeeze(-1)  # Shape: [B, latent_dim]
+        x_enc = features[-1]
+        mu = self.mu_head(x_enc).squeeze(-1).squeeze(-1)  # Shape: [B, latent_dim]
+        logvar = self.logvar_head(x_enc).squeeze(-1).squeeze(-1)  # Shape: [B, latent_dim]
         
         # Reparameterize
         z = self.reparameterize(mu, logvar)  # Shape: [B, latent_dim]
         
-        # Reshape z to spatial dimensions and initial projection
+        # Reshape z to spatial dimensions
         z = z.unsqueeze(-1).unsqueeze(-1)  # [B, latent_dim, 1, 1]
         
         # Initial feature size matches the smallest encoder feature
         initial_size = features[-1].shape[2:]
         z_spatial = F.interpolate(z, size=initial_size, mode='bilinear', align_corners=True)
-        x = self.z_initial(z_spatial)
         
-        # Decoder with z injection at each stage
+        # Apply bottleneck processing based on injection strategy
+        if self.use_bottleneck:
+            # Use latent for bottleneck
+            x = self.z_initial(z_spatial)
+        else:
+            # No latent injection at bottleneck - use encoder features directly
+            x = features[-1]
+        
+        # Decoder with conditional z injection at each stage
         for i, decoder_block in enumerate(self.decoder_blocks):
-            skip = features[-(i+2)] if i < len(features)-1 else None
+            skip = features[-(i+2)] if i < len(features)-1 and self.use_skip else None
             x = decoder_block(x, skip, z_spatial)
         
         # Final conv and ensure output size matches input size
@@ -191,11 +248,18 @@ class UNetResNet(nn.Module):
         z = z.unsqueeze(-1).unsqueeze(-1)  # [B, latent_dim, 1, 1]
         initial_size = features[-1].shape[2:]
         z_spatial = F.interpolate(z, size=initial_size, mode='bilinear', align_corners=True)
-        x = self.z_initial(z_spatial)
         
-        # Decode
+        # Apply bottleneck processing based on injection strategy
+        if self.use_bottleneck:
+            # Use latent for bottleneck
+            x = self.z_initial(z_spatial)
+        else:
+            # For 'none' mode, we still need a starting point, use encoder features with channel padding
+            x = torch.zeros(z.size(0), 512, initial_size[0], initial_size[1], device=z.device)
+        
+        # Decode with conditional z injection
         for i, decoder_block in enumerate(self.decoder_blocks):
-            skip = features[-(i+2)] if i < len(features)-1 else None
+            skip = features[-(i+2)] if i < len(features)-1 and self.use_skip else None
             x = decoder_block(x, skip, z_spatial)
         
         # Final conv and optional resize
