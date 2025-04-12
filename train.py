@@ -537,7 +537,7 @@ Initial GPU Status:
                             
                             # Create directory if it doesn't exist
                             checkpoint_dir.mkdir(parents=True, exist_ok=True)
-                            
+                            logging.info(f"Checkpoint directory: {checkpoint_dir}")
                             # Generate timestamp for filename
                             timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M")
                             
@@ -575,7 +575,7 @@ Initial GPU Status:
                             torch.save(checkpoint_data, checkpoint_path)
                             torch.save(checkpoint_data, best_model_path)
                             
-                            logging.info(f'New best model saved to {checkpoint_path}')
+                            logging.info(f'New best model with dice score {val_score:.4f} saved')
                             logging.info(f'Also saved as {best_model_path}')
                         no_improvement_count = 0
                     else:
