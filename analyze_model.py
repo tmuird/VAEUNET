@@ -9,6 +9,7 @@ from tqdm import tqdm
 import pandas as pd
 import seaborn as sns
 from sklearn.calibration import calibration_curve
+from sklearn.metrics import roc_curve, precision_recall_curve, auc
 import matplotlib.gridspec as gridspec
 from textwrap import wrap
 
@@ -19,10 +20,105 @@ from utils.uncertainty_metrics import (
     brier_score,
     calculate_sparsification_metrics,
     plot_reliability_diagram,
-    plot_sparsification_curve
+    plot_sparsification_curve,
+    calculate_uncertainty_error_auc
 )
 from utils.tensor_utils import ensure_dict_python_scalars, fix_dataframe_tensors
 from visualize_vae import get_segmentation_distribution, track_memory
+
+##############################################################################
+# Additional helper functions for global AUROC / AUPRC plotting,
+# plus storing & plotting data from multiple images / models
+##############################################################################
+def plot_global_roc_pr(
+    all_errors, 
+    all_uncertainties,
+    output_dir,
+    model_label="Model",
+    prefix=""
+):
+    """
+    Plots the global AUROC and AUPRC curves for pixel-level uncertainty vs. errors.
+    Saves plots into output_dir with optional prefix appended to filenames.
+
+    Args:
+        all_errors: 1D numpy array of shape (N_pixels,) with 0/1 for correct/incorrect
+        all_uncertainties: 1D numpy array of shape (N_pixels,) with continuous uncertainty
+        output_dir: Path to output directory
+        model_label: e.g. 'High-KL Model'
+        prefix: optional string to prepend to filenames, e.g. "global_" => "global_roc.png"
+    """
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Compute ROC
+    fpr, tpr, _ = roc_curve(all_errors, all_uncertainties)
+    roc_auc = auc(fpr, tpr)
+
+    # Compute PR
+    precision, recall, _ = precision_recall_curve(all_errors, all_uncertainties)
+    prc_auc = auc(recall, precision)
+
+    # Plot ROC
+    plt.figure(figsize=(6,6))
+    plt.plot(fpr, tpr, label=f'{model_label} (AUC={roc_auc:.4f})', lw=2)
+    plt.plot([0,1],[0,1],'k--', label='Chance')
+    plt.xlabel('False Positive Rate')
+    plt.ylabel('True Positive Rate')
+    plt.title(f'Global ROC Curve ({model_label})')
+    plt.legend(loc='lower right')
+    plt.grid(alpha=0.3)
+    out_roc = output_dir / f"{prefix}roc_curve.png"
+    plt.savefig(out_roc, dpi=300, bbox_inches='tight')
+    plt.close()
+
+    # Plot PR
+    plt.figure(figsize=(6,6))
+    plt.plot(recall, precision, label=f'{model_label} (AUC={prc_auc:.4f})', lw=2)
+    baseline = np.sum(all_errors) / (len(all_errors)+1e-9)  # fraction of positives
+    plt.plot([0,1],[baseline, baseline],'k--', label=f'Chance={baseline:.3f}')
+    plt.xlabel('Recall')
+    plt.ylabel('Precision')
+    plt.title(f'Global Precision-Recall Curve ({model_label})')
+    plt.legend(loc='lower left')
+    plt.grid(alpha=0.3)
+    out_pr = output_dir / f"{prefix}pr_curve.png"
+    plt.savefig(out_pr, dpi=300, bbox_inches='tight')
+    plt.close()
+
+    logging.info(f"Global ROC/AUPR plots saved: {out_roc}, {out_pr}")
+    logging.info(f"Global AUROC={roc_auc:.4f}, AUPRC={prc_auc:.4f}")
+
+
+def store_sparsification_data(save_path, model_spars_data):
+    """
+    Saves the per-image sparsification data to a numpy file (or pickled file).
+    model_spars_data: list of dicts, each with:
+      {
+        'img_id': str,
+        'frac_removed': np.array,
+        'err_random': np.array,
+        'err_uncertainty': np.array
+      }
+    """
+    np.save(save_path, model_spars_data, allow_pickle=True)
+    logging.info(f"Stored sparsification data to {save_path}")
+
+def store_uncertainty_data(save_path, model_uncert_data):
+    """
+    Saves the correct vs. incorrect pixel uncertainty data to disk.
+    model_uncert_data: list of dicts, each with:
+      {
+        'img_id': str,
+        'uncertainties_correct': np.array,
+        'uncertainties_incorrect': np.array
+      }
+    """
+    np.save(save_path, model_uncert_data, allow_pickle=True)
+    logging.info(f"Stored uncertainty data to {save_path}")
+
+##############################################################################
+
 
 def get_args():
     parser = argparse.ArgumentParser(description='Analyze model performance, calibration and uncertainty')
@@ -51,6 +147,15 @@ def get_args():
     parser.add_argument('--latent-injection', type=str, default='all', 
                         choices=['all', 'first', 'last', 'bottleneck', 'none'],
                         help='Latent space injection strategy: inject at all levels, only first, only last, only bottleneck, or none')
+    
+    # Additional flags to control new features
+    parser.add_argument('--plot_roc_pr', action='store_true',
+                        help='If set, plot global pixel-level ROC and PR curves based on uncertainties')
+    parser.add_argument('--store_data', action='store_true',
+                        help='If set, store per-image sparsification and uncertainty arrays to disk for later comparisons')
+    parser.add_argument('--model_label', type=str, default='Model',
+                        help='Label to use when plotting ROC/PR (e.g. "High-KL")')
+    
     parser.set_defaults(use_attention=True, enable_dropout=False)
     args = parser.parse_args()
     
@@ -66,9 +171,12 @@ def get_args():
         
     return args
 
+
 @track_memory
 def analyze_model(model, dataset, args):
-    """Unified analysis function that handles both uncertainty and calibration analysis."""
+    """Unified analysis function that handles both uncertainty and calibration analysis,
+       also storing per-image data for later comparisons, and optionally plotting
+       global pixel-level ROC/PR curves."""
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model.eval()
     
@@ -81,17 +189,20 @@ def analyze_model(model, dataset, args):
     all_predictions = []
     all_ground_truths = []
     
-    # Process each image only once (avoid duplicates from patches)
+    # Additional data structures for advanced comparisons
+    model_sparsification_data = []  # for storing (frac_removed, err_random, err_uncertainty) per image
+    model_uncert_data = []          # for storing correct vs. incorrect pixel uncertainties
+    global_errors = []              # global arrays to plot ROC/PR
+    global_uncertainties = []
+
     processed_ids = set()
     
     for i in tqdm(range(len(dataset)), desc="Analyzing images"):
         sample = dataset[i]
         img_id = sample['img_id']
         
-        # Skip if already processed
         if img_id in processed_ids:
             continue
-            
         processed_ids.add(img_id)
         logging.info(f"Processing image {img_id}")
         
@@ -104,85 +215,95 @@ def analyze_model(model, dataset, args):
                 batch_size=args.batch_size
             )
             
-            # Move to CPU to save GPU memory
+            # Move to CPU
             segmentations_cpu = segmentations.cpu()
             mask_cpu = mask.cpu()
             
-            # Calculate mean prediction
+            # Mean, std
             mean_pred = segmentations_cpu.mean(dim=0)
             std_dev = segmentations_cpu.std(dim=0)
             
-            # Calculate calibration metrics
+            # Calibration metrics
             ece, bin_accs, bin_confs, bin_counts = calculate_expected_calibration_error(
                 mean_pred[0], mask_cpu[0, 0]
             )
-            
-            # Calculate Brier score
             brier = brier_score(mean_pred[0], mask_cpu[0, 0])
-            
-            # Calculate Dice score - ensure proper conversion to Python scalar
             pred_binary = (mean_pred[0] > 0.5).float()
-            dice_tensor = (2.0 * (pred_binary * mask_cpu[0, 0]).sum()) / (
-                pred_binary.sum() + mask_cpu[0, 0].sum() + 1e-8
-            )
-            dice = float(dice_tensor.item())  # Explicitly convert to Python float
+            dice_tensor = (2.0*(pred_binary*mask_cpu[0,0]).sum())/(pred_binary.sum()+mask_cpu[0,0].sum()+1e-8)
+            dice = float(dice_tensor.item())
             
-            # Store flattened predictions and ground truth for global calibration analysis
             if args.calibration or args.temperature_sweep:
                 pred_flat = mean_pred[0].flatten().numpy()
-                gt_flat = mask_cpu[0, 0].flatten().numpy()
-                
-                # Fix for calibration curve - ensure ground truth is exactly 0 or 1
+                gt_flat = mask_cpu[0,0].flatten().numpy()
                 gt_flat = np.round(gt_flat).astype(int)
-                
                 all_predictions.append(pred_flat)
                 all_ground_truths.append(gt_flat)
             
-            # Calculate sparsification metrics (only if uncertainty analysis is enabled)
+            # Uncertainty
             if args.uncertainty:
                 frac_removed, err_random, err_uncertainty = calculate_sparsification_metrics(
-                    mean_pred, std_dev, mask_cpu[:, 0], num_points=20
+                    mean_pred, std_dev, mask_cpu[:,0], num_points=20
                 )
-                
-                # Calculate sparsification error (area between curves)
-                if err_random[0] > 0:
-                    norm_random = err_random / err_random[0]
-                    norm_uncertainty = err_uncertainty / err_random[0]
+                if err_random[0]>0:
+                    norm_random = err_random/err_random[0]
+                    norm_uncertainty = err_uncertainty/err_random[0]
                 else:
                     norm_random = err_random
                     norm_uncertainty = err_uncertainty
-                    
-                se = float(np.trapz(norm_random - norm_uncertainty, frac_removed))  # Ensure Python float
-                
-                # Calculate percent of uncertain pixels (std > threshold)
+                se = float(np.trapz(norm_random - norm_uncertainty, frac_removed))
+
                 uncertainty_threshold = 0.2
-                uncertain_percent_tensor = (std_dev[0] > uncertainty_threshold).float().mean() * 100
-                uncertain_pixel_percent = float(uncertain_percent_tensor.item())  # Ensure Python float
+                uncertain_percent_tensor = (std_dev[0]>uncertainty_threshold).float().mean()*100
+                uncertain_pixel_percent = float(uncertain_percent_tensor.item())
+
+                # Store per-image data for later
+                model_sparsification_data.append({
+                    'img_id': img_id,
+                    'frac_removed': frac_removed,
+                    'err_random': err_random,
+                    'err_uncertainty': err_uncertainty
+                })
+
+                # Build correct vs. incorrect mask for boxplot
+                pred_binary_np = pred_binary.numpy()
+                gt_np = mask_cpu[0,0].numpy()
+                correct_mask = (pred_binary_np == gt_np)
+                incorrect_mask = ~correct_mask
+                # E.g. use std_dev for "uncertainty"
+                unc_map = std_dev[0].numpy()
+                
+                model_uncert_data.append({
+                    'img_id': img_id,
+                    'uncertainties_correct': unc_map[correct_mask],
+                    'uncertainties_incorrect': unc_map[incorrect_mask]
+                })
+
+                # For global ROC/PR, treat "uncertainty" as a detector of error
+                # Flatten
+                errors = (pred_binary_np != gt_np).astype(np.int32)
+                global_errors.append(errors)
+                global_uncertainties.append(unc_map.reshape(-1))
+
             else:
-                # Default values if not running uncertainty analysis
-                se = 0.0
-                uncertain_pixel_percent = 0.0
-                frac_removed = None
-                err_random = None
-                err_uncertainty = None
+                se=0.0
+                uncertain_pixel_percent=0.0
             
-            # Calculate additional metrics
             max_calibration_error = float(np.max(np.abs(bin_accs - bin_confs)))
             mean_abs_calib_error = float(np.mean(np.abs(bin_accs - bin_confs)))
+            auroc, auprc = calculate_uncertainty_error_auc(mean_pred[0], mask_cpu[0,0], std_dev[0])
             
-            # Create a metrics dictionary with explicit Python primitives
             metrics_dict = {
-                'img_id': str(img_id),  # Ensure string
-                'dice': dice,  # Already converted to float
-                'ece': ece,  # Already float from calculate_expected_calibration_error
-                'brier': brier,  # Already float from brier_score
-                'sparsification_error': se,  # Explicitly converted to float
-                'uncertain_pixel_percent': uncertain_pixel_percent,  # Explicitly converted to float
-                'max_calibration_error': max_calibration_error,  # Explicitly converted to float
-                'mean_abs_calib_error': mean_abs_calib_error  # Explicitly converted to float
+                'img_id': str(img_id),
+                'dice': dice,
+                'ece': ece,
+                'brier': brier,
+                'sparsification_error': se,
+                'uncertain_pixel_percent': uncertain_pixel_percent,
+                'max_calibration_error': max_calibration_error,
+                'mean_abs_calib_error': mean_abs_calib_error,
+                'error_auroc': auroc,
+                'error_auprc': auprc
             }
-            
-            # Double-check to ensure all values are primitive types
             metrics_dict = ensure_dict_python_scalars(metrics_dict)
             metrics_data.append(metrics_dict)
             
@@ -290,45 +411,53 @@ def analyze_model(model, dataset, args):
             
             # Free up memory
             del segmentations_cpu, mask_cpu, mean_pred, std_dev
-            
+        
         except Exception as e:
             logging.error(f"Error processing image {img_id}: {e}")
             import traceback
             traceback.print_exc()
             continue
         
-        # Break if we've processed enough images
-        if args.max_images and len(processed_ids) >= args.max_images:
+        if args.max_images and len(processed_ids)>=args.max_images:
             break
-    
-    # Create metrics dataframe and apply tensor fixing utility
+
+    # After the loop, build a metrics dataframe
     metrics_df = pd.DataFrame(metrics_data)
-    metrics_df = fix_dataframe_tensors(metrics_df)  # Extra safety check before visualization
-    
-    # Additional check: ensure all numeric columns are properly converted
+    metrics_df = fix_dataframe_tensors(metrics_df)
     for col in metrics_df.columns:
-        if col != 'img_id':  # Skip the image ID column
+        if col != 'img_id':
             try:
                 metrics_df[col] = pd.to_numeric(metrics_df[col], errors='coerce')
             except Exception as e:
-                logging.warning(f"Could not convert column {col} to numeric: {e}")
+                logging.warning(f"Could not convert {col} to numeric: {e}")
     
-    # Save metrics to CSV
+    # Save CSV
+    output_dir.mkdir(parents=True, exist_ok=True)
     metrics_csv_path = output_dir / "analysis_metrics.csv"
     metrics_df.to_csv(metrics_csv_path, index=False)
     logging.info(f"Saved metrics data to {metrics_csv_path}")
     
-    # Generate appropriate analysis reports based on enabled modes
+    # (Optionally) store the data for external comparison
+    if args.store_data and args.uncertainty:
+        store_sparsification_data(output_dir / "sparsification_data.npy", model_sparsification_data)
+        store_uncertainty_data(output_dir / "uncertainty_data.npy", model_uncert_data)
+
+    # Summaries
     if args.uncertainty:
         create_uncertainty_visualizations(metrics_df, output_dir)
-    
     if args.calibration:
         create_calibration_visualizations(all_predictions, all_ground_truths, output_dir)
-    
     if args.temperature_sweep:
         perform_temperature_analysis(all_predictions, all_ground_truths, output_dir, args.temp_values)
     
-    # Print summary statistics
+    # Plot global ROC/PR if requested
+    if args.plot_roc_pr and args.uncertainty:
+        if len(global_errors)>0:
+            all_err = np.concatenate(global_errors)
+            all_unc = np.concatenate(global_uncertainties)
+            plot_global_roc_pr(all_err, all_unc, output_dir, model_label=args.model_label, prefix="global_")
+    
+    # Log summary
     logging.info("\nSummary Statistics:")
     logging.info(f"Number of images analyzed: {len(metrics_df)}")
     logging.info(f"Average Dice Score: {metrics_df['dice'].mean():.4f} ± {metrics_df['dice'].std():.4f}")
@@ -340,8 +469,8 @@ def analyze_model(model, dataset, args):
         logging.info(f"Average Uncertain Pixel %: {metrics_df['uncertain_pixel_percent'].mean():.2f}% ± {metrics_df['uncertain_pixel_percent'].std():.2f}%")
     
     print_interpretation_guide(args)
-    
-    return metrics_df
+    return metrics_df, model_sparsification_data, model_uncert_data
+
 
 def create_uncertainty_visualizations(metrics_df, output_dir):
     """Create visualizations for uncertainty analysis."""
@@ -819,13 +948,17 @@ if __name__ == '__main__':
     
     args = get_args()
     
-    # Create output directory
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     
-    # Load model
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model = UNetResNet(n_channels=3, n_classes=1, latent_dim=32, use_attention=args.use_attention, latent_injection=args.latent_injection)
+    model = UNetResNet(
+        n_channels=3,
+        n_classes=1,
+        latent_dim=32,
+        use_attention=args.use_attention,
+        latent_injection=args.latent_injection
+    )
     
     logging.info(f'Loading model {args.model}')
     model_path = Path(f'./checkpoints/{args.model}')
@@ -833,7 +966,6 @@ if __name__ == '__main__':
     model.load_state_dict(checkpoint['model_state_dict'])
     model.to(device)
     
-    # Load dataset
     logging.info(f'Loading test dataset with patch_size={args.patch_size}')
     test_dataset = IDRIDDataset(
         base_dir='./data',
@@ -846,6 +978,6 @@ if __name__ == '__main__':
     )
     
     logging.info(f'Found {len(test_dataset)} test items')
-    
-    # Run unified analysis
-    metrics_df = analyze_model(model, test_dataset, args)
+
+    # Now run analysis with the extended function
+    metrics_df, model_spars_data, model_uncert_data = analyze_model(model, test_dataset, args)

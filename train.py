@@ -1,26 +1,20 @@
 import argparse
 import logging
-import os
-import random
-import sys
+
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import torchvision.transforms as transforms
-import torchvision.transforms.functional as TF
-import cv2
+
 from pathlib import Path
 from torch import optim
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader
 from tqdm import tqdm
 from typing import Optional
-from utils import metrics
+
 import wandb
 from evaluate import evaluate
 from unet import UNet
 from unet.unet_resnet import UNetResNet
 from utils.data_loading import IDRIDDataset
-from utils.loss import CombinedLoss, MAFocalLoss, MASegmentationLoss, KLAnnealer, kl_with_free_bits
+from utils.loss import CombinedLoss,  MASegmentationLoss, KLAnnealer, kl_with_free_bits
 import numpy as np
 from torchvision.transforms import Normalize
 from utils.vae_utils import generate_predictions, calculate_latent_stats
@@ -159,8 +153,8 @@ def train_model(
         lesion_type: str = 'EX',
         backbone: str = 'resnet34',
         pretrained: bool = True,
-        beta: float = 0.01,  # KL weight
-        free_bits: float = 1e-2,  # Added free bits parameter
+        beta: float = 0.001,  # KL weight
+        free_bits: float = 5e-1,  # Added free bits parameter
         kl_anneal_epochs: int = 20  # Added KL annealing epochs
 ):
     # Clear cache at start and set memory limits for better management
@@ -730,7 +724,7 @@ if __name__ == '__main__':
             lesion_type=args.lesion_type,
             backbone='resnet34',
             pretrained=True,
-            beta=0.01,
+            beta=0.001,
             free_bits=args.free_bits,
             kl_anneal_epochs=args.kl_anneal_epochs
         )
@@ -755,5 +749,5 @@ if __name__ == '__main__':
             lesion_type=args.lesion_type,
             backbone='resnet34',
             pretrained=True,
-            beta=0.01
+            beta=0.001
         )

@@ -56,6 +56,7 @@ class Down(nn.Module):
         self.maxpool_conv = nn.Sequential(
             nn.MaxPool2d(2),
             DoubleConv(in_channels, out_channels)
+
         )
 
     def forward(self, x):
