@@ -636,7 +636,7 @@ def get_segmentation_distribution_from_image(model, img_id, dataset, num_samples
     segmentations_cpu = torch.zeros((num_samples, 1, H, W), dtype=torch.float32)
     
     # Determine if sampling should be applied based on model configuration
-    should_sample = getattr(model, 'latent_injection', 'all') not in ['none', 'inject_no_bottleneck']
+    should_sample = getattr(model, 'latent_injection', 'all') not in ['none']
     if not should_sample:
         logging.info(f"Latent injection mode is '{model.latent_injection}'. Using deterministic mu (temperature ignored).")
 
@@ -810,7 +810,7 @@ def visualize_temperature_sampling(model, image, mask=None,
         mu, logvar = encode_images(model, image)
         
     # Determine if sampling should be applied based on model configuration
-    should_sample = getattr(model, 'latent_injection', 'all') not in ['none', 'inject_no_bottleneck']
+    should_sample = getattr(model, 'latent_injection', 'all') != 'none'
     if not should_sample:
         logging.info(f"Latent injection mode is '{model.latent_injection}'. Using deterministic mu (temperature ignored).")
     
@@ -930,7 +930,7 @@ def generate_and_compare_ensemble(model, image, mask, temperatures=[0.5, 1.0, 2.
         mu, logvar = encode_images(model, image)
         
     # Determine if sampling should be applied based on model configuration
-    should_sample = getattr(model, 'latent_injection', 'all') not in ['none', 'inject_no_bottleneck']
+    should_sample = getattr(model, 'latent_injection', 'all') != 'none'
     if not should_sample:
         logging.info(f"Latent injection mode is '{model.latent_injection}'. Using deterministic mu (temperature ignored).")
     
