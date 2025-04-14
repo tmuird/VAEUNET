@@ -12,6 +12,7 @@ from sklearn.calibration import calibration_curve
 from sklearn.metrics import roc_curve, precision_recall_curve, auc
 import matplotlib.gridspec as gridspec
 from textwrap import wrap
+import wandb  # Import wandb
 
 from utils.data_loading import IDRIDDataset
 from unet.unet_resnet import UNetResNet
@@ -35,7 +36,8 @@ def plot_global_roc_pr(
     all_uncertainties,
     output_dir,
     model_label="Model",
-    prefix=""
+    prefix="",
+    log_wandb=False  # Add wandb logging flag
 ):
     """
     Plots the global AUROC and AUPRC curves for pixel-level uncertainty vs. errors.
@@ -47,6 +49,7 @@ def plot_global_roc_pr(
         output_dir: Path to output directory
         model_label: e.g. 'High-KL Model'
         prefix: optional string to prepend to filenames, e.g. "global_" => "global_roc.png"
+        log_wandb: If True, log plots to W&B
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -71,6 +74,11 @@ def plot_global_roc_pr(
     out_roc = output_dir / f"{prefix}roc_curve.png"
     plt.savefig(out_roc, dpi=300, bbox_inches='tight')
     plt.close()
+    if log_wandb:
+        try:
+            wandb.log({f"plots/{prefix}roc_curve": wandb.Image(str(out_roc))})
+        except Exception as e:
+            logging.warning(f"Could not log ROC curve to W&B: {e}")
 
     # Plot PR
     plt.figure(figsize=(6,6))
@@ -85,9 +93,20 @@ def plot_global_roc_pr(
     out_pr = output_dir / f"{prefix}pr_curve.png"
     plt.savefig(out_pr, dpi=300, bbox_inches='tight')
     plt.close()
+    if log_wandb:
+        try:
+            wandb.log({f"plots/{prefix}pr_curve": wandb.Image(str(out_pr))})
+        except Exception as e:
+            logging.warning(f"Could not log PR curve to W&B: {e}")
 
     logging.info(f"Global ROC/AUPR plots saved: {out_roc}, {out_pr}")
     logging.info(f"Global AUROC={roc_auc:.4f}, AUPRC={prc_auc:.4f}")
+    if log_wandb:
+        try:
+            wandb.summary[f"{prefix}global_auroc"] = roc_auc
+            wandb.summary[f"{prefix}global_auprc"] = prc_auc
+        except Exception as e:
+            logging.warning(f"Could not log global AUCs to W&B summary: {e}")
 
 
 def store_sparsification_data(save_path, model_spars_data):
@@ -156,6 +175,12 @@ def get_args():
     parser.add_argument('--model_label', type=str, default='Model',
                         help='Label to use when plotting ROC/PR (e.g. "High-KL")')
     
+    # W&B Arguments
+    parser.add_argument('--wandb_project', type=str, default='VAEUNET-Analysis', help='W&B project name')
+    parser.add_argument('--wandb_entity', type=str, default=None, help='W&B entity (team/user name)')
+    parser.add_argument('--wandb_run_name', type=str, default=None, help='W&B run name (defaults to auto-generated)')
+    parser.add_argument('--no_wandb', action='store_true', help='Disable W&B logging')
+
     parser.set_defaults(use_attention=True, enable_dropout=False)
     args = parser.parse_args()
     
@@ -173,7 +198,7 @@ def get_args():
 
 
 @track_memory
-def analyze_model(model, dataset, args):
+def analyze_model(model, dataset, args, wandb_run=None):  # Add wandb_run parameter
     """Unified analysis function that handles both uncertainty and calibration analysis,
        also storing per-image data for later comparisons, and optionally plotting
        global pixel-level ROC/PR curves."""
@@ -196,6 +221,7 @@ def analyze_model(model, dataset, args):
     global_uncertainties = []
 
     processed_ids = set()
+    log_wandb = wandb_run is not None  # Check if W&B is active
     
     for i in tqdm(range(len(dataset)), desc="Analyzing images"):
         sample = dataset[i]
@@ -307,6 +333,15 @@ def analyze_model(model, dataset, args):
             metrics_dict = ensure_dict_python_scalars(metrics_dict)
             metrics_data.append(metrics_dict)
             
+            # Log per-image metrics to W&B if active
+            if log_wandb:
+                try:
+                    wandb_metrics = {f"metrics/{k}": v for k, v in metrics_dict.items() if k != 'img_id'}
+                    wandb_metrics['image_index'] = i
+                    wandb.log(wandb_metrics)
+                except Exception as e:
+                    logging.warning(f"Could not log per-image metrics to W&B for {img_id}: {e}")
+            
             # Generate individual image reports (conditional on analysis mode)
             img_output_dir = output_dir / "individual_reports"
             img_output_dir.mkdir(exist_ok=True)
@@ -343,8 +378,14 @@ def analyze_model(model, dataset, args):
                 ax.grid(True, alpha=0.3)
                 
                 plt.tight_layout()
-                plt.savefig(img_output_dir / f"{img_id}_calibration_curve.png", dpi=200)
+                calib_plot_path = img_output_dir / f"{img_id}_calibration_curve.png"
+                plt.savefig(calib_plot_path, dpi=200)
                 plt.close(fig)
+                if log_wandb:
+                    try:
+                        wandb.log({f"individual_plots/{img_id}_calibration": wandb.Image(str(calib_plot_path)), "image_index": i})
+                    except Exception as e:
+                        logging.warning(f"Could not log calibration plot to W&B for {img_id}: {e}")
             
             # Generate combined uncertainty metrics visualization
             if args.uncertainty:
@@ -361,8 +402,14 @@ def analyze_model(model, dataset, args):
                 
                 plt.suptitle(f'Image {img_id} (Dice={dice:.4f}, Brier={brier:.4f})')
                 plt.tight_layout()
-                plt.savefig(img_output_dir / f"{img_id}_uncertainty_metrics.png", dpi=200)
+                uncert_plot_path = img_output_dir / f"{img_id}_uncertainty_metrics.png"
+                plt.savefig(uncert_plot_path, dpi=200)
                 plt.close(fig)
+                if log_wandb:
+                    try:
+                        wandb.log({f"individual_plots/{img_id}_uncertainty": wandb.Image(str(uncert_plot_path)), "image_index": i})
+                    except Exception as e:
+                        logging.warning(f"Could not log uncertainty plot to W&B for {img_id}: {e}")
                 
                 # Generate a more detailed analysis figure
                 fig, axes = plt.subplots(2, 2, figsize=(16, 12))
@@ -406,8 +453,14 @@ def analyze_model(model, dataset, args):
                 
                 plt.suptitle(f'Detailed Analysis for Image {img_id}', fontsize=16)
                 plt.tight_layout()
-                plt.savefig(img_output_dir / f"{img_id}_detailed_analysis.png", dpi=200)
+                detailed_plot_path = img_output_dir / f"{img_id}_detailed_analysis.png"
+                plt.savefig(detailed_plot_path, dpi=200)
                 plt.close(fig)
+                if log_wandb:
+                    try:
+                        wandb.log({f"individual_plots/{img_id}_detailed": wandb.Image(str(detailed_plot_path)), "image_index": i})
+                    except Exception as e:
+                        logging.warning(f"Could not log detailed plot to W&B for {img_id}: {e}")
             
             # Free up memory
             del segmentations_cpu, mask_cpu, mean_pred, std_dev
@@ -437,6 +490,13 @@ def analyze_model(model, dataset, args):
     metrics_df.to_csv(metrics_csv_path, index=False)
     logging.info(f"Saved metrics data to {metrics_csv_path}")
     
+    # Log the metrics dataframe as a W&B Table
+    if log_wandb:
+        try:
+            wandb.log({"analysis_summary_table": wandb.Table(dataframe=metrics_df)})
+        except Exception as e:
+            logging.warning(f"Could not log metrics DataFrame to W&B: {e}")
+
     # (Optionally) store the data for external comparison
     if args.store_data and args.uncertainty:
         store_sparsification_data(output_dir / "sparsification_data.npy", model_sparsification_data)
@@ -444,18 +504,39 @@ def analyze_model(model, dataset, args):
 
     # Summaries
     if args.uncertainty:
-        create_uncertainty_visualizations(metrics_df, output_dir)
+        create_uncertainty_visualizations(metrics_df, output_dir, log_wandb=log_wandb)
     if args.calibration:
-        create_calibration_visualizations(all_predictions, all_ground_truths, output_dir)
+        create_calibration_visualizations(all_predictions, all_ground_truths, output_dir, log_wandb=log_wandb)
     if args.temperature_sweep:
-        perform_temperature_analysis(all_predictions, all_ground_truths, output_dir, args.temp_values)
+        perform_temperature_analysis(all_predictions, all_ground_truths, output_dir, args.temp_values, log_wandb=log_wandb)
     
     # Plot global ROC/PR if requested
     if args.plot_roc_pr and args.uncertainty:
         if len(global_errors)>0:
             all_err = np.concatenate(global_errors)
             all_unc = np.concatenate(global_uncertainties)
-            plot_global_roc_pr(all_err, all_unc, output_dir, model_label=args.model_label, prefix="global_")
+            plot_global_roc_pr(all_err, all_unc, output_dir, model_label=args.model_label, prefix="global_", log_wandb=log_wandb)
+    
+    # Log summary statistics to W&B summary
+    if log_wandb:
+        try:
+            summary_stats = {
+                "summary/avg_dice": metrics_df['dice'].mean(),
+                "summary/std_dice": metrics_df['dice'].std(),
+                "summary/avg_ece": metrics_df['ece'].mean(),
+                "summary/std_ece": metrics_df['ece'].std(),
+                "summary/avg_brier": metrics_df['brier'].mean(),
+                "summary/std_brier": metrics_df['brier'].std(),
+            }
+            if args.uncertainty:
+                summary_stats["summary/avg_sparsification_error"] = metrics_df['sparsification_error'].mean()
+                summary_stats["summary/std_sparsification_error"] = metrics_df['sparsification_error'].std()
+                summary_stats["summary/avg_uncertain_pixel_percent"] = metrics_df['uncertain_pixel_percent'].mean()
+                summary_stats["summary/std_uncertain_pixel_percent"] = metrics_df['uncertain_pixel_percent'].std()
+
+            wandb.summary.update(summary_stats)
+        except Exception as e:
+            logging.warning(f"Could not log summary statistics to W&B: {e}")
     
     # Log summary
     logging.info("\nSummary Statistics:")
@@ -472,7 +553,7 @@ def analyze_model(model, dataset, args):
     return metrics_df, model_sparsification_data, model_uncert_data
 
 
-def create_uncertainty_visualizations(metrics_df, output_dir):
+def create_uncertainty_visualizations(metrics_df, output_dir, log_wandb=False):  # Add flag
     """Create visualizations for uncertainty analysis."""
     # Set Seaborn style
     sns.set_style("whitegrid")
@@ -531,7 +612,7 @@ def create_uncertainty_visualizations(metrics_df, output_dir):
             Line2D([0], [0], marker='o', color='w', markerfacecolor='red', markersize=10, 
                   label='Poor uncertainty (SE < 0)')
         ]
-        axes[0, 1].legend(handles=legend_elements, loc='lower right')
+        axes[0, 1].legend(handles, legend_elements, loc='lower right')
         
         # Add correlation coefficient
         corr = metrics_df['dice'].corr(metrics_df['sparsification_error'])
@@ -599,8 +680,14 @@ def create_uncertainty_visualizations(metrics_df, output_dir):
     
     plt.suptitle(f'Uncertainty Analysis Summary - {len(metrics_df)} Images', fontsize=16, y=0.98)
     plt.tight_layout(rect=[0, 0, 1, 0.97])
-    plt.savefig(output_dir / "uncertainty_summary.png", dpi=300, bbox_inches='tight')
+    uncertainty_summary_path = output_dir / "uncertainty_summary.png"
+    plt.savefig(uncertainty_summary_path, dpi=300, bbox_inches='tight')
     plt.close(fig)
+    if log_wandb:
+        try:
+            wandb.log({"plots/uncertainty_summary": wandb.Image(str(uncertainty_summary_path))})
+        except Exception as e:
+            logging.warning(f"Could not log uncertainty summary plot to W&B: {e}")
     
     # Create correlation heatmap with improved visualization
     try:
@@ -628,8 +715,14 @@ def create_uncertainty_visualizations(metrics_df, output_dir):
                   bbox={"facecolor":"lightgoldenrodyellow", "alpha":0.5, "pad":5})
         
         plt.tight_layout(rect=[0, 0.05, 1, 0.95])
-        plt.savefig(output_dir / "correlation_matrix.png", dpi=300)
+        corr_matrix_path = output_dir / "correlation_matrix.png"
+        plt.savefig(corr_matrix_path, dpi=300)
         plt.close()
+        if log_wandb:
+            try:
+                wandb.log({"plots/correlation_matrix": wandb.Image(str(corr_matrix_path))})
+            except Exception as e:
+                logging.warning(f"Could not log correlation matrix plot to W&B: {e}")
     except Exception as e:
         logging.error(f"Error creating correlation heatmap: {e}")
     
@@ -657,8 +750,14 @@ def create_uncertainty_visualizations(metrics_df, output_dir):
                       bbox={"facecolor":"lightgoldenrodyellow", "alpha":0.5, "pad":5})
             
             plt.subplots_adjust(top=0.95, bottom=0.1)
-            plt.savefig(output_dir / "metrics_pairplot.png", dpi=300, bbox_inches='tight')
+            pairplot_path = output_dir / "metrics_pairplot.png"
+            plt.savefig(pairplot_path, dpi=300, bbox_inches='tight')
             plt.close()
+            if log_wandb:
+                try:
+                    wandb.log({"plots/metrics_pairplot": wandb.Image(str(pairplot_path))})
+                except Exception as e:
+                    logging.warning(f"Could not log pairplot to W&B: {e}")
         else:
             logging.warning(f"Not enough numeric columns for pairplot. Found: {existing_cols}")
     except Exception as e:
@@ -729,16 +828,21 @@ def create_uncertainty_visualizations(metrics_df, output_dir):
                    verticalalignment='top', bbox=props)
             
             plt.tight_layout()
-            plt.savefig(output_dir / "calibration_analysis.png", dpi=300)
+            calib_analysis_path = output_dir / "calibration_analysis.png"
+            plt.savefig(calib_analysis_path, dpi=300)
             plt.close(fig)
+            if log_wandb:
+                try:
+                    wandb.log({"plots/calibration_analysis_chart": wandb.Image(str(calib_analysis_path))})
+                except Exception as e:
+                    logging.warning(f"Could not log calibration analysis chart to W&B: {e}")
         else:
             logging.warning("Missing required columns for calibration analysis chart")
     except Exception as e:
         logging.error(f"Error creating calibration analysis chart: {e}")
 
 
-
-def create_calibration_visualizations(all_predictions, all_ground_truths, output_dir):
+def create_calibration_visualizations(all_predictions, all_ground_truths, output_dir, log_wandb=False):  # Add flag
     """Create visualizations specifically for calibration analysis."""
     if not all_predictions or not all_ground_truths:
         logging.warning("No prediction data available for calibration analysis")
@@ -787,10 +891,17 @@ def create_calibration_visualizations(all_predictions, all_ground_truths, output
     ax.grid(True, alpha=0.3)
     
     plt.tight_layout()
-    plt.savefig(output_dir / "global_calibration_curve.png", dpi=200)
+    global_calib_path = output_dir / "global_calibration_curve.png"
+    plt.savefig(global_calib_path, dpi=200)
     plt.close(fig)
+    if log_wandb:
+        try:
+            wandb.log({"plots/global_calibration_curve": wandb.Image(str(global_calib_path))})
+        except Exception as e:
+            logging.warning(f"Could not log global calibration curve to W&B: {e}")
 
-def perform_temperature_analysis(all_predictions, all_ground_truths, output_dir, temperatures):
+
+def perform_temperature_analysis(all_predictions, all_ground_truths, output_dir, temperatures, log_wandb=False):  # Add flag
     """Analyze the effect of temperature on calibration."""
     if not all_predictions or not all_ground_truths:
         logging.warning("No prediction data available for temperature analysis")
@@ -841,8 +952,14 @@ def perform_temperature_analysis(all_predictions, all_ground_truths, output_dir,
     plt.grid(True, alpha=0.3)
     plt.legend()
     plt.tight_layout()
-    plt.savefig(output_dir / "temperature_effect.png", dpi=200)
+    temp_effect_path = output_dir / "temperature_effect.png"
+    plt.savefig(temp_effect_path, dpi=200)
     plt.close()
+    if log_wandb:
+        try:
+            wandb.log({"plots/temperature_effect": wandb.Image(str(temp_effect_path))})
+        except Exception as e:
+            logging.warning(f"Could not log temperature effect plot to W&B: {e}")
     
     # Create dataframe and save results
     summary_df = pd.DataFrame({
@@ -891,8 +1008,14 @@ def perform_temperature_analysis(all_predictions, all_ground_truths, output_dir,
     plt.grid(True, alpha=0.3)
     plt.legend(loc='lower right')
     plt.tight_layout()
-    plt.savefig(output_dir / "temperature_calibration_curves.png", dpi=200)
+    temp_curves_path = output_dir / "temperature_calibration_curves.png"
+    plt.savefig(temp_curves_path, dpi=200)
     plt.close()
+    if log_wandb:
+        try:
+            wandb.log({"plots/temperature_calibration_curves": wandb.Image(str(temp_curves_path))})
+        except Exception as e:
+            logging.warning(f"Could not log temperature curves plot to W&B: {e}")
     
     # Log the recommendation
     logging.info(f"TEMPERATURE ANALYSIS RESULTS:")
@@ -904,7 +1027,15 @@ def perform_temperature_analysis(all_predictions, all_ground_truths, output_dir,
     else:
         logging.info(f"Default temperature (T=1.0) is optimal")
     
+    if log_wandb:
+        try:
+            wandb.summary["optimal_temperature"] = optimal_temp
+            wandb.summary["optimal_ece_at_temp"] = optimal_ece
+        except Exception as e:
+            logging.warning(f"Could not log optimal temperature to W&B summary: {e}")
+    
     return optimal_temp, optimal_ece
+
 
 def print_interpretation_guide(args):
     """Print a guide for interpreting the analysis results."""
@@ -942,11 +1073,30 @@ def print_interpretation_guide(args):
     
     print("\n" + "="*80 + "\n")
 
+
 if __name__ == '__main__':
     # Set up logging
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
     
     args = get_args()
+    
+    # Initialize W&B
+    wandb_run = None
+    if not args.no_wandb:
+        try:
+            wandb_run = wandb.init(
+                project=args.wandb_project,
+                entity=args.wandb_entity,
+                name=args.wandb_run_name,
+                config=vars(args),  # Log all arguments
+                job_type="analysis"  # Add job type
+            )
+            logging.info(f"W&B run initialized: {wandb_run.url}")
+        except Exception as e:
+            logging.error(f"Failed to initialize W&B: {e}. Running without W&B logging.")
+            wandb_run = None  # Ensure wandb_run is None if init fails
+    else:
+        logging.info("W&B logging disabled by --no_wandb flag.")
     
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -979,5 +1129,10 @@ if __name__ == '__main__':
     
     logging.info(f'Found {len(test_dataset)} test items')
 
-    # Now run analysis with the extended function
-    metrics_df, model_spars_data, model_uncert_data = analyze_model(model, test_dataset, args)
+    # Now run analysis with the extended function, passing the wandb_run object
+    metrics_df, model_spars_data, model_uncert_data = analyze_model(model, test_dataset, args, wandb_run=wandb_run)
+
+    # Finish W&B run if it was initialized
+    if wandb_run:
+        wandb.finish()
+        logging.info("W&B run finished.")

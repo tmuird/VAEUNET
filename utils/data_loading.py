@@ -648,10 +648,10 @@ class IDRIDDataset(Dataset):
         """Return a single patch (image, mask) loaded from disk. If patch_size is None, returns full image."""
         if self.patch_size is None:
             img_id = self.patch_indices[idx][0]
-            patch_data = torch.load(self.patches_dir / f"{img_id}_full")
+            patch_data = torch.load(self.patches_dir / f"{img_id}_full", weights_only=True)
         else:
             img_id, patch_path, _ = self.patch_indices[idx]
-            patch_data = torch.load(patch_path)
+            patch_data = torch.load(patch_path, weights_only=True)
         
         # Get image and mask from patch data
         image = patch_data['image']

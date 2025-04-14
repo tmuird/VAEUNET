@@ -1,5 +1,6 @@
 import argparse
 import logging
+import random  # Added for seeding
 
 import torch
 
@@ -14,7 +15,7 @@ from evaluate import evaluate
 from unet import UNet
 from unet.unet_resnet import UNetResNet
 from utils.data_loading import IDRIDDataset
-from utils.loss import CombinedLoss,  MASegmentationLoss, KLAnnealer, kl_with_free_bits
+from utils.loss import CombinedLoss, MASegmentationLoss, KLAnnealer, kl_with_free_bits
 import numpy as np
 from torchvision.transforms import Normalize
 from utils.vae_utils import generate_predictions, calculate_latent_stats
@@ -36,6 +37,30 @@ dir_checkpoint = Path('./checkpoints/')
 # Create normalizer with mean 0 and std 1 for each channel
 normalize = Normalize(mean=[0.0, 0.0, 0.0], std=[1.0, 1.0, 1.0])
 
+def set_seed(seed: int):
+    """Sets the seed for reproducibility."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)  # if you are using multi-GPU.
+    # Ensure deterministic behavior for cuDNN
+    # NOTE: Setting deterministic=True and benchmark=False ensures strict reproducibility
+    # but can negatively impact performance and may slightly alter convergence.
+    # Setting benchmark=True and deterministic=False prioritizes performance.
+    # torch.backends.cudnn.deterministic = True # Disabled for performance
+    torch.backends.cudnn.benchmark = True  # Enabled for performance
+    logging.info(f"Random seed set to {seed}")
+
+def worker_init_fn(worker_id):
+    """Sets the seed for DataLoader workers."""
+    # Get the main seed and add worker_id to ensure different seeds per worker
+    # Using torch.initial_seed() ensures that the seed is derived from the main process seed
+    seed = torch.initial_seed() % 2**32
+    np.random.seed(seed + worker_id)
+    random.seed(seed + worker_id)
+
 def get_checkpoint_path(
     lesion_type: str,
     model_type: str,
@@ -46,7 +71,8 @@ def get_checkpoint_path(
     free_bits: float,
     kl_anneal_epochs: int,
     latent_injection: str = None,
-    learning_rate: float = None
+    learning_rate: float = None,
+    seed: Optional[int] = None  # Added seed parameter
 ) -> Path:
     """
     Create a structured checkpoint directory path based on model parameters.
@@ -79,8 +105,11 @@ def get_checkpoint_path(
     # Add learning rate if specified
     lr_str = f"_lr{learning_rate}" if learning_rate is not None else ""
     
+    # Add seed if specified
+    seed_str = f"_seed{seed}" if seed is not None else ""
+    
     # Combine all components for the directory name
-    dir_name = f"{lesion_type}_{model_type}_{attention_str}_{scale_str}_{patch_str}_{kl_str}{latent_str}{lr_str}"
+    dir_name = f"{lesion_type}_{model_type}_{attention_str}_{scale_str}_{patch_str}_{kl_str}{latent_str}{lr_str}{seed_str}"
     
     return dir_checkpoint / dir_name
 
@@ -155,7 +184,8 @@ def train_model(
         pretrained: bool = True,
         beta: float = 0.001,  # KL weight
         free_bits: float = 5e-1,  # Added free bits parameter
-        kl_anneal_epochs: int = 20  # Added KL annealing epochs
+        kl_anneal_epochs: int = 20,  # Added KL annealing epochs
+        seed: Optional[int] = None  # Added seed parameter
 ):
     # Clear cache at start and set memory limits for better management
     if torch.cuda.is_available():
@@ -220,7 +250,8 @@ Initial GPU Status:
         persistent_workers=True,
         prefetch_factor=2,
         pin_memory_device='cuda',
-        collate_fn=collate_patches  # Add this line to use the custom collate function
+        collate_fn=collate_patches,  # Add this line to use the custom collate function
+        worker_init_fn=worker_init_fn  # Add worker init function for reproducibility
     )
     
     # No special handling needed for patch_size=None anymore
@@ -265,7 +296,8 @@ Initial GPU Status:
             classes=1,
             lesion_type=lesion_type,
             backbone=backbone,
-            pretrained=pretrained
+            pretrained=pretrained,
+            seed=seed  # Log seed
         )
     )
 
@@ -283,6 +315,7 @@ Initial GPU Status:
         Max images:      {max_images}
         Backbone:        {backbone}
         Pretrained:      {pretrained}
+        Seed:            {seed}
     ''')
 
     # Use specialized loss for Microaneurysms
@@ -338,7 +371,7 @@ Initial GPU Status:
         logging.info(f"AMP enabled: {amp}")
         
     # Before training loop
-    torch.backends.cudnn.benchmark = True
+    # Settings for determinism/benchmarking are now handled in set_seed
     if torch.cuda.is_available():
         try:
             torch.backends.cuda.preferred_linalg_library('cusolver')
@@ -526,7 +559,8 @@ Initial GPU Status:
                                 free_bits=free_bits,
                                 kl_anneal_epochs=kl_anneal_epochs,
                                 latent_injection=latent_injection,
-                                learning_rate=learning_rate
+                                learning_rate=learning_rate,
+                                seed=seed  # Pass seed to checkpoint path function
                             )
                             
                             # Create directory if it doesn't exist
@@ -562,6 +596,7 @@ Initial GPU Status:
                                     'free_bits': free_bits,
                                     'kl_anneal_epochs': kl_anneal_epochs,
                                     'latent_injection': latent_injection,
+                                    'seed': seed  # Save seed in checkpoint
                                 }
                             }
                             
@@ -669,14 +704,21 @@ def get_args():
     parser.add_argument('--free-bits', type=float, default=1e-3,
                       help='Free bits parameter to prevent posterior collapse')
     parser.add_argument('--latent-injection', type=str, default='all', 
-                        choices=['all', 'first', 'last', 'bottleneck', 'none'],
-                        help='Latent space injection strategy: inject at all levels, only first, only last, only bottleneck, or none')
+                        choices=['all', 'first', 'last', 'bottleneck', 'inject_no_bottleneck', 'none'], # Added 'inject_no_bottleneck'
+                        help='Latent space injection strategy')
+    parser.add_argument('--beta', type=float, default=0.001,
+                        help='KL weight for the loss function')
+    parser.add_argument('--seed', type=int, default=42, help='Random seed for reproducibility')  # Added seed argument
     parser.set_defaults(use_attention=True, use_skip=True)
+    
     return parser.parse_args()
 
 
 if __name__ == '__main__':
     args = get_args()
+
+    # Set seed as early as possible
+    set_seed(args.seed)
 
     logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -724,15 +766,15 @@ if __name__ == '__main__':
             lesion_type=args.lesion_type,
             backbone='resnet34',
             pretrained=True,
-            beta=0.001,
+            beta=args.beta,
             free_bits=args.free_bits,
-            kl_anneal_epochs=args.kl_anneal_epochs
+            kl_anneal_epochs=args.kl_anneal_epochs,
+            seed=args.seed  # Pass seed to train_model
         )
     except torch.cuda.OutOfMemoryError:
         logging.error('Detected OutOfMemoryError! '
                     'Try reducing the batch size or image scale.')
         torch.cuda.empty_cache()
-        # If you want to attempt re-training with gradient checkpointing or smaller batch size, do so here.
         model.use_checkpointing()
         train_model(
             model=model,
@@ -749,5 +791,8 @@ if __name__ == '__main__':
             lesion_type=args.lesion_type,
             backbone='resnet34',
             pretrained=True,
-            beta=0.001
+            beta=args.beta,
+            free_bits=args.free_bits,
+            kl_anneal_epochs=args.kl_anneal_epochs,
+            seed=args.seed  # Pass seed to train_model
         )

@@ -113,11 +113,13 @@ class UNetResNet(nn.Module):
             use_attention: Whether to use attention gates
             use_skip: Whether to use skip connections
             latent_injection: Strategy for latent space injection
-                - 'all': Inject at all decoder levels (default)
-                - 'first': Inject only at the first decoder level
-                - 'bottleneck': Inject only at the bottleneck (no decoder injection)
-                - 'none': No latent injection at all
-                - list of ints: Inject at specified decoder levels (0-based index)
+                - 'all': Inject at bottleneck AND all decoder levels (default)
+                - 'first': Inject at bottleneck AND first decoder level
+                - 'last': Inject at bottleneck AND last decoder level
+                - 'bottleneck': Inject ONLY at the bottleneck (decoder starts from z)
+                - 'inject_no_bottleneck': Inject at all decoder levels BUT NOT at bottleneck (decoder starts from encoder features)
+                - 'none': No latent injection at all (decoder starts from encoder features)
+                - list of ints: Inject at bottleneck AND specified decoder levels (0-based index)
         """
         super().__init__()
         self.n_channels = n_channels
@@ -155,7 +157,7 @@ class UNetResNet(nn.Module):
         if isinstance(latent_injection, list):
             # Specific levels defined by list
             use_latent_list = [i in latent_injection for i in range(4)]
-        elif latent_injection == 'all':
+        elif latent_injection == 'all' or latent_injection == 'inject_no_bottleneck': # Added 'inject_no_bottleneck' here
             use_latent_list = [True, True, True, True]
         elif latent_injection == 'first':
             use_latent_list = [True, False, False, False]
@@ -166,9 +168,11 @@ class UNetResNet(nn.Module):
         else:
             # Default to all
             use_latent_list = [True, True, True, True]
+            latent_injection = 'all' # Correct the mode if unknown
             
-        # Whether to use bottleneck injection
-        self.use_bottleneck = latent_injection != 'none'
+        # Whether to use bottleneck injection (decoder starts from z)
+        # This is True for all modes EXCEPT 'none' and the new 'inject_no_bottleneck'
+        self.use_bottleneck = latent_injection not in ['none', 'inject_no_bottleneck']
             
         # Decoder blocks with parameterized latent injection
         self.use_skip = use_skip
