@@ -18,6 +18,7 @@ import matplotlib.cm as cm
 import math
 import gc
 import shutil
+import psutil
 
 from utils.data_loading import IDRIDDataset, load_image
 from unet.unet_resnet import UNetResNet
@@ -32,25 +33,32 @@ from utils.uncertainty_metrics import (
 from utils.tensor_utils import ensure_dict_python_scalars, fix_dataframe_tensors
 from visualize_vae import get_segmentation_distribution_from_image, track_memory
 
-##############################################################################
-# Additional helper functions for global AUROC / AUPRC plotting,
-# plus storing & plotting data from multiple images / models
-##############################################################################
+
+def log_memory_usage(stage_name=""):
+    """Logs current RAM and GPU memory usage."""
+    process = psutil.Process(os.getpid())
+    ram_mb = process.memory_info().rss / (1024 * 1024)
+    gpu_mem_mb = 0
+    if torch.cuda.is_available():
+        gpu_mem_mb = torch.cuda.memory_allocated() / (1024 * 1024)
+    logging.info(f"Memory usage {stage_name}: RAM={ram_mb:.2f} MB, GPU={gpu_mem_mb:.2f} MB")
+
+
 def plot_global_roc_pr(
-    all_errors, 
-    all_uncertainties,
+    processed_ids,
+    temp_pixel_data_dir,
     output_dir,
     model_label="Model",
     prefix="",
     log_wandb=False
 ):
     """
-    Plots the global AUROC and AUPRC curves for pixel-level uncertainty vs. errors.
+    Plots the global AUROC and AUPRC curves by loading data incrementally.
     Saves plots into output_dir with optional prefix appended to filenames.
 
     Args:
-        all_errors: 1D numpy array of shape (N_pixels,) with 0/1 for correct/incorrect
-        all_uncertainties: 1D numpy array of shape (N_pixels,) with continuous uncertainty
+        processed_ids: Set of image IDs that were processed.
+        temp_pixel_data_dir: Path to the directory containing temporary .npy files.
         output_dir: Path to output directory
         model_label: e.g. 'High-KL Model'
         prefix: optional string to prepend to filenames, e.g. "global_" => "global_roc.png"
@@ -58,60 +66,313 @@ def plot_global_roc_pr(
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    log_memory_usage("[Before Global ROC/PR Load]")
 
-    # Compute ROC
-    fpr, tpr, _ = roc_curve(all_errors, all_uncertainties)
-    roc_auc = auc(fpr, tpr)
+    all_errors_loaded = []
+    all_uncertainties_loaded = []
+    loaded_count = 0
 
-    # Compute PR
-    precision, recall, _ = precision_recall_curve(all_errors, all_uncertainties)
-    prc_auc = auc(recall, precision)
+    logging.info("Loading errors and uncertainties for global ROC/PR...")
+    for img_id in tqdm(processed_ids, desc="Loading ROC/PR data"):
+        errors_path = temp_pixel_data_dir / f"{img_id}_errors.npy"
+        uncertainties_path = temp_pixel_data_dir / f"{img_id}_uncertainties.npy"
+        if errors_path.exists() and uncertainties_path.exists():
+            try:
+                all_errors_loaded.append(np.load(errors_path))
+                all_uncertainties_loaded.append(np.load(uncertainties_path))
+                loaded_count += 1
+            except Exception as e:
+                logging.warning(f"Could not load ROC/PR data for {img_id}: {e}")
+        else:
+            logging.warning(f"ROC/PR files not found for {img_id}: {errors_path.exists()=}, {uncertainties_path.exists()=}")
 
-    # Plot ROC
-    plt.figure(figsize=(6,6))
-    plt.plot(fpr, tpr, label=f'{model_label} (AUC={roc_auc:.4f})', lw=2)
-    plt.plot([0,1],[0,1],'k--', label='Chance')
-    plt.xlabel('False Positive Rate')
-    plt.ylabel('True Positive Rate')
-    plt.title(f'Global ROC Curve ({model_label})')
-    plt.legend(loc='lower right')
-    plt.grid(alpha=0.3)
-    out_roc = output_dir / f"{prefix}roc_curve.png"
-    plt.savefig(out_roc, dpi=300, bbox_inches='tight')
-    plt.close()
-    if log_wandb:
-        try:
-            wandb.log({f"plots/{prefix}roc_curve": wandb.Image(str(out_roc))})
-        except Exception as e:
-            logging.warning(f"Could not log ROC curve to W&B: {e}")
+    if loaded_count == 0:
+        logging.warning("No valid error/uncertainty data loaded to plot global ROC/PR.")
+        return
+    logging.info(f"Loaded ROC/PR data for {loaded_count} images.")
+    log_memory_usage("[After Global ROC/PR Load]")
 
-    # Plot PR
-    plt.figure(figsize=(6,6))
-    plt.plot(recall, precision, label=f'{model_label} (AUC={prc_auc:.4f})', lw=2)
-    baseline = np.sum(all_errors) / (len(all_errors)+1e-9)  # fraction of positives
-    plt.plot([0,1],[baseline, baseline],'k--', label=f'Chance={baseline:.3f}')
-    plt.xlabel('Recall')
-    plt.ylabel('Precision')
-    plt.title(f'Global Precision-Recall Curve ({model_label})')
-    plt.legend(loc='lower left')
-    plt.grid(alpha=0.3)
-    out_pr = output_dir / f"{prefix}pr_curve.png"
-    plt.savefig(out_pr, dpi=300, bbox_inches='tight')
-    plt.close()
-    if log_wandb:
-        try:
-            wandb.log({f"plots/{prefix}pr_curve": wandb.Image(str(out_pr))})
-        except Exception as e:
-            logging.warning(f"Could not log PR curve to W&B: {e}")
+    try:
+        logging.info("Concatenating global errors and uncertainties...")
+        all_errors = np.concatenate(all_errors_loaded)
+        all_uncertainties = np.concatenate(all_uncertainties_loaded)
+        logging.info(f"Concatenated shapes: errors={all_errors.shape}, uncertainties={all_uncertainties.shape}")
+        log_memory_usage("[After Global ROC/PR Concat]")
+        
+        # Free original lists
+        del all_errors_loaded, all_uncertainties_loaded
+        gc.collect()
+        log_memory_usage("[After Global ROC/PR List Cleanup]")
 
-    logging.info(f"Global ROC/AUPR plots saved: {out_roc}, {out_pr}")
-    logging.info(f"Global AUROC={roc_auc:.4f}, AUPRC={prc_auc:.4f}")
-    if log_wandb:
-        try:
-            wandb.summary[f"{prefix}global_auroc"] = roc_auc
-            wandb.summary[f"{prefix}global_auprc"] = prc_auc
-        except Exception as e:
-            logging.warning(f"Could not log global AUCs to W&B summary: {e}")
+        # Compute ROC
+        fpr, tpr, _ = roc_curve(all_errors, all_uncertainties)
+        roc_auc = auc(fpr, tpr)
+
+        # Compute PR
+        precision, recall, _ = precision_recall_curve(all_errors, all_uncertainties)
+        prc_auc = auc(recall, precision)
+
+        # Plot ROC
+        plt.figure(figsize=(6,6))
+        plt.plot(fpr, tpr, label=f'{model_label} (AUC={roc_auc:.4f})', lw=2)
+        plt.plot([0,1],[0,1],'k--', label='Chance')
+        plt.xlabel('False Positive Rate')
+        plt.ylabel('True Positive Rate')
+        plt.title(f'Global ROC Curve ({model_label})')
+        plt.legend(loc='lower right')
+        plt.grid(alpha=0.3)
+        out_roc = output_dir / f"{prefix}roc_curve.png"
+        plt.savefig(out_roc, dpi=300, bbox_inches='tight')
+        plt.close()
+        if log_wandb:
+            try:
+                wandb.log({f"plots/{prefix}roc_curve": wandb.Image(str(out_roc))})
+            except Exception as e:
+                logging.warning(f"Could not log ROC curve to W&B: {e}")
+
+        # Plot PR
+        plt.figure(figsize=(6,6))
+        plt.plot(recall, precision, label=f'{model_label} (AUC={prc_auc:.4f})', lw=2)
+        baseline = np.sum(all_errors) / (len(all_errors)+1e-9)  # fraction of positives
+        plt.plot([0,1],[baseline, baseline],'k--', label=f'Chance={baseline:.3f}')
+        plt.xlabel('Recall')
+        plt.ylabel('Precision')
+        plt.title(f'Global Precision-Recall Curve ({model_label})')
+        plt.legend(loc='lower left')
+        plt.grid(alpha=0.3)
+        out_pr = output_dir / f"{prefix}pr_curve.png"
+        plt.savefig(out_pr, dpi=300, bbox_inches='tight')
+        plt.close()
+        if log_wandb:
+            try:
+                wandb.log({f"plots/{prefix}pr_curve": wandb.Image(str(out_pr))})
+            except Exception as e:
+                logging.warning(f"Could not log PR curve to W&B: {e}")
+
+        logging.info(f"Global ROC/AUPR plots saved: {out_roc}, {out_pr}")
+        logging.info(f"Global AUROC={roc_auc:.4f}, AUPRC={prc_auc:.4f}")
+        if log_wandb:
+            try:
+                wandb.summary[f"{prefix}global_auroc"] = roc_auc
+                wandb.summary[f"{prefix}global_auprc"] = prc_auc
+            except Exception as e:
+                logging.warning(f"Could not log global AUCs to W&B summary: {e}")
+
+        # Final cleanup
+        del all_errors, all_uncertainties, fpr, tpr, precision, recall
+        gc.collect()
+        log_memory_usage("[After Global ROC/PR Plotting]")
+
+    except ValueError as e:
+         logging.error(f"Error concatenating global arrays for ROC/PR: {e}. Check shapes of temporary .npy files in {temp_pixel_data_dir}. Skipping plot.")
+    except Exception as e:
+         logging.error(f"Unexpected error during global ROC/PR generation: {e}. Skipping plot.")
+    finally:
+        # Ensure cleanup even if errors occur
+        if 'all_errors_loaded' in locals(): del all_errors_loaded
+        if 'all_uncertainties_loaded' in locals(): del all_uncertainties_loaded
+        if 'all_errors' in locals(): del all_errors
+        if 'all_uncertainties' in locals(): del all_uncertainties
+        gc.collect()
+        log_memory_usage("[End of Global ROC/PR]")
+
+
+def create_calibration_visualizations(processed_ids, temp_pixel_data_dir, output_dir, log_wandb=False):
+    """Creates global calibration plot by loading data incrementally."""
+    log_memory_usage("[Before Calibration Load]")
+    all_predictions_loaded = []
+    all_ground_truths_loaded = []
+    loaded_count = 0
+
+    logging.info("Loading predictions and ground truths for calibration...")
+    for img_id in tqdm(processed_ids, desc="Loading calibration data"):
+        pred_flat_path = temp_pixel_data_dir / f"{img_id}_pred_flat.npy"
+        gt_flat_path = temp_pixel_data_dir / f"{img_id}_gt_flat.npy"
+        if pred_flat_path.exists() and gt_flat_path.exists():
+            try:
+                all_predictions_loaded.append(np.load(pred_flat_path))
+                all_ground_truths_loaded.append(np.load(gt_flat_path))
+                loaded_count += 1
+            except Exception as e:
+                logging.warning(f"Could not load calibration data for {img_id}: {e}")
+        else:
+            logging.warning(f"Calibration files not found for {img_id}: {pred_flat_path.exists()=}, {gt_flat_path.exists()=}")
+
+    if loaded_count == 0:
+        logging.warning("No valid prediction/GT data loaded for calibration analysis.")
+        return
+    logging.info(f"Loaded calibration data for {loaded_count} images.")
+    log_memory_usage("[After Calibration Load]")
+
+    try:
+        all_pred_flat = np.concatenate(all_predictions_loaded)
+        all_gt_flat = np.concatenate(all_ground_truths_loaded)
+        log_memory_usage("[After Calibration Concat]")
+        
+        del all_predictions_loaded, all_ground_truths_loaded
+        gc.collect()
+        log_memory_usage("[After Calibration List Cleanup]")
+        
+        all_gt_flat = np.round(all_gt_flat).astype(int)
+        
+        global_prob_true, global_prob_pred = calibration_curve(
+            all_gt_flat, all_pred_flat, n_bins=10, strategy='uniform'
+        )
+        
+        hist_counts, bin_edges = np.histogram(all_pred_flat, bins=10, range=(0,1))
+        total_count = len(all_pred_flat)
+        bin_weights = hist_counts / total_count
+        global_ece = np.sum(np.abs(global_prob_true - global_prob_pred) * bin_weights)
+        
+        fig, ax = plt.subplots(figsize=(10, 8))
+        
+        ax.plot(global_prob_pred, global_prob_true, marker='o', linewidth=2,
+               label=f'Calibration Curve (ECE={global_ece:.4f})')
+        
+        ax.plot([0, 1], [0, 1], 'k--', label='Perfect Calibration')
+        
+        ax2 = ax.twinx()
+        ax2.hist(all_pred_flat, bins=20, alpha=0.3, density=True,
+                color='gray', label='Prediction Distribution')
+        ax2.set_ylabel('Density')
+        
+        ax.set_xlabel('Mean Predicted Probability')
+        ax.set_ylabel('Fraction of Positives')
+        ax.set_title(f'Global Calibration Curve (All Images)')
+        ax.legend(loc='upper left')
+        ax2.legend(loc='upper right')
+        ax.grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        global_calib_path = output_dir / "global_calibration_curve.png"
+        plt.savefig(global_calib_path, dpi=200)
+        plt.close(fig)
+        logging.info(f"Global calibration curve saved to {global_calib_path}")
+        if log_wandb:
+            try:
+                wandb.log({"plots/global_calibration_curve": wandb.Image(str(global_calib_path))})
+                wandb.summary["global_ece"] = global_ece
+            except Exception as e:
+                logging.warning(f"Could not log global calibration curve to W&B: {e}")
+
+    except ValueError as e:
+        logging.error(f"ValueError during calibration calculation: {e}")
+    except Exception as e:
+        logging.error(f"Unexpected error during calibration visualization: {e}")
+    finally:
+        if 'all_pred_flat' in locals(): del all_pred_flat
+        if 'all_gt_flat' in locals(): del all_gt_flat
+        gc.collect()
+        log_memory_usage("[End of Calibration]")
+
+
+def perform_temperature_analysis(processed_ids, temp_pixel_data_dir, output_dir, temperatures, log_wandb=False):
+    """Performs temperature scaling analysis by loading data incrementally."""
+    log_memory_usage("[Before Temp Analysis Load]")
+    all_predictions_loaded = []
+    all_ground_truths_loaded = []
+    loaded_count = 0
+
+    logging.info("Loading predictions and ground truths for temperature analysis...")
+    for img_id in tqdm(processed_ids, desc="Loading temp analysis data"):
+        pred_flat_path = temp_pixel_data_dir / f"{img_id}_pred_flat.npy"
+        gt_flat_path = temp_pixel_data_dir / f"{img_id}_gt_flat.npy"
+        if pred_flat_path.exists() and gt_flat_path.exists():
+            try:
+                all_predictions_loaded.append(np.load(pred_flat_path))
+                all_ground_truths_loaded.append(np.load(gt_flat_path))
+                loaded_count += 1
+            except Exception as e:
+                logging.warning(f"Could not load temp analysis data for {img_id}: {e}")
+        else:
+            logging.warning(f"Temp analysis files not found for {img_id}: {pred_flat_path.exists()=}, {gt_flat_path.exists()=}")
+
+    if loaded_count == 0:
+        logging.warning("No valid prediction/GT data loaded for temperature analysis.")
+        return
+    logging.info(f"Loaded temp analysis data for {loaded_count} images.")
+    log_memory_usage("[After Temp Analysis Load]")
+
+    try:
+        all_pred_flat = np.concatenate(all_predictions_loaded)
+        all_gt_flat = np.concatenate(all_ground_truths_loaded)
+        log_memory_usage("[After Temp Analysis Concat]")
+        
+        del all_predictions_loaded, all_ground_truths_loaded
+        gc.collect()
+        log_memory_usage("[After Temp Analysis List Cleanup]")
+
+        all_gt_flat = np.round(all_gt_flat).astype(int)
+        
+        results = []
+        eps = 1e-7
+        pred_clipped = np.clip(all_pred_flat, eps, 1 - eps)
+        logits = np.log(pred_clipped / (1 - pred_clipped))
+        
+        plt.figure(figsize=(12, 8))
+        ax_hist = plt.gca().twinx()
+        ax_hist.hist(all_pred_flat, bins=30, alpha=0.2, density=True, color='gray', label='Original Pred Dist')
+        ax_hist.set_ylabel('Density')
+        ax_hist.legend(loc='center right')
+
+        for temp in temperatures:
+            scaled_logits = logits / temp
+            calibrated_pred = 1 / (1 + np.exp(-scaled_logits))
+            
+            prob_true, prob_pred = calibration_curve(all_gt_flat, calibrated_pred, n_bins=10, strategy='uniform')
+            hist_counts, _ = np.histogram(calibrated_pred, bins=10, range=(0,1))
+            total_count = len(calibrated_pred)
+            bin_weights = hist_counts / total_count
+            ece = np.sum(np.abs(prob_true - prob_pred) * bin_weights)
+
+            results.append({'temperature': temp, 'ece': ece})
+            
+            plt.plot(prob_pred, prob_true, marker='o', linestyle='--', linewidth=1.5, alpha=0.8,
+                     label=f'T={temp:.2f} (ECE={ece:.4f})')
+
+        temp_df = pd.DataFrame(results)
+        valid_ece = temp_df[np.isfinite(temp_df['ece'])]
+        if not valid_ece.empty:
+            best_temp_idx = valid_ece['ece'].idxmin()
+            best_temp = valid_ece.loc[best_temp_idx, 'temperature']
+            best_ece = valid_ece.loc[best_temp_idx, 'ece']
+            logging.info(f"Temperature scaling analysis complete. Best temperature: {best_temp:.2f} with ECE: {best_ece:.4f}")
+
+            plt.figure(figsize=(8, 6))
+            plt.plot(valid_ece['temperature'], valid_ece['ece'], marker='o')
+            plt.scatter([best_temp], [best_ece], color='red', s=100, zorder=5, label=f'Best T={best_temp:.2f} (ECE={best_ece:.4f})')
+            plt.xlabel('Temperature (T)')
+            plt.ylabel('Expected Calibration Error (ECE)')
+            plt.title('ECE vs. Temperature Scaling (Finite Values)')
+            plt.legend()
+            plt.grid(True, alpha=0.3)
+            
+            ece_vs_temp_path = output_dir / "ece_vs_temperature.png"
+            plt.savefig(ece_vs_temp_path, dpi=200)
+            plt.close()
+            if log_wandb:
+                try:
+                    wandb.log({"plots/ece_vs_temperature": wandb.Image(str(ece_vs_temp_path))})
+                    wandb.summary['best_temperature'] = best_temp
+                    wandb.summary['best_temperature_ece'] = best_ece
+                except Exception as e:
+                    logging.warning(f"Could not log ECE vs Temp plot/summary to W&B: {e}")
+        else:
+            logging.warning("No valid (finite) ECE values found during temperature scaling.")
+            if log_wandb:
+                 wandb.summary['best_temperature'] = None
+                 wandb.summary['best_temperature_ece'] = None
+
+    except ValueError as e:
+        logging.error(f"ValueError during temperature analysis: {e}")
+    except Exception as e:
+        logging.error(f"Unexpected error during temperature analysis: {e}")
+    finally:
+        if 'all_pred_flat' in locals(): del all_pred_flat
+        if 'all_gt_flat' in locals(): del all_gt_flat
+        if 'logits' in locals(): del logits
+        gc.collect()
+        log_memory_usage("[End of Temp Analysis]")
 
 
 def plot_global_sparsification_curve(processed_ids, temp_data_dir, output_dir, model_label="Model", log_wandb=False):
@@ -304,47 +565,117 @@ def plot_global_uncertainty_distribution(processed_ids, temp_data_dir, output_di
     gc.collect()
 
 
-def get_args():
-    parser = argparse.ArgumentParser(description='Analyze model performance, calibration and uncertainty')
-    parser.add_argument('--model', '-m', default='best_model.pth', metavar='FILE', help='Model file')
-    parser.add_argument('--lesion_type', type=str, required=True, default='EX', 
-                      choices=['EX', 'HE', 'MA','OD'], help='Lesion type')
-    parser.add_argument('--attention', dest='use_attention', action='store_true', help='Enable attention mechanism (default)')
-    parser.add_argument('--no-attention', dest='use_attention', action='store_false', help='Disable attention mechanism')
-    parser.add_argument('--temperature', type=float, default=1.0, help='Temperature for sampling')
-    parser.add_argument('--samples', type=int, default=30, help='Number of samples for ensemble prediction')
-    parser.add_argument('--patch_size', type=int, default=512, help='Patch size (0 for full image)')
-    parser.add_argument('--overlap', type=int, default=100, help='Overlap between patches')
-    parser.add_argument('--output_dir', type=str, default='./analysis', help='Output directory')
-    parser.add_argument('--batch_size', type=int, default=4, help='Batch size for processing')
-    parser.add_argument('--max_images', type=int, default=None, help='Maximum number of images to process')
-    parser.add_argument('--scale', type=float, default=1.0, help='Scale factor for resizing (default: 1.0)')
+def create_uncertainty_visualizations(metrics_df, output_dir, log_wandb=False):  
+    sns.set_style("whitegrid")
+    plt.rcParams.update({'font.size': 11})
     
-    parser.add_argument('--latent-injection', type=str, default='all', 
-                        choices=['all', 'first', 'last', 'bottleneck', 'inject_no_bottleneck', 'none'],
-                        help='Latent space injection strategy')
+    fig, axes = plt.subplots(2, 2, figsize=(14, 12))
+    axes = axes.flatten()
+    
+    numeric_cols = [col for col in metrics_df.columns if col != 'img_id']
+    for col in numeric_cols:
+        if col in metrics_df.columns:
+            metrics_df[col] = pd.to_numeric(metrics_df[col], errors='coerce')
+        else:
+            logging.warning(f"Column '{col}' not found in metrics_df for numeric conversion.")
+            
+    logging.info(f"DataFrame columns for uncertainty viz: {metrics_df.columns.tolist()}")
+    logging.info(f"DataFrame dtypes for uncertainty viz: {metrics_df.dtypes}")
+    
+    try:
+        if 'dice' in metrics_df.columns and 'ece' in metrics_df.columns:
+            sns.scatterplot(x='dice', y='ece', data=metrics_df, ax=axes[0], s=80, alpha=0.7)
+            axes[0].set_title('Segmentation Accuracy vs. Calibration Error', fontsize=14)
+            axes[0].set_xlabel('Dice Score (higher is better)', fontsize=12)
+            axes[0].set_ylabel('ECE (lower is better)', fontsize=12)
+            
+            corr = metrics_df['dice'].corr(metrics_df['ece'])
+            axes[0].annotate(f'Correlation: {corr:.3f}', 
+                             xy=(0.05, 0.95), xycoords='axes fraction',
+                             bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="gray", alpha=0.8))
+        else:
+            axes[0].text(0.5, 0.5, "Dice or ECE data missing", ha='center', va='center')
+            axes[0].set_title('Segmentation Accuracy vs. Calibration Error (Data Missing)')
+    except Exception as e:
+        logging.error(f"Error creating Dice vs ECE plot: {e}")
+        axes[0].text(0.5, 0.5, "Error plotting Dice vs ECE", ha='center', va='center')
+    
+    try:
+        if 'dice' in metrics_df.columns and 'sparsification_error' in metrics_df.columns:
+            colors = ['green' if se > 0 else 'red' for se in metrics_df['sparsification_error']]
+            scatter = sns.scatterplot(x='dice', y='sparsification_error', data=metrics_df, 
+                                     ax=axes[1], s=80, alpha=0.7, hue=colors, palette={'green':'green', 'red':'red'}, legend=False) 
+            axes[1].set_title('Segmentation Accuracy vs. Uncertainty Quality', fontsize=14)
+            axes[1].set_xlabel('Dice Score (higher is better)', fontsize=12)
+            axes[1].set_ylabel('Sparsification Error (higher is better)', fontsize=12)
+            
+            from matplotlib.lines import Line2D
+            legend_elements = [
+                Line2D([0], [0], marker='o', color='w', markerfacecolor='green', markersize=10, 
+                      label='Good uncertainty (SE > 0)'),
+                Line2D([0], [0], marker='o', color='w', markerfacecolor='red', markersize=10, 
+                      label='Poor uncertainty (SE <= 0)')
+            ]
+            axes[1].legend(handles=legend_elements, loc='lower right') 
+            
+            corr = metrics_df['dice'].corr(metrics_df['sparsification_error'])
+            axes[1].annotate(f'Correlation: {corr:.3f}', 
+                              xy=(0.05, 0.95), xycoords='axes fraction',
+                              bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="gray", alpha=0.8))
+        else:
+            axes[1].text(0.5, 0.5, "Dice or Sparsification Error data missing", ha='center', va='center')
+            axes[1].set_title('Segmentation Accuracy vs. Uncertainty Quality (Data Missing)')
+    except Exception as e:
+        logging.error(f"Error creating Dice vs Sparsification Error plot: {e}")
+        axes[1].text(0.5, 0.5, "Error plotting Dice vs SE", ha='center', va='center')
+    
+    try:
+        if 'ece' in metrics_df.columns:
+            sns.histplot(x='ece', data=metrics_df, kde=True, ax=axes[2], color='teal')
+            axes[2].axvline(metrics_df['ece'].mean(), color='r', linestyle='--', 
+                             label=f'Mean: {metrics_df["ece"].mean():.3f}')
+            
+            axes[2].axvspan(0, 0.01, alpha=0.2, color='green', label='Excellent (<0.01)')
+            axes[2].axvspan(0.01, 0.05, alpha=0.2, color='yellowgreen', label='Good (<0.05)')
+            axes[2].axvspan(0.05, 0.15, alpha=0.2, color='orange', label='Fair (<0.15)')
+            axes[2].axvspan(0.15, 1, alpha=0.2, color='red', label='Poor (>0.15)')
+            
+            axes[2].set_title('Distribution of Expected Calibration Error', fontsize=14)
+            axes[2].set_xlabel('ECE (lower is better)', fontsize=12)
+            axes[2].legend(loc='upper right', fontsize=9)
+        else:
+            axes[2].text(0.5, 0.5, "ECE data missing", ha='center', va='center')
+            axes[2].set_title('Distribution of Expected Calibration Error (Data Missing)')
+    except Exception as e:
+        logging.error(f"Error creating ECE histogram: {e}")
+        axes[2].text(0.5, 0.5, "Error plotting ECE", ha='center', va='center')
 
-    parser.add_argument('--temp_values', type=float, nargs='+', 
-                       default=[0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 3.0],
-                       help='Temperature values to analyze for temperature scaling')
-    
-    parser.add_argument('--store_data', action='store_true',
-                        help='If set, store per-image sparsification and uncertainty arrays to disk for later comparisons')
-    parser.add_argument('--model_label', type=str, default='Model',
-                        help='Label to use when plotting ROC/PR (e.g. "High-KL")')
-    
-    parser.add_argument('--wandb_project', type=str, default='VAEUNET-Analysis', help='W&B project name')
-    parser.add_argument('--wandb_entity', type=str, default=None, help='W&B entity (team/user name)')
-    parser.add_argument('--wandb_run_name', type=str, default=None, help='W&B run name (defaults to auto-generated)')
-    parser.add_argument('--no_wandb', action='store_true', help='Disable W&B logging')
+    try:
+        if 'uncertainty_error_dice' in metrics_df.columns:
+            sns.histplot(x='uncertainty_error_dice', data=metrics_df, kde=True, ax=axes[3], color='indigo')
+            axes[3].axvline(metrics_df['uncertainty_error_dice'].mean(), color='r', linestyle='--',
+                              label=f'Mean: {metrics_df["uncertainty_error_dice"].mean():.3f}')
+            axes[3].set_title('Distribution of Uncertainty-Error Dice', fontsize=14)
+            axes[3].set_xlabel('U-E Dice (higher indicates better overlap)', fontsize=12)
+            axes[3].set_xlim(0, 1)
+            axes[3].legend(loc='upper right')
+        else:
+            axes[3].text(0.5, 0.5, "U-E Dice data missing", ha='center', va='center')
+            axes[3].set_title('Distribution of Uncertainty-Error Dice (Data Missing)')
+    except Exception as e:
+        logging.error(f"Error creating U-E Dice histogram: {e}")
+        axes[3].text(0.5, 0.5, "Error plotting U-E Dice", ha='center', va='center')
 
-    parser.set_defaults(use_attention=True, enable_dropout=False)
-    args = parser.parse_args()
-    
-    if args.patch_size == 0:
-        args.patch_size = None
-        
-    return args
+    plt.suptitle(f'Uncertainty Analysis Summary - {len(metrics_df)} Images', fontsize=16, y=0.99)
+    plt.tight_layout(rect=[0, 0, 1, 0.97])
+    uncertainty_summary_path = output_dir / "uncertainty_summary.png"
+    plt.savefig(uncertainty_summary_path, dpi=300, bbox_inches='tight')
+    plt.close(fig)
+    if log_wandb:
+        try:
+            wandb.log({"plots/uncertainty_summary": wandb.Image(str(uncertainty_summary_path))})
+        except Exception as e:
+            logging.warning(f"Could not log uncertainty summary plot to W&B: {e}")
 
 
 @track_memory
@@ -530,10 +861,12 @@ def analyze_model(model, dataset, args, wandb_run=None):
 
     metrics_df = pd.DataFrame(metrics_data)
     metrics_df = fix_dataframe_tensors(metrics_df)
+    numeric_cols = [] # Keep track of numeric columns for summary
     for col in metrics_df.columns:
         if col != 'img_id':
             try:
                 metrics_df[col] = pd.to_numeric(metrics_df[col], errors='coerce')
+                numeric_cols.append(col) # Add to list if conversion is successful
             except Exception as e:
                 logging.warning(f"Could not convert {col} to numeric: {e}")
     
@@ -543,65 +876,29 @@ def analyze_model(model, dataset, args, wandb_run=None):
     
     if log_wandb:
         try:
-            wandb.log({"analysis_summary_table": wandb.Table(dataframe=metrics_df)})
+            # Calculate mean values for summary row
+            summary_row = metrics_df[numeric_cols].mean().to_dict()
+            summary_row['img_id'] = 'Overall Mean' # Add identifier for the summary row
+            
+            # Create a DataFrame for the summary row
+            summary_df = pd.DataFrame([summary_row])
+            
+            # Concatenate the summary row to the original DataFrame
+            df_for_wandb = pd.concat([metrics_df, summary_df], ignore_index=True)
+            
+            # Log the table with the summary row
+            wandb.log({"analysis_summary_table": wandb.Table(dataframe=df_for_wandb)})
         except Exception as e:
-            logging.warning(f"Could not log metrics DataFrame to W&B: {e}")
-
-    logging.info(f"Loading temporary pixel data for {len(processed_ids)} images...")
-    all_predictions_loaded = []
-    all_ground_truths_loaded = []
-    all_errors_loaded = []
-    all_uncertainties_loaded = []
-
-    for img_id in tqdm(processed_ids, desc="Loading temp data"):
-        pred_flat_path = temp_pixel_data_dir / f"{img_id}_pred_flat.npy"
-        gt_flat_path = temp_pixel_data_dir / f"{img_id}_gt_flat.npy"
-        errors_path = temp_pixel_data_dir / f"{img_id}_errors.npy"
-        uncertainties_path = temp_pixel_data_dir / f"{img_id}_uncertainties.npy"
-
-        if pred_flat_path.exists() and gt_flat_path.exists():
-            all_predictions_loaded.append(np.load(pred_flat_path))
-            all_ground_truths_loaded.append(np.load(gt_flat_path))
-        if errors_path.exists() and uncertainties_path.exists():
-            all_errors_loaded.append(np.load(errors_path))
-            all_uncertainties_loaded.append(np.load(uncertainties_path))
-
-    logging.info("Finished loading temporary data.")
-    gc.collect()
+            logging.warning(f"Could not log metrics DataFrame with summary row to W&B: {e}")
 
     create_uncertainty_visualizations(metrics_df, output_dir, log_wandb=log_wandb)
     
-    if all_predictions_loaded and all_ground_truths_loaded:
-        create_calibration_visualizations(all_predictions_loaded, all_ground_truths_loaded, output_dir, log_wandb=log_wandb)
-        perform_temperature_analysis(all_predictions_loaded, all_ground_truths_loaded, output_dir, args.temp_values, log_wandb=log_wandb)
-    else:
-        logging.warning("Skipping calibration and temperature analysis due to missing loaded data.")
-
+    create_calibration_visualizations(processed_ids, temp_pixel_data_dir, output_dir, log_wandb=log_wandb)
+    perform_temperature_analysis(processed_ids, temp_pixel_data_dir, output_dir, args.temp_values, log_wandb=log_wandb)
     plot_global_sparsification_curve(processed_ids, temp_pixel_data_dir, output_dir, model_label=args.model_label, log_wandb=log_wandb)
     plot_global_uncertainty_distribution(processed_ids, temp_pixel_data_dir, output_dir, model_label=args.model_label, log_wandb=log_wandb)
+    plot_global_roc_pr(processed_ids, temp_pixel_data_dir, output_dir, model_label=args.model_label, prefix="global_", log_wandb=log_wandb)
     
-    if all_errors_loaded and all_uncertainties_loaded:
-        logging.info("Concatenating global errors and uncertainties for ROC/PR plots...")
-        try:
-            if len(all_errors_loaded) > 0:
-                 logging.debug(f"Shapes of first few error arrays: {[e.shape for e in all_errors_loaded[:3]]}")
-                 logging.debug(f"Shapes of first few uncertainty arrays: {[u.shape for u in all_uncertainties_loaded[:3]]}")
-            
-            all_err_concat = np.concatenate(all_errors_loaded)
-            all_unc_concat = np.concatenate(all_uncertainties_loaded)
-            logging.info(f"Concatenated shapes: errors={all_err_concat.shape}, uncertainties={all_unc_concat.shape}")
-            plot_global_roc_pr(all_err_concat, all_unc_concat, output_dir, model_label=args.model_label, prefix="global_", log_wandb=log_wandb)
-            del all_err_concat, all_unc_concat
-        except ValueError as e:
-             logging.error(f"Error concatenating global arrays for ROC/PR: {e}. Check shapes of temporary .npy files in {temp_pixel_data_dir}. Skipping plot.")
-        except Exception as e:
-             logging.error(f"Unexpected error during global ROC/PR generation: {e}. Skipping plot.")
-    else:
-        logging.warning("Skipping global ROC/PR plot due to missing loaded data.")
-    
-    del all_predictions_loaded, all_ground_truths_loaded, all_errors_loaded, all_uncertainties_loaded
-    gc.collect()
-
     if log_wandb:
         try:
             summary_stats = {
@@ -640,260 +937,46 @@ def analyze_model(model, dataset, args, wandb_run=None):
     return metrics_df
 
 
-def create_uncertainty_visualizations(metrics_df, output_dir, log_wandb=False):  
-    sns.set_style("whitegrid")
-    plt.rcParams.update({'font.size': 11})
-    
-    fig, axes = plt.subplots(2, 2, figsize=(14, 12))
-    axes = axes.flatten()
-    
-    numeric_cols = [col for col in metrics_df.columns if col != 'img_id']
-    for col in numeric_cols:
-        if col in metrics_df.columns:
-            metrics_df[col] = pd.to_numeric(metrics_df[col], errors='coerce')
-        else:
-            logging.warning(f"Column '{col}' not found in metrics_df for numeric conversion.")
-            
-    logging.info(f"DataFrame columns for uncertainty viz: {metrics_df.columns.tolist()}")
-    logging.info(f"DataFrame dtypes for uncertainty viz: {metrics_df.dtypes}")
-    
-    try:
-        if 'dice' in metrics_df.columns and 'ece' in metrics_df.columns:
-            sns.scatterplot(x='dice', y='ece', data=metrics_df, ax=axes[0], s=80, alpha=0.7)
-            axes[0].set_title('Segmentation Accuracy vs. Calibration Error', fontsize=14)
-            axes[0].set_xlabel('Dice Score (higher is better)', fontsize=12)
-            axes[0].set_ylabel('ECE (lower is better)', fontsize=12)
-            
-            corr = metrics_df['dice'].corr(metrics_df['ece'])
-            axes[0].annotate(f'Correlation: {corr:.3f}', 
-                             xy=(0.05, 0.95), xycoords='axes fraction',
-                             bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="gray", alpha=0.8))
-        else:
-            axes[0].text(0.5, 0.5, "Dice or ECE data missing", ha='center', va='center')
-            axes[0].set_title('Segmentation Accuracy vs. Calibration Error (Data Missing)')
-    except Exception as e:
-        logging.error(f"Error creating Dice vs ECE plot: {e}")
-        axes[0].text(0.5, 0.5, "Error plotting Dice vs ECE", ha='center', va='center')
-    
-    try:
-        if 'dice' in metrics_df.columns and 'sparsification_error' in metrics_df.columns:
-            colors = ['green' if se > 0 else 'red' for se in metrics_df['sparsification_error']]
-            scatter = sns.scatterplot(x='dice', y='sparsification_error', data=metrics_df, 
-                                     ax=axes[1], s=80, alpha=0.7, hue=colors, palette={'green':'green', 'red':'red'}, legend=False) 
-            axes[1].set_title('Segmentation Accuracy vs. Uncertainty Quality', fontsize=14)
-            axes[1].set_xlabel('Dice Score (higher is better)', fontsize=12)
-            axes[1].set_ylabel('Sparsification Error (higher is better)', fontsize=12)
-            
-            from matplotlib.lines import Line2D
-            legend_elements = [
-                Line2D([0], [0], marker='o', color='w', markerfacecolor='green', markersize=10, 
-                      label='Good uncertainty (SE > 0)'),
-                Line2D([0], [0], marker='o', color='w', markerfacecolor='red', markersize=10, 
-                      label='Poor uncertainty (SE <= 0)')
-            ]
-            axes[1].legend(handles=legend_elements, loc='lower right') 
-            
-            corr = metrics_df['dice'].corr(metrics_df['sparsification_error'])
-            axes[1].annotate(f'Correlation: {corr:.3f}', 
-                              xy=(0.05, 0.95), xycoords='axes fraction',
-                              bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="gray", alpha=0.8))
-        else:
-            axes[1].text(0.5, 0.5, "Dice or Sparsification Error data missing", ha='center', va='center')
-            axes[1].set_title('Segmentation Accuracy vs. Uncertainty Quality (Data Missing)')
-    except Exception as e:
-        logging.error(f"Error creating Dice vs Sparsification Error plot: {e}")
-        axes[1].text(0.5, 0.5, "Error plotting Dice vs SE", ha='center', va='center')
-    
-    try:
-        if 'ece' in metrics_df.columns:
-            sns.histplot(x='ece', data=metrics_df, kde=True, ax=axes[2], color='teal')
-            axes[2].axvline(metrics_df['ece'].mean(), color='r', linestyle='--', 
-                             label=f'Mean: {metrics_df["ece"].mean():.3f}')
-            
-            axes[2].axvspan(0, 0.01, alpha=0.2, color='green', label='Excellent (<0.01)')
-            axes[2].axvspan(0.01, 0.05, alpha=0.2, color='yellowgreen', label='Good (<0.05)')
-            axes[2].axvspan(0.05, 0.15, alpha=0.2, color='orange', label='Fair (<0.15)')
-            axes[2].axvspan(0.15, 1, alpha=0.2, color='red', label='Poor (>0.15)')
-            
-            axes[2].set_title('Distribution of Expected Calibration Error', fontsize=14)
-            axes[2].set_xlabel('ECE (lower is better)', fontsize=12)
-            axes[2].legend(loc='upper right', fontsize=9)
-        else:
-            axes[2].text(0.5, 0.5, "ECE data missing", ha='center', va='center')
-            axes[2].set_title('Distribution of Expected Calibration Error (Data Missing)')
-    except Exception as e:
-        logging.error(f"Error creating ECE histogram: {e}")
-        axes[2].text(0.5, 0.5, "Error plotting ECE", ha='center', va='center')
+def get_args():
+    parser = argparse.ArgumentParser(description='Analyze VAE-UNet model performance and uncertainty')
+    parser.add_argument('--model', '-m', default='best_model.pth', metavar='FILE',
+                        help='Specify the file in which the model is stored')
+    parser.add_argument('--lesion_type', type=str, required=True, choices=['EX', 'HE', 'MA', 'SE', 'OD'],
+                        help='Lesion type to analyze')
+    parser.add_argument('--temperature', type=float, default=1.0,
+                        help='Temperature for sampling from latent space (default: 1.0)')
+    parser.add_argument('--samples', type=int, default=10,
+                        help='Number of samples for uncertainty estimation (default: 10)')
+    parser.add_argument('--patch_size', type=int, default=None,
+                        help='Patch size for prediction. If None, uses full image.')
+    parser.add_argument('--overlap', type=int, default=100,
+                        help='Overlap between patches if using patch_size (default: 100)')
+    parser.add_argument('--scale', type=float, default=1.0,
+                        help='Scale factor for resizing images (default: 1.0)')
+    parser.add_argument('--attention', dest='use_attention', action='store_true',
+                        help='Enable attention mechanism (default)')
+    parser.add_argument('--no-attention', dest='use_attention', action='store_false',
+                        help='Disable attention mechanism')
+    parser.add_argument('--latent-injection', type=str, default='all', 
+                        choices=['all', 'first', 'last', 'bottleneck', 'inject_no_bottleneck', 'none'],
+                        help='Latent space injection strategy')
+    parser.add_argument('--output_dir', type=str, default='./analysis_results',
+                        help='Directory to save analysis results and plots')
+    parser.add_argument('--max_images', type=int, default=None,
+                        help='Maximum number of test images to process (default: all)')
+    parser.add_argument('--temp_values', type=float, nargs='+', default=[0.5, 1.0, 1.5, 2.0, 2.5, 3.0],
+                        help='List of temperatures for temperature scaling analysis')
+    parser.add_argument('--model_label', type=str, default='VAE-UNet',
+                        help='Label for the model in plots')
+    parser.add_argument('--batch_size', type=int, default=4,
+                        help='Batch size for patch processing (default: 4)')
+    parser.add_argument('--no_wandb', action='store_true', help='Disable Weights & Biases logging')
+    parser.add_argument('--wandb_project', type=str, default='VAE_UNet_Analysis', help='W&B project name')
+    parser.add_argument('--wandb_entity', type=str, default=None, help='W&B entity (username or team)')
+    parser.add_argument('--wandb_run_name', type=str, default=None, help='W&B run name (defaults to auto-generated)')
 
-    try:
-        if 'uncertainty_error_dice' in metrics_df.columns:
-            sns.histplot(x='uncertainty_error_dice', data=metrics_df, kde=True, ax=axes[3], color='indigo')
-            axes[3].axvline(metrics_df['uncertainty_error_dice'].mean(), color='r', linestyle='--',
-                              label=f'Mean: {metrics_df["uncertainty_error_dice"].mean():.3f}')
-            axes[3].set_title('Distribution of Uncertainty-Error Dice', fontsize=14)
-            axes[3].set_xlabel('U-E Dice (higher indicates better overlap)', fontsize=12)
-            axes[3].set_xlim(0, 1)
-            axes[3].legend(loc='upper right')
-        else:
-            axes[3].text(0.5, 0.5, "U-E Dice data missing", ha='center', va='center')
-            axes[3].set_title('Distribution of Uncertainty-Error Dice (Data Missing)')
-    except Exception as e:
-        logging.error(f"Error creating U-E Dice histogram: {e}")
-        axes[3].text(0.5, 0.5, "Error plotting U-E Dice", ha='center', va='center')
-
-    plt.suptitle(f'Uncertainty Analysis Summary - {len(metrics_df)} Images', fontsize=16, y=0.99)
-    plt.tight_layout(rect=[0, 0, 1, 0.97])
-    uncertainty_summary_path = output_dir / "uncertainty_summary.png"
-    plt.savefig(uncertainty_summary_path, dpi=300, bbox_inches='tight')
-    plt.close(fig)
-    if log_wandb:
-        try:
-            wandb.log({"plots/uncertainty_summary": wandb.Image(str(uncertainty_summary_path))})
-        except Exception as e:
-            logging.warning(f"Could not log uncertainty summary plot to W&B: {e}")
-
-
-def create_calibration_visualizations(all_predictions, all_ground_truths, output_dir, log_wandb=False):  
-    if not all_predictions or not all_ground_truths:
-        logging.warning("No prediction data available for calibration analysis")
-        return
-        
-    all_pred_flat = np.concatenate(all_predictions)
-    all_gt_flat = np.concatenate(all_ground_truths)
-    
-    all_gt_flat = np.round(all_gt_flat).astype(int)
-    
-    global_prob_true, global_prob_pred = calibration_curve(
-        all_gt_flat, all_pred_flat, n_bins=10, strategy='uniform'
-    )
-    
-    global_ece = np.sum(
-        np.abs(global_prob_true - global_prob_pred) * 
-        np.histogram(all_pred_flat, bins=10)[0] / len(all_pred_flat)
-    )
-    
-    fig, ax = plt.subplots(figsize=(10, 8))
-    
-    ax.plot(global_prob_pred, global_prob_true, marker='o', linewidth=2,
-           label=f'Calibration Curve (ECE={global_ece:.4f})')
-    
-    ax.plot([0, 1], [0, 1], 'k--', label='Perfect Calibration')
-    
-    ax2 = ax.twinx()
-    ax2.hist(all_pred_flat, bins=20, alpha=0.3, density=True,
-            color='gray', label='Prediction Distribution')
-    ax2.set_ylabel('Density')
-    
-    ax.set_xlabel('Mean Predicted Probability')
-    ax.set_ylabel('Fraction of Positives')
-    ax.set_title(f'Global Calibration Curve (All Images)')
-    ax.legend(loc='upper left')
-    ax2.legend(loc='upper right')
-    ax.grid(True, alpha=0.3)
-    
-    plt.tight_layout()
-    global_calib_path = output_dir / "global_calibration_curve.png"
-    plt.savefig(global_calib_path, dpi=200)
-    plt.close(fig)
-    if log_wandb:
-        try:
-            wandb.log({"plots/global_calibration_curve": wandb.Image(str(global_calib_path))})
-        except Exception as e:
-            logging.warning(f"Could not log global calibration curve to W&B: {e}")
-
-
-def perform_temperature_analysis(all_predictions, all_ground_truths, output_dir, temperatures, log_wandb=False):
-    if not all_predictions or not all_ground_truths:
-        logging.warning("No prediction data available for temperature analysis")
-        return
-
-    all_pred_flat = np.concatenate(all_predictions)
-    all_gt_flat = np.concatenate(all_ground_truths)
-    all_gt_flat = np.round(all_gt_flat).astype(int)
-
-    results = []
-    plt.figure(figsize=(12, 8))
-    
-    ax_hist = plt.gca().twinx()
-    ax_hist.hist(all_pred_flat, bins=30, alpha=0.2, density=True, color='gray', label='Original Pred Dist')
-    ax_hist.set_ylabel('Density')
-    ax_hist.legend(loc='center right')
-
-    for temp in temperatures:
-        eps = 1e-7
-        pred_clipped = np.clip(all_pred_flat, np.nextafter(0., 1.), np.nextafter(1., 0.))
-        
-        if not np.all(np.isfinite(pred_clipped)):
-             logging.warning(f"Non-finite values found in predictions before logit calculation for T={temp}. Skipping this temperature.")
-             results.append({'temperature': temp, 'ece': np.inf})
-             continue
-
-        logits = np.log(pred_clipped / (1 - pred_clipped))
-        
-        if not np.all(np.isfinite(logits)):
-             logging.warning(f"Non-finite values found in logits for T={temp}. Skipping this temperature.")
-             results.append({'temperature': temp, 'ece': np.inf})
-             continue
-             
-        scaled_logits = logits / temp
-        calibrated_pred = 1 / (1 + np.exp(-scaled_logits))
-        
-        if not np.all(np.isfinite(calibrated_pred)):
-             logging.warning(f"Non-finite values found in calibrated predictions for T={temp}. Skipping this temperature.")
-             results.append({'temperature': temp, 'ece': np.inf})
-             continue
-
-        try:
-            prob_true, prob_pred = calibration_curve(all_gt_flat, calibrated_pred, n_bins=10, strategy='uniform')
-            hist_counts, _ = np.histogram(calibrated_pred, bins=10, range=(0,1))
-            total_count = len(calibrated_pred)
-            if total_count == 0:
-                 ece = 0.0
-            else:
-                 bin_weights = hist_counts / total_count
-                 ece = np.sum(np.abs(prob_true - prob_pred) * bin_weights)
-
-            results.append({'temperature': temp, 'ece': ece})
-            
-            plt.plot(prob_pred, prob_true, marker='o', linestyle='--', linewidth=1.5, alpha=0.8,
-                     label=f'T={temp:.2f} (ECE={ece:.4f})')
-        except Exception as e:
-             logging.error(f"Error calculating calibration curve or ECE for T={temp}: {e}")
-             results.append({'temperature': temp, 'ece': np.inf})
-
-
-    temp_df = pd.DataFrame(results)
-    valid_ece = temp_df[np.isfinite(temp_df['ece'])]
-    if not valid_ece.empty:
-        best_temp_idx = valid_ece['ece'].idxmin()
-        best_temp = valid_ece.loc[best_temp_idx, 'temperature']
-        best_ece = valid_ece.loc[best_temp_idx, 'ece']
-        logging.info(f"Temperature scaling analysis complete. Best temperature: {best_temp:.2f} with ECE: {best_ece:.4f}")
-
-        plt.figure(figsize=(8, 6))
-        plt.plot(valid_ece['temperature'], valid_ece['ece'], marker='o')
-        plt.scatter([best_temp], [best_ece], color='red', s=100, zorder=5, label=f'Best T={best_temp:.2f} (ECE={best_ece:.4f})')
-        plt.xlabel('Temperature (T)')
-        plt.ylabel('Expected Calibration Error (ECE)')
-        plt.title('ECE vs. Temperature Scaling (Finite Values)')
-        plt.legend()
-        plt.grid(True, alpha=0.3)
-        
-        ece_vs_temp_path = output_dir / "ece_vs_temperature.png"
-        plt.savefig(ece_vs_temp_path, dpi=200)
-        plt.close()
-        if log_wandb:
-            try:
-                wandb.log({"plots/ece_vs_temperature": wandb.Image(str(ece_vs_temp_path))})
-                wandb.summary['best_temperature'] = best_temp
-                wandb.summary['best_temperature_ece'] = best_ece
-            except Exception as e:
-                logging.warning(f"Could not log ECE vs Temp plot/summary to W&B: {e}")
-    else:
-        logging.warning("No valid (finite) ECE values found during temperature scaling.")
-        if log_wandb:
-             wandb.summary['best_temperature'] = None
-             wandb.summary['best_temperature_ece'] = None
+    parser.set_defaults(use_attention=True)
+    return parser.parse_args()
 
 
 if __name__ == '__main__':
