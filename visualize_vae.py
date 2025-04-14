@@ -248,8 +248,8 @@ def get_args():
                         help='Batch size for patch processing (default: 4)')
     parser.set_defaults(use_attention=True, enable_dropout=False)
     parser.add_argument('--latent-injection', type=str, default='all', 
-                        choices=['all', 'first', 'last', 'bottleneck', 'none'],
-                        help='Latent space injection strategy: inject at all levels, only first, only last, only bottleneck, or none')
+                        choices=['all', 'first', 'last', 'bottleneck', 'inject_no_bottleneck', 'none'],
+                        help='Latent space injection strategy')
     return parser.parse_args()
 
 def predict_with_patches(model, img, z, patch_size=512, overlap=None, batch_size=4):

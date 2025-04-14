@@ -704,7 +704,7 @@ def get_args():
     parser.add_argument('--free-bits', type=float, default=1e-3,
                       help='Free bits parameter to prevent posterior collapse')
     parser.add_argument('--latent-injection', type=str, default='all', 
-                        choices=['all', 'first', 'last', 'bottleneck', 'inject_no_bottleneck', 'none'], # Added 'inject_no_bottleneck'
+                        choices=['all', 'first', 'last', 'bottleneck', 'inject_no_bottleneck', 'none'], # Updated choices
                         help='Latent space injection strategy')
     parser.add_argument('--beta', type=float, default=0.001,
                         help='KL weight for the loss function')

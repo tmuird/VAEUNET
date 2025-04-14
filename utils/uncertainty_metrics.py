@@ -220,6 +220,47 @@ def calculate_uncertainty_error_auc(mean_pred, gt_mask, uncertainty_map):
     
     return auroc,auprc
 
+def calculate_negative_log_likelihood(predictions, targets, epsilon=1e-9):
+    """Calculates the pixel-wise Negative Log-Likelihood (NLL).
+
+    Args:
+        predictions (torch.Tensor): Predicted probabilities [H, W].
+        targets (torch.Tensor): Ground truth labels (0 or 1) [H, W].
+        epsilon (float): Small value to prevent log(0).
+
+    Returns:
+        float: Mean NLL over all pixels.
+    """
+    predictions = torch.clamp(predictions, epsilon, 1 - epsilon)
+    nll = -(targets * torch.log(predictions) + (1 - targets) * torch.log(1 - predictions))
+    return nll.mean().item()
+
+def calculate_uncertainty_error_dice(uncertainty_map, predictions_binary, targets, uncertainty_threshold=0.2):
+    """Calculates the Dice score between high uncertainty regions and error regions.
+
+    Args:
+        uncertainty_map (torch.Tensor): Uncertainty values (e.g., std dev) [H, W].
+        predictions_binary (torch.Tensor): Binarized predictions (0 or 1) [H, W].
+        targets (torch.Tensor): Ground truth labels (0 or 1) [H, W].
+        uncertainty_threshold (float): Threshold to define high uncertainty regions.
+
+    Returns:
+        float: Dice score between high uncertainty and error masks.
+    """
+    high_uncertainty_mask = (uncertainty_map > uncertainty_threshold).float()
+    error_mask = (predictions_binary != targets).float()
+
+    intersection = (high_uncertainty_mask * error_mask).sum()
+    denominator = high_uncertainty_mask.sum() + error_mask.sum()
+
+    if denominator == 0:
+        # If both masks are empty, perfect overlap (Dice=1) or undefined?
+        # Let's return 1 if intersection is also 0, else 0.
+        return 1.0 if intersection == 0 else 0.0
+        
+    dice = (2.0 * intersection) / (denominator + 1e-8)
+    return dice.item()
+
 def create_comprehensive_uncertainty_report(segmentations, ground_truth, output_path=None):
     # (No change to your original function)
     pass

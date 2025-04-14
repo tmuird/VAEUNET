@@ -12,10 +12,12 @@ from sklearn.calibration import calibration_curve
 from sklearn.metrics import roc_curve, precision_recall_curve, auc
 import matplotlib.gridspec as gridspec
 from textwrap import wrap
-import wandb  # Import wandb
-from PIL import Image  # Import Image for visualization
+import wandb
+from PIL import Image
+import matplotlib.cm as cm
+import math
 
-from utils.data_loading import IDRIDDataset, load_image  # Add load_image import
+from utils.data_loading import IDRIDDataset, load_image
 from unet.unet_resnet import UNetResNet
 from utils.uncertainty_metrics import (
     calculate_expected_calibration_error, 
@@ -23,7 +25,9 @@ from utils.uncertainty_metrics import (
     calculate_sparsification_metrics,
     plot_reliability_diagram,
     plot_sparsification_curve,
-    calculate_uncertainty_error_auc
+    calculate_uncertainty_error_auc,
+    calculate_negative_log_likelihood,
+    calculate_uncertainty_error_dice
 )
 from utils.tensor_utils import ensure_dict_python_scalars, fix_dataframe_tensors
 from visualize_vae import get_segmentation_distribution, track_memory
@@ -38,7 +42,7 @@ def plot_global_roc_pr(
     output_dir,
     model_label="Model",
     prefix="",
-    log_wandb=False  # Add wandb logging flag
+    log_wandb=False
 ):
     """
     Plots the global AUROC and AUPRC curves for pixel-level uncertainty vs. errors.
@@ -110,6 +114,121 @@ def plot_global_roc_pr(
             logging.warning(f"Could not log global AUCs to W&B summary: {e}")
 
 
+def plot_global_sparsification_curve(model_spars_data, output_dir, model_label="Model", log_wandb=False):
+    """Plots the average sparsification curve across all images."""
+    if not model_spars_data:
+        logging.warning("No sparsification data available to plot global curve.")
+        return
+
+    # Assuming all frac_removed arrays are the same
+    frac_removed = model_spars_data[0]['frac_removed']
+    
+    # Average the error curves
+    all_err_random = np.stack([d['err_random'] for d in model_spars_data])
+    all_err_uncertainty = np.stack([d['err_uncertainty'] for d in model_spars_data])
+    
+    avg_err_random = np.mean(all_err_random, axis=0)
+    avg_err_uncertainty = np.mean(all_err_uncertainty, axis=0)
+    
+    # Normalize by the initial random error
+    if avg_err_random[0] > 0:
+        norm_avg_random = avg_err_random / avg_err_random[0]
+        norm_avg_uncertainty = avg_err_uncertainty / avg_err_random[0]
+    else:
+        norm_avg_random = avg_err_random
+        norm_avg_uncertainty = avg_err_uncertainty
+        
+    # Calculate average Sparsification Error (SE)
+    avg_se = np.trapz(norm_avg_random - norm_avg_uncertainty, frac_removed)
+
+    fig, ax = plt.subplots(figsize=(8, 6))
+    ax, _ = plot_sparsification_curve(frac_removed, avg_err_random, avg_err_uncertainty, ax=ax)
+    ax.set_title(f'Global Sparsification Curve ({model_label})\nAverage SE = {avg_se:.4f}')
+    
+    plt.tight_layout()
+    global_spars_path = output_dir / "global_sparsification_curve.png"
+    plt.savefig(global_spars_path, dpi=300)
+    plt.close(fig)
+    logging.info(f"Global sparsification curve saved to {global_spars_path}")
+    
+    if log_wandb:
+        try:
+            wandb.log({"plots/global_sparsification_curve": wandb.Image(str(global_spars_path))})
+            wandb.summary["global_sparsification_error"] = avg_se
+        except Exception as e:
+            logging.warning(f"Could not log global sparsification curve to W&B: {e}")
+
+
+def plot_global_uncertainty_distribution(model_uncert_data, output_dir, model_label="Model", log_wandb=False):
+    """Plots boxplots comparing uncertainty for correct vs incorrect pixels globally."""
+    if not model_uncert_data:
+        logging.warning("No uncertainty data available to plot global distribution.")
+        return
+
+    all_unc_correct = np.concatenate([d['uncertainties_correct'] for d in model_uncert_data if d['uncertainties_correct'].size > 0])
+    all_unc_incorrect = np.concatenate([d['uncertainties_incorrect'] for d in model_uncert_data if d['uncertainties_incorrect'].size > 0])
+
+    # Remove potential NaNs or Infs
+    all_unc_correct = all_unc_correct[np.isfinite(all_unc_correct)]
+    all_unc_incorrect = all_unc_incorrect[np.isfinite(all_unc_incorrect)]
+
+    if all_unc_correct.size == 0 and all_unc_incorrect.size == 0:
+        logging.warning("No valid uncertainty values found for global distribution plot.")
+        return
+
+    fig, ax = plt.subplots(figsize=(8, 6))
+    
+    data_to_plot = []
+    labels = []
+    if all_unc_correct.size > 0:
+        data_to_plot.append(all_unc_correct)
+        labels.append(f'Correct ({len(all_unc_correct)})')
+    if all_unc_incorrect.size > 0:
+        data_to_plot.append(all_unc_incorrect)
+        labels.append(f'Incorrect ({len(all_unc_incorrect)})')
+
+    if not data_to_plot:
+        logging.warning("No data to plot for global uncertainty distribution.")
+        plt.close(fig)
+        return
+
+    bp = ax.boxplot(data_to_plot, labels=labels, patch_artist=True, showfliers=False) # Hide outliers for clarity
+
+    colors = ['lightblue', 'lightcoral']
+    for patch, color in zip(bp['boxes'], colors):
+        patch.set_facecolor(color)
+
+    ax.set_ylabel('Uncertainty (Std Dev)')
+    ax.set_title(f'Global Uncertainty Distribution ({model_label})')
+    ax.grid(True, axis='y', linestyle='--', alpha=0.7)
+    
+    # Add median values text
+    medians = [np.median(d) for d in data_to_plot]
+    for i, median in enumerate(medians):
+        ax.text(i + 1, median, f'{median:.3f}', 
+                horizontalalignment='center', verticalalignment='bottom', 
+                fontweight='bold', color='black')
+
+    plt.tight_layout()
+    global_unc_dist_path = output_dir / "global_uncertainty_distribution.png"
+    plt.savefig(global_unc_dist_path, dpi=300)
+    plt.close(fig)
+    logging.info(f"Global uncertainty distribution plot saved to {global_unc_dist_path}")
+
+    if log_wandb:
+        try:
+            wandb.log({"plots/global_uncertainty_distribution": wandb.Image(str(global_unc_dist_path))})
+            if len(medians) == 2: # If both correct and incorrect exist
+                 wandb.summary["median_unc_correct"] = medians[0]
+                 wandb.summary["median_unc_incorrect"] = medians[1]
+            elif len(medians) == 1 and 'Correct' in labels[0]:
+                 wandb.summary["median_unc_correct"] = medians[0]
+            elif len(medians) == 1 and 'Incorrect' in labels[0]:
+                 wandb.summary["median_unc_incorrect"] = medians[0]
+        except Exception as e:
+            logging.warning(f"Could not log global uncertainty distribution to W&B: {e}")
+
+
 def store_sparsification_data(save_path, model_spars_data):
     """
     Saves the per-image sparsification data to a numpy file (or pickled file).
@@ -124,6 +243,7 @@ def store_sparsification_data(save_path, model_spars_data):
     np.save(save_path, model_spars_data, allow_pickle=True)
     logging.info(f"Stored sparsification data to {save_path}")
 
+
 def store_uncertainty_data(save_path, model_uncert_data):
     """
     Saves the correct vs. incorrect pixel uncertainty data to disk.
@@ -136,8 +256,6 @@ def store_uncertainty_data(save_path, model_uncert_data):
     """
     np.save(save_path, model_uncert_data, allow_pickle=True)
     logging.info(f"Stored uncertainty data to {save_path}")
-
-##############################################################################
 
 
 def get_args():
@@ -156,14 +274,17 @@ def get_args():
     parser.add_argument('--max_images', type=int, default=None, help='Maximum number of images to process')
     parser.add_argument('--scale', type=float, default=1.0, help='Scale factor for resizing (default: 1.0)')
     
+    # Add latent injection argument
+    parser.add_argument('--latent-injection', type=str, default='all', 
+                        choices=['all', 'first', 'last', 'bottleneck', 'inject_no_bottleneck', 'none'],
+                        help='Latent space injection strategy')
+
     # Keep temp_values for temperature analysis
     parser.add_argument('--temp_values', type=float, nargs='+', 
                        default=[0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 3.0],
                        help='Temperature values to analyze for temperature scaling')
     
     # Additional flags to control new features
-    parser.add_argument('--plot_roc_pr', action='store_true',
-                        help='If set, plot global pixel-level ROC and PR curves based on uncertainties')
     parser.add_argument('--store_data', action='store_true',
                         help='If set, store per-image sparsification and uncertainty arrays to disk for later comparisons')
     parser.add_argument('--model_label', type=str, default='Model',
@@ -186,7 +307,7 @@ def get_args():
 
 
 @track_memory
-def analyze_model(model, dataset, args, wandb_run=None):  # Add wandb_run parameter
+def analyze_model(model, dataset, args, wandb_run=None):
     """Unified analysis function that handles both uncertainty and calibration analysis,
        also storing per-image data for later comparisons, and optionally plotting
        global pixel-level ROC/PR curves."""
@@ -237,18 +358,43 @@ def analyze_model(model, dataset, args, wandb_run=None):  # Add wandb_run parame
             mean_pred = segmentations_cpu.mean(dim=0) # Shape [1, H, W]
             std_dev = segmentations_cpu.std(dim=0)   # Shape [1, H, W]
 
-            # --- Start: Restore Metrics Calculation ---
             # Flatten predictions and ground truth for metrics
             pred_flat = mean_pred[0].flatten().numpy()
             gt_flat = mask_cpu[0,0].flatten().numpy()
             gt_flat = np.round(gt_flat).astype(int) # Ensure GT is 0 or 1
 
+            # --- Calculate NEW metrics ---
+            # Entropy and Mutual Information
+            epsilon = 1e-9
+            entropy_map = -(mean_pred * torch.log(mean_pred + epsilon) + 
+                           (1 - mean_pred) * torch.log(1 - mean_pred + epsilon))
+            sample_entropies = -(segmentations_cpu * torch.log(segmentations_cpu + epsilon) + 
+                                (1 - segmentations_cpu) * torch.log(1 - segmentations_cpu + epsilon))
+            mean_entropy_pixels = sample_entropies.mean(dim=0)
+            mutual_info_map = entropy_map - mean_entropy_pixels
+            
+            mean_entropy = entropy_map.mean().item()
+            mean_mutual_info = mutual_info_map.mean().item()
+
+            # Coefficient of Variation
+            cov_map = std_dev / (mean_pred + epsilon)
+            mean_cov = cov_map.mean().item()
+            if math.isnan(mean_cov) or math.isinf(mean_cov):
+                mean_cov = np.nan_to_num(cov_map.numpy(), nan=0.0, posinf=0.0, neginf=0.0).mean()
+
+            # Negative Log-Likelihood (NLL)
+            nll = calculate_negative_log_likelihood(mean_pred[0], mask_cpu[0, 0])
+
+            # Uncertainty-Error Dice
+            pred_binary = (mean_pred[0] > 0.5).float()
+            ue_dice = calculate_uncertainty_error_dice(std_dev[0], pred_binary, mask_cpu[0, 0])
+            # --- End NEW metrics calculation ---
+
             # Calibration metrics
             ece, bin_accs, bin_confs, bin_counts = calculate_expected_calibration_error(
-                mean_pred[0], mask_cpu[0, 0] # Use mean_pred[0] which is [H, W]
+                mean_pred[0], mask_cpu[0, 0]
             )
             brier = brier_score(mean_pred[0], mask_cpu[0, 0])
-            pred_binary = (mean_pred[0] > 0.5).float()
             dice_tensor = (2.0*(pred_binary*mask_cpu[0,0]).sum())/(pred_binary.sum()+mask_cpu[0,0].sum()+1e-8)
             dice = float(dice_tensor.item())
 
@@ -272,7 +418,7 @@ def analyze_model(model, dataset, args, wandb_run=None):  # Add wandb_run parame
                 norm_uncertainty = err_uncertainty
             se = float(np.trapz(norm_random - norm_uncertainty, frac_removed))
 
-            uncertainty_threshold = 0.2 # Example threshold
+            uncertainty_threshold = 0.2
             uncertain_percent_tensor = (std_dev[0]>uncertainty_threshold).float().mean()*100
             uncertain_pixel_percent = float(uncertain_percent_tensor.item())
 
@@ -310,14 +456,19 @@ def analyze_model(model, dataset, args, wandb_run=None):  # Add wandb_run parame
             max_calibration_error = float(np.max(np.abs(bin_accs - bin_confs)))
             mean_abs_calib_error = float(np.mean(np.abs(bin_accs - bin_confs)))
 
-            # Assemble metrics dictionary
+            # Assemble metrics dictionary (including NEW metrics)
             metrics_dict = {
                 'img_id': str(img_id),
                 'dice': dice,
                 'ece': ece,
                 'brier': brier,
+                'nll': nll,
                 'sparsification_error': se,
                 'uncertain_pixel_percent': uncertain_pixel_percent,
+                'mean_entropy': mean_entropy,
+                'mean_mutual_info': mean_mutual_info,
+                'mean_coeff_variation': mean_cov,
+                'uncertainty_error_dice': ue_dice,
                 'max_calibration_error': max_calibration_error,
                 'mean_abs_calib_error': mean_abs_calib_error,
                 'error_auroc': auroc,
@@ -325,12 +476,10 @@ def analyze_model(model, dataset, args, wandb_run=None):  # Add wandb_run parame
             }
             metrics_dict = ensure_dict_python_scalars(metrics_dict)
             metrics_data.append(metrics_dict)
-            # --- End: Restore Metrics Calculation ---
 
-            # --- Start: Add Visualization Logging (as before) ---
+            # --- Start: Add Visualization Logging ---
             if log_wandb:
                 try:
-                    # 1. Load Original Image (scaled appropriately)
                     img_file = dataset.images_dir / f"{img_id}.jpg"
                     img_pil = load_image(img_file).convert('RGB')
                     w, h = img_pil.size
@@ -354,21 +503,47 @@ def analyze_model(model, dataset, args, wandb_run=None):  # Add wandb_run parame
 
                     gt_vis = (mask_cpu[0, 0].numpy() * 255).clip(0, 255).astype(np.uint8)
                     pred_vis_prob = mean_pred[0].numpy()
-                    pred_vis_prob = (pred_vis_prob - pred_vis_prob.min()) / (pred_vis_prob.max() - pred_vis_prob.min() + 1e-8)
-                    pred_vis = (pred_vis_prob * 255).clip(0, 255).astype(np.uint8)
-                    uncert_vis_raw = std_dev[0].numpy()
-                    uncert_vis_raw = (uncert_vis_raw - uncert_vis_raw.min()) / (uncert_vis_raw.max() - uncert_vis_raw.min() + 1e-8)
-                    uncert_vis = (uncert_vis_raw * 255).clip(0, 255).astype(np.uint8)
+                    pred_vis_prob_norm = (pred_vis_prob - pred_vis_prob.min()) / (pred_vis_prob.max() - pred_vis_prob.min() + 1e-8)
+                    pred_vis = (pred_vis_prob_norm * 255).clip(0, 255).astype(np.uint8)
+                    
+                    uncert_map_raw = std_dev[0].numpy()
+                    uncert_map_norm = (uncert_map_raw - uncert_map_raw.min()) / (uncert_map_raw.max() - uncert_map_raw.min() + 1e-8)
+                    colormap_hot = cm.get_cmap('hot')
+                    uncert_vis_colored = (colormap_hot(uncert_map_norm)[:, :, :3] * 255).astype(np.uint8)
+
+                    entropy_map_raw = entropy_map[0].numpy()
+                    entropy_map_norm = (entropy_map_raw - entropy_map_raw.min()) / (entropy_map_raw.max() - entropy_map_raw.min() + 1e-8)
+                    colormap_plasma = cm.get_cmap('plasma')
+                    entropy_vis_colored = (colormap_plasma(entropy_map_norm)[:, :, :3] * 255).astype(np.uint8)
+
+                    mi_map_raw = mutual_info_map[0].numpy()
+                    mi_map_norm = (mi_map_raw - mi_map_raw.min()) / (mi_map_raw.max() - mi_map_raw.min() + 1e-8)
+                    colormap_viridis = cm.get_cmap('viridis')
+                    mi_vis_colored = (colormap_viridis(mi_map_norm)[:, :, :3] * 255).astype(np.uint8)
 
                     wandb.log({
                         f"visualizations/{img_id}/original_image": wandb.Image(img_vis),
                         f"visualizations/{img_id}/ground_truth": wandb.Image(gt_vis),
                         f"visualizations/{img_id}/mean_prediction": wandb.Image(pred_vis),
-                        f"visualizations/{img_id}/uncertainty_map": wandb.Image(uncert_vis, caption=f"Mean Std: {std_dev[0].mean().item():.4f}"),
+                        f"visualizations/{img_id}/uncertainty_map_std_dev": wandb.Image(
+                            uncert_vis_colored, 
+                            caption=f"Std Dev (Aleatoric) - Mean: {std_dev[0].mean().item():.4f}"
+                        ),
+                        f"visualizations/{img_id}/uncertainty_map_entropy": wandb.Image(
+                            entropy_vis_colored, 
+                            caption=f"Entropy (Epistemic) - Mean: {mean_entropy:.4f}"
+                        ),
+                        f"visualizations/{img_id}/uncertainty_map_mutual_info": wandb.Image(
+                            mi_vis_colored, 
+                            caption=f"Mutual Info (Total) - Mean: {mean_mutual_info:.4f}"
+                        ),
                         "image_index": i
                     })
                     
-                    del img_vis, gt_vis, pred_vis, uncert_vis, img_pil, img_pil_scaled
+                    del img_vis, gt_vis, pred_vis, uncert_map_raw, uncert_map_norm, uncert_vis_colored
+                    del entropy_map_raw, entropy_map_norm, entropy_vis_colored
+                    del mi_map_raw, mi_map_norm, mi_vis_colored
+                    del img_pil, img_pil_scaled
                     if 'img_array_vis' in locals(): del img_array_vis
 
                 except Exception as e:
@@ -377,177 +552,7 @@ def analyze_model(model, dataset, args, wandb_run=None):  # Add wandb_run parame
                     traceback.print_exc()
             # --- End: Add Visualization Logging ---
 
-            # Log per-image metrics to W&B if active
-            if log_wandb:
-                try:
-                    if 'metrics_dict' in locals(): 
-                        wandb_metrics = {f"metrics/{k}": v for k, v in metrics_dict.items() if k != 'img_id'}
-                        wandb_metrics['image_index'] = i
-                        wandb.log(wandb_metrics)
-                    else:
-                         logging.warning(f"metrics_dict not found for image {img_id}, skipping W&B metric logging.")
-                except Exception as e:
-                    logging.warning(f"Could not log per-image metrics to W&B for {img_id}: {e}")
-            
-            # --- Start: Restore Individual Plot Generation ---
-            # Generate individual image reports (conditional on analysis mode)
-            img_output_dir = output_dir / "individual_reports"
-            img_output_dir.mkdir(exist_ok=True)
-            
-            # Generate individual calibration report
-            try: # Added try-except block
-                # Create calibration curve using scikit-learn
-                prob_true, prob_pred = calibration_curve(
-                    gt_flat, pred_flat, n_bins=10, strategy='uniform'
-                )
-                
-                # Create individual calibration plots
-                fig, ax = plt.subplots(figsize=(8, 8))
-                
-                # Plot calibration curve
-                ax.plot(prob_pred, prob_true, marker='o', linewidth=2, 
-                       label=f'Calibration Curve (ECE={ece:.4f})')
-                
-                # Plot the diagonal (perfect calibration)
-                ax.plot([0, 1], [0, 1], 'k--', label='Perfect Calibration')
-                
-                # Add histogram of prediction confidences
-                ax2 = ax.twinx()
-                ax2.hist(pred_flat, bins=20, alpha=0.3, density=True, 
-                        color='gray', label='Prediction Distribution')
-                ax2.set_ylabel('Density')
-                
-                # Set labels and title
-                ax.set_xlabel('Mean Predicted Probability')
-                ax.set_ylabel('Fraction of Positives')
-                ax.set_title(f'Calibration Curve for Image {img_id}')
-                ax.legend(loc='upper left')
-                ax2.legend(loc='upper right')
-                ax.grid(True, alpha=0.3)
-                
-                plt.tight_layout()
-                calib_plot_path = img_output_dir / f"{img_id}_calibration_curve.png"
-                plt.savefig(calib_plot_path, dpi=200)
-                plt.close(fig)
-                if log_wandb:
-                    try:
-                        wandb.log({f"individual_plots/{img_id}_calibration": wandb.Image(str(calib_plot_path)), "image_index": i})
-                    except Exception as e:
-                        logging.warning(f"Could not log calibration plot to W&B for {img_id}: {e}")
-            except Exception as plot_err:
-                logging.error(f"Error generating calibration plot for {img_id}: {plot_err}")
-
-            # Generate combined uncertainty metrics visualization
-            try: # Added try-except block
-                # Create figure with reliability and sparsification plots
-                fig, axes = plt.subplots(1, 2, figsize=(16, 6))
-                
-                # Enhanced reliability plot
-                plot_reliability_diagram(bin_accs, bin_confs, bin_counts, ax=axes[0])
-                axes[0].set_title(f'Reliability Diagram (ECE={ece:.4f}, MCE={max_calibration_error:.4f})')
-                
-                # Enhanced sparsification plot
-                axes[1], se_value = plot_sparsification_curve(frac_removed, err_random, err_uncertainty, ax=axes[1])
-                axes[1].set_title(f'Sparsification Curve (Sparsification Error={se:.4f})')
-
-                plt.suptitle(f'Image {img_id} (Dice={dice:.4f}, Brier={brier:.4f})')
-                plt.tight_layout()
-                uncert_plot_path = img_output_dir / f"{img_id}_uncertainty_metrics.png"
-                plt.savefig(uncert_plot_path, dpi=200)
-                plt.close(fig)
-                if log_wandb:
-                    try:
-                        wandb.log({f"individual_plots/{img_id}_uncertainty": wandb.Image(str(uncert_plot_path)), "image_index": i})
-                    except Exception as e:
-                        logging.warning(f"Could not log uncertainty plot to W&B for {img_id}: {e}")
-            except Exception as plot_err:
-                logging.error(f"Error generating uncertainty metrics plot for {img_id}: {plot_err}")
-
-                # Generate a more detailed analysis figure
-            try: # Added try-except block
-                fig, axes = plt.subplots(2, 2, figsize=(16, 12))
-                
-                # Show image, mask, and prediction
-                img_file = dataset.images_dir / f"{img_id}.jpg"
-                img_pil = load_image(img_file).convert('RGB')
-                w, h = img_pil.size
-                newW, newH = int(dataset.scale * w), int(dataset.scale * h)
-                img_pil_scaled = img_pil.resize((newW, newH), resample=Image.BICUBIC)
-                if dataset.is_full_image:
-                    img_array_vis = np.array(img_pil_scaled).astype(np.float32) / 255.0
-                    img_tensor_vis = torch.from_numpy(img_array_vis.transpose(2, 0, 1))
-                    dummy_mask_tensor = torch.zeros_like(img_tensor_vis[0:1])
-                    img_cropped_tensor, _ = dataset.crop_to_fundus(img_tensor_vis, dummy_mask_tensor, img_array_vis.transpose(2, 0, 1))
-                    display_img = img_cropped_tensor.permute(1, 2, 0).numpy()
-                else:
-                    display_img = np.array(img_pil_scaled)
-                if display_img.max() <= 1.0: display_img = (display_img * 255).clip(0, 255).astype(np.uint8)
-                else: display_img = display_img.clip(0, 255).astype(np.uint8)
-
-                display_mask = (mask_cpu[0, 0].numpy() * 255).clip(0, 255).astype(np.uint8) # Ground truth mask
-
-                axes[0, 0].imshow(display_img)
-                axes[0, 0].set_title('Original Image (Scaled/Cropped)')
-                axes[0, 0].axis('off')
-
-                axes[0, 1].imshow(display_mask, cmap='gray')
-                axes[0, 1].set_title('Ground Truth Mask')
-                axes[0, 1].axis('off')
-
-                # Show uncertainty map
-                im = axes[1, 0].imshow(std_dev[0].numpy(), cmap='hot')
-                plt.colorbar(im, ax=axes[1, 0], fraction=0.046, pad=0.04)
-                axes[1, 0].set_title(f'Uncertainty Map (Mean Std: {std_dev[0].mean().item():.4f})')
-                axes[1, 0].axis('off')
-                
-                # Show areas of high uncertainty/error
-                uncertainty_threshold = 0.2  # Define threshold for high uncertainty
-                pred_binary_np = pred_binary.numpy() # Already calculated
-                mask_np = mask_cpu[0, 0].numpy() # Already calculated
-                uncertain_mask = (std_dev[0].numpy() > uncertainty_threshold).astype(np.float32)
-                error_mask = (pred_binary_np != mask_np).astype(np.float32)
-                
-                # Display composite mask - red where both high uncertainty and errors
-                rgb_overlay = np.zeros((*uncertain_mask.shape, 3))
-                rgb_overlay[..., 0] = uncertain_mask  # Red channel = high uncertainty
-                rgb_overlay[..., 1] = error_mask      # Green channel = errors
-                
-                axes[1, 1].imshow(rgb_overlay)
-                axes[1, 1].set_title('Red: High Uncertainty, Green: Errors, Yellow: Both')
-                axes[1, 1].axis('off')
-                
-                plt.suptitle(f'Detailed Analysis for Image {img_id}', fontsize=16)
-                plt.tight_layout(rect=[0, 0.03, 1, 0.95]) # Adjust layout
-                detailed_plot_path = img_output_dir / f"{img_id}_detailed_analysis.png"
-                plt.savefig(detailed_plot_path, dpi=200)
-                plt.close(fig)
-                if log_wandb:
-                    try:
-                        wandb.log({f"individual_plots/{img_id}_detailed": wandb.Image(str(detailed_plot_path)), "image_index": i})
-                    except Exception as e:
-                        logging.warning(f"Could not log detailed plot to W&B for {img_id}: {e}")
-            except Exception as plot_err:
-                logging.error(f"Error generating detailed analysis plot for {img_id}: {plot_err}")
-                import traceback
-                traceback.print_exc() # Print detailed traceback for plotting errors
-            # --- End: Restore Individual Plot Generation ---
-
-            # Free up memory
-            del segmentations_cpu, mask_cpu, mean_pred, std_dev
-            if 'metrics_dict' in locals(): del metrics_dict 
-            if 'calib_plot_path' in locals(): del calib_plot_path
-            if 'uncert_plot_path' in locals(): del uncert_plot_path
-            if 'detailed_plot_path' in locals(): del detailed_plot_path
-            if 'pred_flat' in locals(): del pred_flat
-            if 'gt_flat' in locals(): del gt_flat
-            if 'pred_binary' in locals(): del pred_binary
-            if 'pred_binary_np' in locals(): del pred_binary_np
-            if 'gt_np' in locals(): del gt_np
-            if 'unc_map' in locals(): del unc_map
-            if 'frac_removed' in locals(): del frac_removed, err_random, err_uncertainty
-            if 'display_img' in locals(): del display_img 
-            if 'display_mask' in locals(): del display_mask
-
+            del entropy_map, mutual_info_map, cov_map, sample_entropies, mean_entropy_pixels
             torch.cuda.empty_cache() 
 
         except Exception as e:
@@ -585,13 +590,14 @@ def analyze_model(model, dataset, args, wandb_run=None):  # Add wandb_run parame
 
     create_uncertainty_visualizations(metrics_df, output_dir, log_wandb=log_wandb)
     create_calibration_visualizations(all_predictions, all_ground_truths, output_dir, log_wandb=log_wandb)
-    # perform_temperature_analysis(all_predictions, all_ground_truths, output_dir, args.temp_values, log_wandb=log_wandb)
+    perform_temperature_analysis(all_predictions, all_ground_truths, output_dir, args.temp_values, log_wandb=log_wandb)
+    plot_global_sparsification_curve(model_sparsification_data, output_dir, model_label=args.model_label, log_wandb=log_wandb)
+    plot_global_uncertainty_distribution(model_uncert_data, output_dir, model_label=args.model_label, log_wandb=log_wandb)
     
-    if args.plot_roc_pr:
-        if len(global_errors)>0:
-            all_err = np.concatenate(global_errors)
-            all_unc = np.concatenate(global_uncertainties)
-            plot_global_roc_pr(all_err, all_unc, output_dir, model_label=args.model_label, prefix="global_", log_wandb=log_wandb)
+    if len(global_errors)>0:
+        all_err = np.concatenate(global_errors)
+        all_unc = np.concatenate(global_uncertainties)
+        plot_global_roc_pr(all_err, all_unc, output_dir, model_label=args.model_label, prefix="global_", log_wandb=log_wandb)
     
     if log_wandb:
         try:
@@ -602,10 +608,24 @@ def analyze_model(model, dataset, args, wandb_run=None):  # Add wandb_run parame
                 "summary/std_ece": metrics_df['ece'].std(),
                 "summary/avg_brier": metrics_df['brier'].mean(),
                 "summary/std_brier": metrics_df['brier'].std(),
+                "summary/avg_nll": metrics_df['nll'].mean(),
+                "summary/std_nll": metrics_df['nll'].std(),
                 "summary/avg_sparsification_error": metrics_df['sparsification_error'].mean(),
                 "summary/std_sparsification_error": metrics_df['sparsification_error'].std(),
                 "summary/avg_uncertain_pixel_percent": metrics_df['uncertain_pixel_percent'].mean(),
                 "summary/std_uncertain_pixel_percent": metrics_df['uncertain_pixel_percent'].std(),
+                "summary/avg_mean_entropy": metrics_df['mean_entropy'].mean(),
+                "summary/std_mean_entropy": metrics_df['mean_entropy'].std(),
+                "summary/avg_mean_mutual_info": metrics_df['mean_mutual_info'].mean(),
+                "summary/std_mean_mutual_info": metrics_df['mean_mutual_info'].std(),
+                "summary/avg_mean_coeff_variation": metrics_df['mean_coeff_variation'].mean(),
+                "summary/std_mean_coeff_variation": metrics_df['mean_coeff_variation'].std(),
+                "summary/avg_uncertainty_error_dice": metrics_df['uncertainty_error_dice'].mean(),
+                "summary/std_uncertainty_error_dice": metrics_df['uncertainty_error_dice'].std(),
+                "summary/avg_error_auroc": metrics_df['error_auroc'].mean(),
+                "summary/std_error_auroc": metrics_df['error_auroc'].std(),
+                "summary/avg_error_auprc": metrics_df['error_auprc'].mean(),
+                "summary/std_error_auprc": metrics_df['error_auprc'].std(),
             }
             wandb.summary.update(summary_stats)
         except Exception as e:
@@ -616,18 +636,27 @@ def analyze_model(model, dataset, args, wandb_run=None):  # Add wandb_run parame
     logging.info(f"Average Dice Score: {metrics_df['dice'].mean():.4f} ± {metrics_df['dice'].std():.4f}")
     logging.info(f"Average ECE: {metrics_df['ece'].mean():.4f} ± {metrics_df['ece'].std():.4f}")
     logging.info(f"Average Brier Score: {metrics_df['brier'].mean():.4f} ± {metrics_df['brier'].std():.4f}")
+    logging.info(f"Average NLL: {metrics_df['nll'].mean():.4f} ± {metrics_df['nll'].std():.4f}")
     logging.info(f"Average Sparsification Error: {metrics_df['sparsification_error'].mean():.4f} ± {metrics_df['sparsification_error'].std():.4f}")
     logging.info(f"Average Uncertain Pixel %: {metrics_df['uncertain_pixel_percent'].mean():.2f}% ± {metrics_df['uncertain_pixel_percent'].std():.2f}%")
+    logging.info(f"Average Mean Entropy: {metrics_df['mean_entropy'].mean():.4f} ± {metrics_df['mean_entropy'].std():.4f}")
+    logging.info(f"Average Mean Mutual Info: {metrics_df['mean_mutual_info'].mean():.4f} ± {metrics_df['mean_mutual_info'].std():.4f}")
+    logging.info(f"Average Mean Coeff Variation: {metrics_df['mean_coeff_variation'].mean():.4f} ± {metrics_df['mean_coeff_variation'].std():.4f}")
+    logging.info(f"Average Uncertainty-Error Dice: {metrics_df['uncertainty_error_dice'].mean():.4f} ± {metrics_df['uncertainty_error_dice'].std():.4f}")
+    logging.info(f"Average Error AUROC: {metrics_df['error_auroc'].mean():.4f} ± {metrics_df['error_auroc'].std():.4f}")
+    logging.info(f"Average Error AUPRC: {metrics_df['error_auprc'].mean():.4f} ± {metrics_df['error_auprc'].std():.4f}")
     
     return metrics_df, model_sparsification_data, model_uncert_data
 
 
 def create_uncertainty_visualizations(metrics_df, output_dir, log_wandb=False):  
-    """Create visualizations for uncertainty analysis."""
+    """Create visualizations for uncertainty analysis. (Updated)"""
     sns.set_style("whitegrid")
     plt.rcParams.update({'font.size': 11})
     
-    fig, axes = plt.subplots(2, 2, figsize=(14, 12))
+    # Increase figure size to accommodate more plots (3 rows, 2 columns)
+    fig, axes = plt.subplots(3, 2, figsize=(14, 18)) 
+    axes = axes.flatten() # Flatten axes array for easier indexing
     
     numeric_cols = [col for col in metrics_df.columns if col != 'img_id']
     for col in numeric_cols:
@@ -639,38 +668,41 @@ def create_uncertainty_visualizations(metrics_df, output_dir, log_wandb=False):
     logging.info(f"DataFrame columns for uncertainty viz: {metrics_df.columns.tolist()}")
     logging.info(f"DataFrame dtypes for uncertainty viz: {metrics_df.dtypes}")
     
+    # Plot 1: Dice vs ECE (Existing)
     try:
         if 'dice' in metrics_df.columns and 'ece' in metrics_df.columns:
-            sns.scatterplot(x='dice', y='ece', data=metrics_df, ax=axes[0, 0], s=80, alpha=0.7)
-            axes[0, 0].set_title('Segmentation Accuracy vs. Calibration Error', fontsize=14)
-            axes[0, 0].set_xlabel('Dice Score (higher is better)', fontsize=12)
-            axes[0, 0].set_ylabel('ECE (lower is better)', fontsize=12)
+            sns.scatterplot(x='dice', y='ece', data=metrics_df, ax=axes[0], s=80, alpha=0.7)
+            axes[0].set_title('Segmentation Accuracy vs. Calibration Error', fontsize=14)
+            axes[0].set_xlabel('Dice Score (higher is better)', fontsize=12)
+            axes[0].set_ylabel('ECE (lower is better)', fontsize=12)
             
             corr = metrics_df['dice'].corr(metrics_df['ece'])
-            axes[0, 0].annotate(f'Correlation: {corr:.3f}', 
+            axes[0].annotate(f'Correlation: {corr:.3f}', 
                              xy=(0.05, 0.95), xycoords='axes fraction',
                              bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="gray", alpha=0.8))
             
-            axes[0, 0].annotate(
+            axes[0].annotate(
                 "This plot shows the relationship between segmentation\n"
                 "accuracy (Dice) and calibration quality (ECE).\n"
                 "Lower ECE means better calibrated probabilities.",
                 xy=(0.5, 0.05), xycoords='axes fraction', ha='center',
                 bbox=dict(boxstyle="round,pad=0.5", fc="lightyellow", ec="orange", alpha=0.8))
         else:
-            axes[0, 0].text(0.5, 0.5, "Dice or ECE data missing", ha='center', va='center')
-            axes[0, 0].set_title('Segmentation Accuracy vs. Calibration Error (Data Missing)')
+            axes[0].text(0.5, 0.5, "Dice or ECE data missing", ha='center', va='center')
+            axes[0].set_title('Segmentation Accuracy vs. Calibration Error (Data Missing)')
     except Exception as e:
         logging.error(f"Error creating Dice vs ECE plot: {e}")
+        axes[0].text(0.5, 0.5, "Error plotting Dice vs ECE", ha='center', va='center')
     
+    # Plot 2: Dice vs Sparsification Error (Existing)
     try:
         if 'dice' in metrics_df.columns and 'sparsification_error' in metrics_df.columns:
             colors = ['green' if se > 0 else 'red' for se in metrics_df['sparsification_error']]
             scatter = sns.scatterplot(x='dice', y='sparsification_error', data=metrics_df, 
-                                     ax=axes[0, 1], s=80, alpha=0.7, hue=colors, palette={'green':'green', 'red':'red'}, legend=False) 
-            axes[0, 1].set_title('Segmentation Accuracy vs. Uncertainty Quality', fontsize=14)
-            axes[0, 1].set_xlabel('Dice Score (higher is better)', fontsize=12)
-            axes[0, 1].set_ylabel('Sparsification Error (higher is better)', fontsize=12)
+                                     ax=axes[1], s=80, alpha=0.7, hue=colors, palette={'green':'green', 'red':'red'}, legend=False) 
+            axes[1].set_title('Segmentation Accuracy vs. Uncertainty Quality', fontsize=14)
+            axes[1].set_xlabel('Dice Score (higher is better)', fontsize=12)
+            axes[1].set_ylabel('Sparsification Error (higher is better)', fontsize=12)
             
             from matplotlib.lines import Line2D
             legend_elements = [
@@ -679,14 +711,14 @@ def create_uncertainty_visualizations(metrics_df, output_dir, log_wandb=False):
                 Line2D([0], [0], marker='o', color='w', markerfacecolor='red', markersize=10, 
                       label='Poor uncertainty (SE <= 0)')
             ]
-            axes[0, 1].legend(handles=legend_elements, loc='lower right') 
+            axes[1].legend(handles=legend_elements, loc='lower right') 
             
             corr = metrics_df['dice'].corr(metrics_df['sparsification_error'])
-            axes[0, 1].annotate(f'Correlation: {corr:.3f}', 
+            axes[1].annotate(f'Correlation: {corr:.3f}', 
                               xy=(0.05, 0.95), xycoords='axes fraction',
                               bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="gray", alpha=0.8))
             
-            axes[0, 1].annotate(
+            axes[1].annotate(
                 "This plot shows how uncertainty quality (SE) relates\n"
                 "to segmentation accuracy (Dice).\n"
                 "Positive SE (green): Uncertainty is meaningful\n"
@@ -694,63 +726,111 @@ def create_uncertainty_visualizations(metrics_df, output_dir, log_wandb=False):
                 xy=(0.5, 0.05), xycoords='axes fraction', ha='center',
                 bbox=dict(boxstyle="round,pad=0.5", fc="lightyellow", ec="orange", alpha=0.8))
         else:
-            axes[0, 1].text(0.5, 0.5, "Dice or Sparsification Error data missing", ha='center', va='center')
-            axes[0, 1].set_title('Segmentation Accuracy vs. Uncertainty Quality (Data Missing)')
+            axes[1].text(0.5, 0.5, "Dice or Sparsification Error data missing", ha='center', va='center')
+            axes[1].set_title('Segmentation Accuracy vs. Uncertainty Quality (Data Missing)')
     except Exception as e:
         logging.error(f"Error creating Dice vs Sparsification Error plot: {e}")
+        axes[1].text(0.5, 0.5, "Error plotting Dice vs SE", ha='center', va='center')
         logging.exception("Detailed traceback:")
     
+    # Plot 3: ECE Distribution (Existing)
     try:
         if 'ece' in metrics_df.columns:
-            sns.histplot(x='ece', data=metrics_df, kde=True, ax=axes[1, 0], color='teal')
-            axes[1, 0].axvline(metrics_df['ece'].mean(), color='r', linestyle='--', 
+            sns.histplot(x='ece', data=metrics_df, kde=True, ax=axes[2], color='teal')
+            axes[2].axvline(metrics_df['ece'].mean(), color='r', linestyle='--', 
                              label=f'Mean: {metrics_df["ece"].mean():.3f}')
             
-            axes[1, 0].axvspan(0, 0.01, alpha=0.2, color='green', label='Excellent (<0.01)')
-            axes[1, 0].axvspan(0.01, 0.05, alpha=0.2, color='yellowgreen', label='Good (<0.05)')
-            axes[1, 0].axvspan(0.05, 0.15, alpha=0.2, color='orange', label='Fair (<0.15)')
-            axes[1, 0].axvspan(0.15, 1, alpha=0.2, color='red', label='Poor (>0.15)')
+            axes[2].axvspan(0, 0.01, alpha=0.2, color='green', label='Excellent (<0.01)')
+            axes[2].axvspan(0.01, 0.05, alpha=0.2, color='yellowgreen', label='Good (<0.05)')
+            axes[2].axvspan(0.05, 0.15, alpha=0.2, color='orange', label='Fair (<0.15)')
+            axes[2].axvspan(0.15, 1, alpha=0.2, color='red', label='Poor (>0.15)')
             
-            axes[1, 0].set_title('Distribution of Expected Calibration Error', fontsize=14)
-            axes[1, 0].set_xlabel('ECE (lower is better)', fontsize=12)
-            axes[1, 0].legend(loc='upper right', fontsize=9)
+            axes[2].set_title('Distribution of Expected Calibration Error', fontsize=14)
+            axes[2].set_xlabel('ECE (lower is better)', fontsize=12)
+            axes[2].legend(loc='upper right', fontsize=9)
             
-            axes[1, 0].annotate(
+            axes[2].annotate(
                 "ECE measures how well confidence values\n"
                 "match actual frequencies.\n"
                 "Lower values indicate better calibration.",
                 xy=(0.7, 0.5), xycoords='axes fraction',
                 bbox=dict(boxstyle="round,pad=0.5", fc="lightyellow", ec="orange", alpha=0.8))
         else:
-            axes[1, 0].text(0.5, 0.5, "ECE data missing", ha='center', va='center')
-            axes[1, 0].set_title('Distribution of Expected Calibration Error (Data Missing)')
+            axes[2].text(0.5, 0.5, "ECE data missing", ha='center', va='center')
+            axes[2].set_title('Distribution of Expected Calibration Error (Data Missing)')
     except Exception as e:
         logging.error(f"Error creating ECE histogram: {e}")
-    
+        axes[2].text(0.5, 0.5, "Error plotting ECE", ha='center', va='center')
+
+    # Plot 4: NLL Distribution (NEW)
     try:
-        if 'uncertain_pixel_percent' in metrics_df.columns:
-            sns.histplot(x='uncertain_pixel_percent', data=metrics_df, kde=True, ax=axes[1, 1], color='purple')
-            axes[1, 1].axvline(metrics_df['uncertain_pixel_percent'].mean(), color='r', linestyle='--',
-                              label=f'Mean: {metrics_df["uncertain_pixel_percent"].mean():.1f}%')
-            axes[1, 1].set_title('Distribution of Uncertain Pixel Percentage', fontsize=14)
-            axes[1, 1].set_xlabel('Uncertain Pixel %', fontsize=12)
-            axes[1, 1].legend(loc='upper right')
-            
-            axes[1, 1].annotate(
-                "Shows what percentage of pixels have high uncertainty.\n"
-                "Ideally correlates with difficult regions and errors.\n"
-                "Too high: model is underconfident\n"
-                "Too low: model might be overconfident",
+        if 'nll' in metrics_df.columns:
+            sns.histplot(x='nll', data=metrics_df, kde=True, ax=axes[3], color='darkorange')
+            axes[3].axvline(metrics_df['nll'].mean(), color='r', linestyle='--',
+                              label=f'Mean: {metrics_df["nll"].mean():.3f}')
+            axes[3].set_title('Distribution of Negative Log-Likelihood', fontsize=14)
+            axes[3].set_xlabel('NLL (lower is better)', fontsize=12)
+            axes[3].legend(loc='upper right')
+            axes[3].annotate(
+                "NLL measures both calibration and sharpness.\n"
+                "Lower values indicate better probabilistic predictions.",
                 xy=(0.3, 0.7), xycoords='axes fraction',
                 bbox=dict(boxstyle="round,pad=0.5", fc="lightyellow", ec="orange", alpha=0.8))
         else:
-            axes[1, 1].text(0.5, 0.5, "Uncertain Pixel % data missing", ha='center', va='center')
-            axes[1, 1].set_title('Distribution of Uncertain Pixel Percentage (Data Missing)')
+            axes[3].text(0.5, 0.5, "NLL data missing", ha='center', va='center')
+            axes[3].set_title('Distribution of Negative Log-Likelihood (Data Missing)')
     except Exception as e:
-        logging.error(f"Error creating Uncertain Pixel histogram: {e}")
-    
-    plt.suptitle(f'Uncertainty Analysis Summary - {len(metrics_df)} Images', fontsize=16, y=0.98)
-    plt.tight_layout(rect=[0, 0, 1, 0.97])
+        logging.error(f"Error creating NLL histogram: {e}")
+        axes[3].text(0.5, 0.5, "Error plotting NLL", ha='center', va='center')
+
+    # Plot 5: Mean Entropy Distribution (NEW)
+    try:
+        if 'mean_entropy' in metrics_df.columns:
+            sns.histplot(x='mean_entropy', data=metrics_df, kde=True, ax=axes[4], color='darkcyan')
+            axes[4].axvline(metrics_df['mean_entropy'].mean(), color='r', linestyle='--',
+                              label=f'Mean: {metrics_df["mean_entropy"].mean():.3f}')
+            axes[4].set_title('Distribution of Mean Prediction Entropy', fontsize=14)
+            axes[4].set_xlabel('Mean Entropy (higher indicates more epistemic uncertainty)', fontsize=12)
+            axes[4].legend(loc='upper right')
+            axes[4].annotate(
+                "Entropy of the mean prediction.\n"
+                "Higher values suggest the model is less certain\n"
+                "about its average prediction (epistemic uncertainty).",
+                xy=(0.3, 0.7), xycoords='axes fraction',
+                bbox=dict(boxstyle="round,pad=0.5", fc="lightyellow", ec="orange", alpha=0.8))
+        else:
+            axes[4].text(0.5, 0.5, "Mean Entropy data missing", ha='center', va='center')
+            axes[4].set_title('Distribution of Mean Prediction Entropy (Data Missing)')
+    except Exception as e:
+        logging.error(f"Error creating Mean Entropy histogram: {e}")
+        axes[4].text(0.5, 0.5, "Error plotting Mean Entropy", ha='center', va='center')
+
+    # Plot 6: Uncertainty-Error Dice Distribution (NEW)
+    try:
+        if 'uncertainty_error_dice' in metrics_df.columns:
+            sns.histplot(x='uncertainty_error_dice', data=metrics_df, kde=True, ax=axes[5], color='indigo')
+            axes[5].axvline(metrics_df['uncertainty_error_dice'].mean(), color='r', linestyle='--',
+                              label=f'Mean: {metrics_df["uncertainty_error_dice"].mean():.3f}')
+            axes[5].set_title('Distribution of Uncertainty-Error Dice', fontsize=14)
+            axes[5].set_xlabel('U-E Dice (higher indicates better overlap)', fontsize=12)
+            axes[5].set_xlim(0, 1) # Dice score is between 0 and 1
+            axes[5].legend(loc='upper right')
+            axes[5].annotate(
+                "Dice score between high uncertainty regions\n"
+                "and prediction error regions.\n"
+                "Higher values mean uncertainty correlates well with errors.",
+                xy=(0.3, 0.7), xycoords='axes fraction',
+                bbox=dict(boxstyle="round,pad=0.5", fc="lightyellow", ec="orange", alpha=0.8))
+        else:
+            axes[5].text(0.5, 0.5, "U-E Dice data missing", ha='center', va='center')
+            axes[5].set_title('Distribution of Uncertainty-Error Dice (Data Missing)')
+    except Exception as e:
+        logging.error(f"Error creating U-E Dice histogram: {e}")
+        axes[5].text(0.5, 0.5, "Error plotting U-E Dice", ha='center', va='center')
+
+    # Adjust layout and save
+    plt.suptitle(f'Uncertainty Analysis Summary - {len(metrics_df)} Images', fontsize=16, y=0.99)
+    plt.tight_layout(rect=[0, 0, 1, 0.98]) # Adjust rect to prevent title overlap
     uncertainty_summary_path = output_dir / "uncertainty_summary.png"
     plt.savefig(uncertainty_summary_path, dpi=300, bbox_inches='tight')
     plt.close(fig)
@@ -760,27 +840,36 @@ def create_uncertainty_visualizations(metrics_df, output_dir, log_wandb=False):
         except Exception as e:
             logging.warning(f"Could not log uncertainty summary plot to W&B: {e}")
     
+    # --- Update Correlation Matrix and Pairplot ---
     try:
-        existing_numeric_cols = [col for col in numeric_cols if col in metrics_df.columns]
+        # Add new metrics to the list for correlation/pairplot
+        selected_cols = ['dice', 'ece', 'brier', 'nll', 'sparsification_error', 
+                         'uncertain_pixel_percent', 'mean_entropy', 'mean_mutual_info', 
+                         'mean_coeff_variation', 'uncertainty_error_dice', 
+                         'error_auroc', 'error_auprc']
+        existing_numeric_cols = [col for col in selected_cols if col in metrics_df.columns and pd.api.types.is_numeric_dtype(metrics_df[col])]
+        
         if len(existing_numeric_cols) > 1:
-            plt.figure(figsize=(10, 8))
+            plt.figure(figsize=(12, 10)) # Adjusted size
             numeric_df = metrics_df[existing_numeric_cols]
             corr_matrix = numeric_df.corr()
             
             mask = np.zeros_like(corr_matrix, dtype=bool)
             mask[np.triu_indices_from(mask)] = True
             
-            cmap = sns.diverging_palette(220, 10, as_cmap=True)
+            cmap = sns.diverging_palette(220, 20, as_cmap=True) # Adjusted palette
             sns.heatmap(corr_matrix, mask=mask, cmap=cmap, vmin=-1, vmax=1, 
-                       annot=True, fmt='.2f', center=0, square=True, linewidths=.5)
+                       annot=True, fmt='.2f', center=0, square=True, linewidths=.5, annot_kws={"size": 8}) # Smaller font
             
-            plt.title('Correlation Matrix of Uncertainty Metrics', fontsize=15)
+            plt.title('Correlation Matrix of Performance and Uncertainty Metrics', fontsize=15)
+            plt.xticks(rotation=45, ha='right') # Rotate labels
+            plt.yticks(rotation=0)
             
             plt.figtext(0.5, 0.01, 
                       "This heatmap shows how different metrics relate to each other.\n"
                       "Values close to 1 or -1 indicate strong correlation.\n"
                       "Look for strong correlations between uncertainty and performance metrics.",
-                      ha="center", fontsize=12, 
+                      ha="center", fontsize=10, # Smaller font for figtext
                       bbox={"facecolor":"lightgoldenrodyellow", "alpha":0.5, "pad":5})
             
             plt.tight_layout(rect=[0, 0.05, 1, 0.95])
@@ -798,22 +887,24 @@ def create_uncertainty_visualizations(metrics_df, output_dir, log_wandb=False):
         logging.error(f"Error creating correlation heatmap: {e}")
     
     try:
-        selected_cols = ['dice', 'ece', 'brier', 'sparsification_error', 'uncertain_pixel_percent']
-        existing_cols = [col for col in selected_cols if col in metrics_df.columns]
-        if len(existing_cols) >= 2:  
+        # Pairplot with a subset of key metrics for clarity
+        pairplot_cols = ['dice', 'ece', 'nll', 'sparsification_error', 'mean_entropy', 'uncertainty_error_dice']
+        existing_pairplot_cols = [col for col in pairplot_cols if col in metrics_df.columns and pd.api.types.is_numeric_dtype(metrics_df[col])]
+        
+        if len(existing_pairplot_cols) >= 2:  
             g = sns.pairplot(
-                metrics_df[existing_cols],
+                metrics_df[existing_pairplot_cols],
                 diag_kind="kde",
-                plot_kws={'alpha': 0.6, 's': 80, 'edgecolor': 'k', 'linewidth': 0.5},
+                plot_kws={'alpha': 0.6, 's': 60, 'edgecolor': 'k', 'linewidth': 0.5}, # Slightly smaller points
                 corner=True,  
             )
-            g.fig.suptitle('Pairwise Relationships Between Uncertainty Metrics', y=1.02, fontsize=16)
+            g.fig.suptitle('Pairwise Relationships Between Key Metrics', y=1.02, fontsize=16)
             
             plt.figtext(0.5, 0.01, 
                       "This matrix shows how each pair of metrics relates to each other.\n"
                       "Look for patterns and correlations that can help interpret uncertainty.\n"
                       "Diagonal plots show the distribution of each individual metric.",
-                      ha="center", fontsize=12, 
+                      ha="center", fontsize=10, # Smaller font for figtext
                       bbox={"facecolor":"lightgoldenrodyellow", "alpha":0.5, "pad":5})
             
             plt.subplots_adjust(top=0.95, bottom=0.1)
@@ -826,10 +917,12 @@ def create_uncertainty_visualizations(metrics_df, output_dir, log_wandb=False):
                 except Exception as e:
                     logging.warning(f"Could not log pairplot to W&B: {e}")
         else:
-            logging.warning(f"Not enough numeric columns for pairplot. Found: {existing_cols}")
+            logging.warning(f"Not enough numeric columns for pairplot. Found: {existing_pairplot_cols}")
     except Exception as e:
         logging.error(f"Error creating pairplot: {e}")
-    
+    # --- End Update Correlation Matrix and Pairplot ---
+
+    # --- Calibration Analysis Chart (Existing) ---
     try:
         required_calib_cols = ['max_calibration_error', 'mean_abs_calib_error', 'ece', 'dice']
         if all(col in metrics_df.columns for col in required_calib_cols):
@@ -896,6 +989,7 @@ def create_uncertainty_visualizations(metrics_df, output_dir, log_wandb=False):
             logging.warning(f"Missing required columns for calibration analysis chart. Needed: {required_calib_cols}")
     except Exception as e:
         logging.error(f"Error creating calibration analysis chart: {e}")
+    # --- End Calibration Analysis Chart ---
 
 
 def create_calibration_visualizations(all_predictions, all_ground_truths, output_dir, log_wandb=False):  
