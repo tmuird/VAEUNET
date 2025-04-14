@@ -10,3 +10,4 @@ data/patches/
 *.jpg
 *.png
 *.jpeg
+*.npy

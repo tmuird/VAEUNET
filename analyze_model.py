@@ -16,6 +16,8 @@ import wandb
 from PIL import Image
 import matplotlib.cm as cm
 import math
+import gc
+import shutil
 
 from utils.data_loading import IDRIDDataset, load_image
 from unet.unet_resnet import UNetResNet
@@ -314,21 +316,18 @@ def analyze_model(model, dataset, args, wandb_run=None):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model.eval()
     
-    # Create output directory
+    # Create output directory and temporary directory for large arrays
     output_dir = Path(args.output_dir) / f"{args.lesion_type}_T{args.temperature}_N{args.samples}"
     output_dir.mkdir(parents=True, exist_ok=True)
+    temp_pixel_data_dir = output_dir / "temp_pixel_data"
+    temp_pixel_data_dir.mkdir(parents=True, exist_ok=True)
     
-    # Initialize data storage
+    # Initialize data storage (keep lists for smaller/aggregated data)
     metrics_data = []
-    all_predictions = []
-    all_ground_truths = []
-    
-    # Additional data structures for advanced comparisons
     model_sparsification_data = []  # for storing (frac_removed, err_random, err_uncertainty) per image
     model_uncert_data = []          # for storing correct vs. incorrect pixel uncertainties
-    global_errors = []              # global arrays to plot ROC/PR
-    global_uncertainties = []
-
+    
+    # Keep track of processed image IDs
     processed_ids = set()
     log_wandb = wandb_run is not None  # Check if W&B is active
     
@@ -338,7 +337,7 @@ def analyze_model(model, dataset, args, wandb_run=None):
         
         if img_id in processed_ids:
             continue
-        processed_ids.add(img_id)
+        
         logging.info(f"Processing image {img_id}")
         
         try:
@@ -395,12 +394,14 @@ def analyze_model(model, dataset, args, wandb_run=None):
                 mean_pred[0], mask_cpu[0, 0]
             )
             brier = brier_score(mean_pred[0], mask_cpu[0, 0])
+            pred_binary = (mean_pred[0] > 0.5).float() # Keep pred_binary for local calculations
             dice_tensor = (2.0*(pred_binary*mask_cpu[0,0]).sum())/(pred_binary.sum()+mask_cpu[0,0].sum()+1e-8)
             dice = float(dice_tensor.item())
 
-            # Store global predictions ALWAYS for calibration/temp sweep
-            all_predictions.append(pred_flat)
-            all_ground_truths.append(gt_flat)
+            # Save flattened predictions and GT to temporary files instead of appending to lists
+            np.save(temp_pixel_data_dir / f"{img_id}_pred_flat.npy", pred_flat)
+            np.save(temp_pixel_data_dir / f"{img_id}_gt_flat.npy", gt_flat)
+            processed_ids.add(img_id) # Add img_id to processed set *after* saving
 
             # Uncertainty metrics
             se = 0.0
@@ -422,7 +423,7 @@ def analyze_model(model, dataset, args, wandb_run=None):
             uncertain_percent_tensor = (std_dev[0]>uncertainty_threshold).float().mean()*100
             uncertain_pixel_percent = float(uncertain_percent_tensor.item())
 
-            # Store per-image sparsification data if requested
+            # Store per-image sparsification data (this should be manageable)
             model_sparsification_data.append({
                 'img_id': img_id,
                 'frac_removed': frac_removed,
@@ -437,6 +438,8 @@ def analyze_model(model, dataset, args, wandb_run=None):
             incorrect_mask = ~correct_mask
             unc_map = std_dev[0].numpy()
 
+            # Store uncertainty data (potentially large, but maybe manageable depending on image count)
+            # If this still causes OOM, apply save-to-disk strategy here too.
             model_uncert_data.append({
                 'img_id': img_id,
                 'uncertainties_correct': unc_map[correct_mask],
@@ -446,10 +449,11 @@ def analyze_model(model, dataset, args, wandb_run=None):
             # Prepare data for global ROC/PR plots
             errors = (pred_binary_np != gt_np).astype(np.int32).flatten()
             uncertainties_flat = unc_map.flatten()
-            global_errors.append(errors)
-            global_uncertainties.append(uncertainties_flat)
+            # Save errors and uncertainties to temporary files
+            np.save(temp_pixel_data_dir / f"{img_id}_errors.npy", errors)
+            np.save(temp_pixel_data_dir / f"{img_id}_uncertainties.npy", uncertainties_flat)
 
-            # Calculate pixel-level AUROC/AUPRC for uncertainty vs error
+            # Calculate pixel-level AUROC/AUPRC for uncertainty vs error (local calculation)
             auroc, auprc = calculate_uncertainty_error_auc(mean_pred[0], mask_cpu[0,0], std_dev[0])
 
             # Other calibration metrics
@@ -552,18 +556,35 @@ def analyze_model(model, dataset, args, wandb_run=None):
                     traceback.print_exc()
             # --- End: Add Visualization Logging ---
 
-            del entropy_map, mutual_info_map, cov_map, sample_entropies, mean_entropy_pixels
+            # Explicitly delete large tensors and collect garbage
+            del segmentations, mask, mu, logvar, segmentations_cpu, mask_cpu, mean_pred, std_dev
+            del pred_flat, gt_flat, errors, uncertainties_flat, pred_binary, pred_binary_np, gt_np, unc_map
+            if 'entropy_map' in locals(): del entropy_map
+            if 'mutual_info_map' in locals(): del mutual_info_map
+            if 'cov_map' in locals(): del cov_map
+            if 'sample_entropies' in locals(): del sample_entropies
+            if 'mean_entropy_pixels' in locals(): del mean_entropy_pixels
             torch.cuda.empty_cache() 
+            gc.collect() # Force garbage collection
 
         except Exception as e:
             logging.error(f"Error processing image {img_id}: {e}")
             import traceback
             traceback.print_exc()
+            # Clean up temp files for this image if error occurred mid-processing
+            for suffix in ["_pred_flat.npy", "_gt_flat.npy", "_errors.npy", "_uncertainties.npy"]:
+                temp_file = temp_pixel_data_dir / f"{img_id}{suffix}"
+                if temp_file.exists():
+                    temp_file.unlink()
+            if img_id in processed_ids:
+                 processed_ids.remove(img_id) # Remove from set if saving failed
+            gc.collect()
             continue
         
         if args.max_images and len(processed_ids)>=args.max_images:
             break
 
+    # --- After the loop ---
     metrics_df = pd.DataFrame(metrics_data)
     metrics_df = fix_dataframe_tensors(metrics_df)
     for col in metrics_df.columns:
@@ -585,20 +606,67 @@ def analyze_model(model, dataset, args, wandb_run=None):
             logging.warning(f"Could not log metrics DataFrame to W&B: {e}")
 
     if args.store_data:
+        # These should be manageable unless uncertainty arrays are huge
         store_sparsification_data(output_dir / "sparsification_data.npy", model_sparsification_data)
         store_uncertainty_data(output_dir / "uncertainty_data.npy", model_uncert_data)
 
+    # --- Load data back from temporary files for global analysis ---
+    logging.info(f"Loading temporary pixel data for {len(processed_ids)} images...")
+    all_predictions_loaded = []
+    all_ground_truths_loaded = []
+    all_errors_loaded = []
+    all_uncertainties_loaded = []
+
+    for img_id in tqdm(processed_ids, desc="Loading temp data"):
+        pred_flat_path = temp_pixel_data_dir / f"{img_id}_pred_flat.npy"
+        gt_flat_path = temp_pixel_data_dir / f"{img_id}_gt_flat.npy"
+        errors_path = temp_pixel_data_dir / f"{img_id}_errors.npy"
+        uncertainties_path = temp_pixel_data_dir / f"{img_id}_uncertainties.npy"
+
+        if pred_flat_path.exists() and gt_flat_path.exists():
+            all_predictions_loaded.append(np.load(pred_flat_path))
+            all_ground_truths_loaded.append(np.load(gt_flat_path))
+        if errors_path.exists() and uncertainties_path.exists():
+            all_errors_loaded.append(np.load(errors_path))
+            all_uncertainties_loaded.append(np.load(uncertainties_path))
+
+    logging.info("Finished loading temporary data.")
+    gc.collect() # Collect garbage after loading
+
+    # --- Perform global analysis using loaded data ---
     create_uncertainty_visualizations(metrics_df, output_dir, log_wandb=log_wandb)
-    create_calibration_visualizations(all_predictions, all_ground_truths, output_dir, log_wandb=log_wandb)
-    perform_temperature_analysis(all_predictions, all_ground_truths, output_dir, args.temp_values, log_wandb=log_wandb)
+    
+    # Use the loaded data for calibration and temperature analysis
+    if all_predictions_loaded and all_ground_truths_loaded:
+        create_calibration_visualizations(all_predictions_loaded, all_ground_truths_loaded, output_dir, log_wandb=log_wandb)
+        perform_temperature_analysis(all_predictions_loaded, all_ground_truths_loaded, output_dir, args.temp_values, log_wandb=log_wandb)
+    else:
+        logging.warning("Skipping calibration and temperature analysis due to missing loaded data.")
+
     plot_global_sparsification_curve(model_sparsification_data, output_dir, model_label=args.model_label, log_wandb=log_wandb)
     plot_global_uncertainty_distribution(model_uncert_data, output_dir, model_label=args.model_label, log_wandb=log_wandb)
     
-    if len(global_errors)>0:
-        all_err = np.concatenate(global_errors)
-        all_unc = np.concatenate(global_uncertainties)
-        plot_global_roc_pr(all_err, all_unc, output_dir, model_label=args.model_label, prefix="global_", log_wandb=log_wandb)
+    # Use the loaded data for global ROC/PR plots
+    if all_errors_loaded and all_uncertainties_loaded:
+        logging.info("Concatenating global errors and uncertainties for ROC/PR plots...")
+        try:
+            all_err_concat = np.concatenate(all_errors_loaded)
+            all_unc_concat = np.concatenate(all_uncertainties_loaded)
+            logging.info(f"Concatenated shapes: errors={all_err_concat.shape}, uncertainties={all_unc_concat.shape}")
+            plot_global_roc_pr(all_err_concat, all_unc_concat, output_dir, model_label=args.model_label, prefix="global_", log_wandb=log_wandb)
+            del all_err_concat, all_unc_concat # Free memory after use
+        except ValueError as e:
+             logging.error(f"Error concatenating global arrays for ROC/PR: {e}. Skipping plot.")
+        except Exception as e:
+             logging.error(f"Unexpected error during global ROC/PR generation: {e}. Skipping plot.")
+    else:
+        logging.warning("Skipping global ROC/PR plot due to missing loaded data.")
     
+    # Clean up loaded lists
+    del all_predictions_loaded, all_ground_truths_loaded, all_errors_loaded, all_uncertainties_loaded
+    gc.collect()
+
+    # --- Log summaries and finish ---
     if log_wandb:
         try:
             summary_stats = {
@@ -881,11 +949,12 @@ def create_uncertainty_visualizations(metrics_df, output_dir, log_wandb=False):
                     wandb.log({"plots/correlation_matrix": wandb.Image(str(corr_matrix_path))})
                 except Exception as e:
                     logging.warning(f"Could not log correlation matrix plot to W&B: {e}")
-        else:
-            logging.warning("Not enough numeric columns to create correlation heatmap.")
+                else:
+                    logging.warning("Not enough numeric columns to create correlation heatmap.")
     except Exception as e:
         logging.error(f"Error creating correlation heatmap: {e}")
-    
+        pass # Added pass to handle empty except block
+
     try:
         # Pairplot with a subset of key metrics for clarity
         pairplot_cols = ['dice', 'ece', 'nll', 'sparsification_error', 'mean_entropy', 'uncertainty_error_dice']
