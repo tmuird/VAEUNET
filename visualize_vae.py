@@ -134,8 +134,6 @@ def calculate_uncertainty_metrics(segmentations):
         'coeff_var': coeff_var.squeeze(1)
     }
 
-
-
 def plot_reconstruction(model, img, mask, img_id, dataset=None, num_samples=32, patch_dataset=None, temperature=1.0, enable_dropout=True):
     """Plot the input image, ground truth mask, and uncertainty analysis from multiple sampled reconstructions."""
     # Ensure correct dimensions
@@ -147,7 +145,7 @@ def plot_reconstruction(model, img, mask, img_id, dataset=None, num_samples=32, 
     print(f"Input shapes - img: {img.shape}, mask: {mask.shape}")
     
     # Get multiple segmentations
-    segmentations, mu, logvar = get_segmentation_distribution(
+    segmentations, mu, logvar = get_segmentation_distribution_from_image(
         model, img, img_id, dataset=dataset, num_samples=num_samples,
         patch_dataset=patch_dataset, temperature=temperature, enable_dropout=enable_dropout, batch_size=args.batch_size
     )
@@ -605,7 +603,7 @@ def get_image_and_mask(dataset, img_id):
         
     return full_img, full_mask, original_shape
 
-def get_segmentation_distribution(model, img_id, dataset, num_samples=32, 
+def get_segmentation_distribution_from_image(model, img_id, dataset, num_samples=32, 
                                  patch_size=None, overlap=None, 
                                  temperature=1.0, enable_dropout=True,
                                  batch_size=4):
@@ -637,14 +635,23 @@ def get_segmentation_distribution(model, img_id, dataset, num_samples=32,
     B, H, W = 1, img.shape[2], img.shape[3]
     segmentations_cpu = torch.zeros((num_samples, 1, H, W), dtype=torch.float32)
     
+    # Determine if sampling should be applied based on model configuration
+    should_sample = getattr(model, 'latent_injection', 'all') not in ['none', 'inject_no_bottleneck']
+    if not should_sample:
+        logging.info(f"Latent injection mode is '{model.latent_injection}'. Using deterministic mu (temperature ignored).")
+
     # Generate one sample at a time to save memory
     for i in tqdm(range(num_samples), desc="Generating samples"):
-        # Sample from latent space
+        # Sample from latent space or use mu directly
         with torch.no_grad():
-            std = torch.exp(0.5 * logvar) * temperature
-            eps = torch.randn_like(std)
-            z = mu + eps * std
-            z = z.unsqueeze(-1).unsqueeze(-1)  # Add spatial dimensions
+            if should_sample:
+                std = torch.exp(0.5 * logvar) * temperature
+                eps = torch.randn_like(std)
+                z = mu + eps * std
+            else:
+                # Use deterministic mu when sampling is disabled for this mode
+                z = mu
+            z = z.unsqueeze(-1).unsqueeze(-1)
             
             # Choose prediction method based on patch size
             if patch_size is not None and patch_size > 0:
@@ -661,7 +668,9 @@ def get_segmentation_distribution(model, img_id, dataset, num_samples=32,
             segmentations_cpu[i] = seg.cpu()
             
             # Free memory
-            del seg, eps
+            del seg
+            if 'eps' in locals():
+                del eps
             torch.cuda.empty_cache()
     
     print(f"Final stacked segmentations shape: {segmentations_cpu.shape}")
@@ -672,7 +681,7 @@ def get_segmentation_distribution(model, img_id, dataset, num_samples=32,
 def plot_reconstruction(model, img_id, dataset, num_samples=32, patch_size=None, overlap=100, temperature=1.0, enable_dropout=True, batch_size=4):
     """Plot image, mask, and uncertainty analysis using either full image or patch-based prediction."""
     # Get multiple segmentations with either patch-based or full image mode
-    segmentations, mask, mu, logvar = get_segmentation_distribution(
+    segmentations, mask, mu, logvar = get_segmentation_distribution_from_image(
         model, img_id, dataset=dataset, num_samples=num_samples,
         patch_size=patch_size, overlap=overlap, 
         temperature=temperature, enable_dropout=enable_dropout,
@@ -799,6 +808,11 @@ def visualize_temperature_sampling(model, image, mask=None,
     # Get latent distribution once to reuse
     with torch.no_grad():
         mu, logvar = encode_images(model, image)
+        
+    # Determine if sampling should be applied based on model configuration
+    should_sample = getattr(model, 'latent_injection', 'all') not in ['none', 'inject_no_bottleneck']
+    if not should_sample:
+        logging.info(f"Latent injection mode is '{model.latent_injection}'. Using deterministic mu (temperature ignored).")
     
     # Process each temperature separately
     for temp_idx, temp in enumerate(temperatures):
@@ -814,10 +828,14 @@ def visualize_temperature_sampling(model, image, mask=None,
             logging.info(f"  Sample {s+1}/{samples_per_temp}")
             
             with torch.no_grad():
-                # Sample with temperature
-                std = torch.exp(0.5 * logvar) * temp
-                eps = torch.randn_like(std)
-                z = mu + eps * std
+                # Sample with temperature or use mu directly
+                if should_sample:
+                    std = torch.exp(0.5 * logvar) * temp
+                    eps = torch.randn_like(std)
+                    z = mu + eps * std
+                else:
+                    # Use deterministic mu when sampling is disabled for this mode
+                    z = mu
                 z = z.unsqueeze(-1).unsqueeze(-1)  # Add spatial dimensions
                 
                 # Use correct prediction method
@@ -910,6 +928,11 @@ def generate_and_compare_ensemble(model, image, mask, temperatures=[0.5, 1.0, 2.
     # Get latent distribution once to reuse
     with torch.no_grad():
         mu, logvar = encode_images(model, image)
+        
+    # Determine if sampling should be applied based on model configuration
+    should_sample = getattr(model, 'latent_injection', 'all') not in ['none', 'inject_no_bottleneck']
+    if not should_sample:
+        logging.info(f"Latent injection mode is '{model.latent_injection}'. Using deterministic mu (temperature ignored).")
     
     # Temperature prediction scores and downsampled predictions
     dice_scores = []
@@ -926,10 +949,14 @@ def generate_and_compare_ensemble(model, image, mask, temperatures=[0.5, 1.0, 2.
             logging.info(f"  Sample {s+1}/{samples_per_temp}")
             
             with torch.no_grad():
-                # Sample latent vector
-                std = torch.exp(0.5 * logvar) * temp
-                eps = torch.randn_like(std)
-                z = mu + eps * std
+                # Sample latent vector or use mu directly
+                if should_sample:
+                    std = torch.exp(0.5 * logvar) * temp
+                    eps = torch.randn_like(std)
+                    z = mu + eps * std
+                else:
+                    # Use deterministic mu when sampling is disabled for this mode
+                    z = mu
                 z = z.unsqueeze(-1).unsqueeze(-1)
                 
                 # Generate prediction using appropriate method
@@ -992,10 +1019,14 @@ def generate_and_compare_ensemble(model, image, mask, temperatures=[0.5, 1.0, 2.
             logging.info(f"  Sample {s+1}/{samples_per_temp}")
             
             with torch.no_grad():
-                # Sample latent vector
-                std = torch.exp(0.5 * logvar) * temp
-                eps = torch.randn_like(std)
-                z = mu + eps * std
+                # Sample latent vector or use mu directly
+                if should_sample:
+                    std = torch.exp(0.5 * logvar) * temp
+                    eps = torch.randn_like(std)
+                    z = mu + eps * std
+                else:
+                    # Use deterministic mu when sampling is disabled for this mode
+                    z = mu
                 z = z.unsqueeze(-1).unsqueeze(-1)
                 
                 # Generate prediction
@@ -1097,6 +1128,11 @@ def generate_ensemble_prediction(model, image, temps=[0.5, 1.0, 2.0, 3.0],
     temp_weights = torch.tensor(temp_weights, device=device)
     temp_weights = temp_weights / temp_weights.sum()
     
+    # Determine if sampling should be applied based on model configuration
+    should_sample = getattr(model, 'latent_injection', 'all') != 'none'
+    if not should_sample:
+        logging.info(f"Latent injection mode is '{model.latent_injection}'. Using deterministic mu (temperature ignored).")
+    
     # Process one temperature at a time to save memory
     for temp_idx, temp in enumerate(temps):
         logging.info(f"Processing temperature {temp} with weight {temp_weights[temp_idx].item():.4f}")
@@ -1112,11 +1148,15 @@ def generate_ensemble_prediction(model, image, temps=[0.5, 1.0, 2.0, 3.0],
         for s in range(samples_per_temp):
             logging.info(f"  Sample {s+1}/{samples_per_temp}")
             
-            # Sample from latent space
+            # Sample from latent space or use mu directly
             with torch.no_grad():
-                std = torch.exp(0.5 * logvar) * temp
-                eps = torch.randn_like(std)
-                z = mu + eps * std
+                if should_sample:
+                    std = torch.exp(0.5 * logvar) * temp
+                    eps = torch.randn_like(std)
+                    z = mu + eps * std
+                else:
+                    # Use deterministic mu when sampling is disabled for this mode
+                    z = mu
                 z = z.unsqueeze(-1).unsqueeze(-1)  # Add spatial dimensions
                 
                 # Generate prediction using patches

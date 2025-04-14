@@ -206,7 +206,11 @@ class UNetResNet(nn.Module):
         logvar = self.logvar_head(x_enc).squeeze(-1).squeeze(-1)  # Shape: [B, latent_dim]
         
         # Reparameterize
-        z = self.reparameterize(mu, logvar)  # Shape: [B, latent_dim]
+        should_sample = self.latent_injection != 'none'
+        if should_sample:
+            z = self.reparameterize(mu, logvar)
+        else:
+            z = mu # Shape: [B, latent_dim]
         
         # Reshape z to spatial dimensions
         z = z.unsqueeze(-1).unsqueeze(-1)  # [B, latent_dim, 1, 1]

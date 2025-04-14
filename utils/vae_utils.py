@@ -34,7 +34,7 @@ def generate_predictions(model, images, temperature=1.0, num_samples=3):
         model: The VAE-UNet model
         images: Input images
         temperature: Temperature for sampling from the latent space
-                    Higher values = more diversity
+                    Higher values = more diversity. Ignored if latent_injection is 'none' or 'inject_no_bottleneck'.
         num_samples: Number of samples to generate and average
     
     Returns:
@@ -52,35 +52,37 @@ def generate_predictions(model, images, temperature=1.0, num_samples=3):
         
         # Prepare to accumulate predictions
         predictions = []
-        
-        for _ in range(num_samples):
-            # Sample from latent space with temperature
+    latent_mode = getattr(model, 'latent_injection', 'all')
+
+    # 'none' → no sampling; all others (including 'inject_no_bottleneck') → sample
+    should_sample = latent_mode != 'none'
+
+    for _ in range(num_samples):
+        # Sample from latent space
+        if should_sample:
             std = torch.exp(0.5 * logvar)
             eps = torch.randn_like(std) * temperature
             z = mu + eps * std
-            
-            # Forward pass through decoder using sampled z
-            z = z.unsqueeze(-1).unsqueeze(-1)
-            
-            # Spatial size for initial z projection
-            initial_size = features[-1].shape[2:]
-            z_spatial = F.interpolate(z, size=initial_size, mode='bilinear', align_corners=True)
-            
-            # Apply bottleneck processing based on injection strategy
-            if hasattr(model, 'use_bottleneck') and model.use_bottleneck:
-                x = model.z_initial(z_spatial)
-            else:
-                # For 'none' mode, use encoder features
-                x = features[-1]
-            
-            # Decode with conditional z injection
-            for i, decoder_block in enumerate(model.decoder_blocks):
-                skip = features[-(i+2)] if i < len(features)-1 and model.use_skip else None
-                x = decoder_block(x, skip, z_spatial)
-            
-            # Final conv
-            pred = model.final_conv(x)
-            predictions.append(pred)
+        else:
+            z = mu
+
+        z = z.unsqueeze(-1).unsqueeze(-1)
+        z_spatial = F.interpolate(z, size=features[-1].shape[2:], mode='bilinear', align_corners=True)
+
+        # Decoder input: use z or encoder features depending on whether to inject at bottleneck
+        if getattr(model, 'use_bottleneck', True):
+            x = model.z_initial(z_spatial)
+        else:
+            x = features[-1]
+
+        # Decoder pass
+        for i, decoder_block in enumerate(model.decoder_blocks):
+            skip = features[-(i + 2)] if i < len(features) - 1 and model.use_skip else None
+            x = decoder_block(x, skip, z_spatial)
+
+        pred = model.final_conv(x)
+        predictions.append(pred)
+
             
         # Average the predictions
         if len(predictions) > 1:
