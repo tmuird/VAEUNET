@@ -35,6 +35,7 @@ from utils.uncertainty_metrics import (
     calculate_uncertainty_error_auc,
     calculate_uncertainty_error_dice,
     calculate_segmentation_metrics
+
 )
 from utils.tensor_utils import ensure_dict_python_scalars, fix_dataframe_tensors
 from visualize_vae import get_segmentation_distribution_from_image, track_memory, get_image_and_mask, predict_with_patches, predict_full_image
@@ -132,21 +133,8 @@ def plot_global_roc_pr(
         gc.collect()
         log_memory_usage("[After Global ROC/PR List Cleanup]")
 
-        # Subsampling Step
-        if total_pixels > max_pixels_for_roc_pr:
-            logging.warning(f"Total pixels ({total_pixels}) exceeds threshold ({max_pixels_for_roc_pr}). Subsampling for ROC/PR calculation.")
-            indices = np.random.choice(total_pixels, max_pixels_for_roc_pr, replace=False)
-            errors_sampled = all_errors[indices]
-            uncertainties_sampled = all_uncertainties[indices]
-            del all_errors, all_uncertainties  # Free full arrays
-            gc.collect()
-            log_memory_usage("[After Global ROC/PR Subsampling]")
-            errors_to_use = errors_sampled
-            uncertainties_to_use = uncertainties_sampled
-        else:
-            logging.info("Using all pixels for ROC/PR calculation.")
-            errors_to_use = all_errors
-            uncertainties_to_use = all_uncertainties
+        errors_to_use = all_errors
+        uncertainties_to_use = all_uncertainties
 
         # Compute ROC using potentially subsampled data
         fpr, tpr, _ = roc_curve(errors_to_use, uncertainties_to_use)
@@ -915,18 +903,7 @@ def analyze_model(model, dataset, args, wandb_run=None):
             mean_pred = segmentations_cpu.mean(dim=0)
             std_dev = segmentations_cpu.std(dim=0)
 
-            # --- Calculate Segmentation Performance Metrics ---
-            mean_pred_for_seg_metrics = mean_pred.squeeze(1)
-            mask_for_seg_metrics = mask_cpu.squeeze(1)
-            
-            segmentation_metrics = calculate_segmentation_metrics(
-                mean_pred_for_seg_metrics, 
-                mask_for_seg_metrics, 
-                threshold=0.5
-            )
-            logging.info(f"Image {img_id} - Segmentation Metrics: {segmentation_metrics}")
-            # --- End Segmentation Performance Metrics Calculation ---
-
+   
             pred_flat = mean_pred[0].flatten().numpy()
             gt_flat = mask_cpu[0,0].flatten().numpy()
             gt_flat = np.round(gt_flat).astype(int)
@@ -991,11 +968,6 @@ def analyze_model(model, dataset, args, wandb_run=None):
                 'uncertainty_error_dice': ue_dice,  
                 'error_auroc': auroc,
                 'error_auprc': auprc,
-                'seg_auroc': segmentation_metrics.get('seg_auroc', float('nan')),
-                'seg_auprc': segmentation_metrics.get('seg_auprc', float('nan')),
-                'precision': segmentation_metrics.get('precision', float('nan')),
-                'recall': segmentation_metrics.get('recall', float('nan')),
-                'specificity': segmentation_metrics.get('specificity', float('nan')),
             }
             metrics_dict = ensure_dict_python_scalars(metrics_dict)
             metrics_data.append(metrics_dict)
@@ -1043,11 +1015,6 @@ def analyze_model(model, dataset, args, wandb_run=None):
                             uncert_vis_colored, 
                             caption=f"Std Dev - Mean: {std_dev[0].mean().item():.4f}"
                         ),
-                        f"metrics/{img_id}/seg_auroc": segmentation_metrics.get('seg_auroc', float('nan')),
-                        f"metrics/{img_id}/seg_auprc": segmentation_metrics.get('seg_auprc', float('nan')),
-                        f"metrics/{img_id}/precision": segmentation_metrics.get('precision', float('nan')),
-                        f"metrics/{img_id}/recall": segmentation_metrics.get('recall', float('nan')),
-                        f"metrics/{img_id}/specificity": segmentation_metrics.get('specificity', float('nan')),
                         "image_index": i
                     })
                     
@@ -1063,7 +1030,7 @@ def analyze_model(model, dataset, args, wandb_run=None):
             del pred_flat, gt_flat, errors, uncertainties_flat, pred_binary, pred_binary_np, gt_np, unc_map
             del uncertainties_correct, uncertainties_incorrect
             del frac_removed, err_random, err_uncertainty
-            del segmentation_metrics
+      
             torch.cuda.empty_cache() 
             gc.collect()
 
@@ -1112,6 +1079,43 @@ def analyze_model(model, dataset, args, wandb_run=None):
             wandb.log({"analysis_summary_table": wandb.Table(dataframe=df_for_wandb)})
         except Exception as e:
             logging.warning(f"Could not log metrics DataFrame with summary row to W&B: {e}")
+     # --- Compute global segmentation metrics (Garifullin-style) ---
+    all_preds = []
+    all_gts = []
+
+    for img_id in processed_ids:
+        try:
+            pred_path = temp_pixel_data_dir / f"{img_id}_pred_flat.npy"
+            gt_path = temp_pixel_data_dir / f"{img_id}_gt_flat.npy"
+            if pred_path.exists() and gt_path.exists():
+                pred = np.load(pred_path)
+                gt = np.load(gt_path)
+                all_preds.append(pred)
+                all_gts.append(gt)
+        except Exception as e:
+            logging.warning(f"Error loading prediction/GT for {img_id}: {e}")
+
+    if all_preds and all_gts:
+        all_preds_flat = np.concatenate(all_preds)
+        all_gts_flat = np.concatenate(all_gts)
+
+        # Convert to tensors
+        preds_tensor = torch.tensor(all_preds_flat)
+        gts_tensor = torch.tensor(all_gts_flat)
+
+        seg_metrics = calculate_segmentation_metrics(preds_tensor, gts_tensor, threshold=0.5)
+        logging.info(f"[Segmentation Metrics - Global]")
+        for k, v in seg_metrics.items():
+            logging.info(f"{k}: {v:.4f}")
+
+        if log_wandb:
+            wandb.summary.update({
+                "segmentation/auroc": seg_metrics['seg_auroc'],
+                "segmentation/auprc": seg_metrics['seg_auprc'],
+                "segmentation/precision": seg_metrics['precision'],
+                "segmentation/recall": seg_metrics['recall'],
+                "segmentation/specificity": seg_metrics['specificity'],
+            })
 
     # --- Ensure these plotting calls are present ---
     create_calibration_visualizations(processed_ids, temp_pixel_data_dir, output_dir, log_wandb=log_wandb)
@@ -1119,33 +1123,20 @@ def analyze_model(model, dataset, args, wandb_run=None):
     plot_global_sparsification_curve(processed_ids, temp_pixel_data_dir, output_dir, model_label=args.model_label, log_wandb=log_wandb)
     plot_global_uncertainty_distribution(processed_ids, temp_pixel_data_dir, output_dir, model_label=args.model_label, log_wandb=log_wandb)
     plot_global_roc_pr(processed_ids, temp_pixel_data_dir, output_dir, model_label=args.model_label, prefix="global_", log_wandb=log_wandb, max_pixels_for_roc_pr=args.max_pixels_roc_pr)
+
     # --- End of plotting calls ---
-    
+
     if log_wandb:
         try:
             summary_stats = {
                 "summary/avg_dice": metrics_df['dice'].mean(),
-                "summary/std_dice": metrics_df['dice'].std(),
                 "summary/avg_ece": metrics_df['ece'].mean(),
-                "summary/std_ece": metrics_df['ece'].std(),
                 "summary/avg_sparsification_error": metrics_df['sparsification_error'].mean(),
-                "summary/std_sparsification_error": metrics_df['sparsification_error'].std(),
                 "summary/avg_uncertainty_error_dice": metrics_df['uncertainty_error_dice'].mean(),
-                "summary/std_uncertainty_error_dice": metrics_df['uncertainty_error_dice'].std(),
                 "summary/avg_error_auroc": metrics_df['error_auroc'].mean(),
-                "summary/std_error_auroc": metrics_df['error_auroc'].std(),
                 "summary/avg_error_auprc": metrics_df['error_auprc'].mean(),
-                "summary/std_error_auprc": metrics_df['error_auprc'].std(),
-                "summary/avg_seg_auroc": metrics_df['seg_auroc'].mean(),
-                "summary/std_seg_auroc": metrics_df['seg_auroc'].std(),
-                "summary/avg_seg_auprc": metrics_df['seg_auprc'].mean(),
-                "summary/std_seg_auprc": metrics_df['seg_auprc'].std(),
-                "summary/avg_precision": metrics_df['precision'].mean(),
-                "summary/std_precision": metrics_df['precision'].std(),
-                "summary/avg_recall": metrics_df['recall'].mean(),
-                "summary/std_recall": metrics_df['recall'].std(),
-                "summary/avg_specificity": metrics_df['specificity'].mean(),
-                "summary/std_specificity": metrics_df['specificity'].std(),
+              
+      
             }
             wandb.summary.update(summary_stats)
         except Exception as e:
@@ -1154,11 +1145,6 @@ def analyze_model(model, dataset, args, wandb_run=None):
     logging.info("\nSummary Statistics:")
     logging.info(f"Number of images analyzed: {len(metrics_df)}")
     logging.info(f"Average Dice Score: {metrics_df['dice'].mean():.4f} ± {metrics_df['dice'].std():.4f}")
-    logging.info(f"Average Segmentation AUROC: {metrics_df['seg_auroc'].mean():.4f} ± {metrics_df['seg_auroc'].std():.4f}")
-    logging.info(f"Average Segmentation AUPRC: {metrics_df['seg_auprc'].mean():.4f} ± {metrics_df['seg_auprc'].std():.4f}")
-    logging.info(f"Average Precision: {metrics_df['precision'].mean():.4f} ± {metrics_df['precision'].std():.4f}")
-    logging.info(f"Average Recall: {metrics_df['recall'].mean():.4f} ± {metrics_df['recall'].std():.4f}")
-    logging.info(f"Average Specificity: {metrics_df['specificity'].mean():.4f} ± {metrics_df['specificity'].std():.4f}")
     logging.info(f"Average ECE: {metrics_df['ece'].mean():.4f} ± {metrics_df['ece'].std():.4f}")
     logging.info(f"Average Sparsification Error: {metrics_df['sparsification_error'].mean():.4f} ± {metrics_df['sparsification_error'].std():.4f}")
     logging.info(f"Average Uncertainty-Error Dice: {metrics_df['uncertainty_error_dice'].mean():.4f} ± {metrics_df['uncertainty_error_dice'].std():.4f}")
