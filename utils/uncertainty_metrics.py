@@ -4,6 +4,7 @@ import matplotlib.pyplot as plt
 from matplotlib.gridspec import GridSpec
 import torch.nn.functional as F
 from sklearn.metrics import roc_auc_score, average_precision_score
+import logging
 
 def calculate_uncertainty_metrics(segmentations):
     """Calculate various uncertainty metrics from multiple segmentation samples.
@@ -205,20 +206,149 @@ def plot_sparsification_curve(fraction_removed, errors_random, errors_uncertaint
     ax.set_ylim(0,1.1)
     return ax,se
 
-def calculate_uncertainty_error_auc(mean_pred, gt_mask, uncertainty_map):
-    pred_binary = (mean_pred>0.5).float().view(-1).cpu().numpy()
+def calculate_uncertainty_error_auc(mean_pred, gt_mask, uncertainty_map, threshold=0.5, handle_imbalance=True):
+    """Calculate how well uncertainty predicts errors in segmentation.
+    
+    Args:
+        mean_pred: Mean prediction probabilities [B, H, W]
+        gt_mask: Ground truth binary mask [B, H, W]
+        uncertainty_map: Uncertainty measure [B, H, W]
+        threshold: Threshold for binarizing predictions (default: 0.5)
+        handle_imbalance: Whether to use class-balancing techniques for severe imbalance
+        
+    Returns:
+        Tuple of (AUROC, AUPRC) between uncertainty and prediction errors
+    """
+    pred_binary = (mean_pred > threshold).float().view(-1).cpu().numpy()
     gt_flat = gt_mask.view(-1).cpu().numpy()
     uncertainty = uncertainty_map.view(-1).cpu().numpy()
 
-    errors = (pred_binary!=gt_flat).astype(np.int32)
+    # Get binary error mask (1 where prediction != ground truth)
+    errors = (pred_binary != gt_flat).astype(np.int32)
+    
+    # Get proportion of errors to understand class imbalance
+    error_rate = np.mean(errors)
+    logging.info(f"Error rate: {error_rate:.4f} (fraction of pixels where prediction != ground truth)")
+    
+    # Check if we have both error and non-error cases (need both for ROC/PR curve)
+    if np.sum(errors) == 0 or np.sum(errors) == len(errors):
+        # All predictions correct or all predictions wrong - ROC/PR not defined
+        return float('nan'), float('nan')
+    
+    # Check if uncertainty has variation - needed for meaningful scoring
+    if np.std(uncertainty) < 1e-10:
+        # No variation in uncertainty scores
+        return float('nan'), float('nan')
+    
     try:
+        # Check for NaN or infinity values that could cause problems
+        if np.isnan(uncertainty).any() or np.isinf(uncertainty).any():
+            return float('nan'), float('nan')
+        
+        # For severe class imbalance (typical in medical imaging segmentation):
+        if handle_imbalance and (error_rate < 0.05 or error_rate > 0.95):
+            # Option 1: Use stratified sampling to balance the classes
+            pos_indices = np.where(errors == 1)[0]
+            neg_indices = np.where(errors == 0)[0]
+            
+            # Limit to the smaller of the two class sizes
+            min_samples = min(len(pos_indices), len(neg_indices))
+            max_samples = 100000  # Cap at 100k samples to prevent memory issues
+            min_samples = min(min_samples, max_samples)
+            
+            if min_samples > 100:  # Ensure we have enough samples for meaningful metrics
+                # If we have at least some of both classes
+                np.random.seed(42)  # For reproducibility
+                sampled_pos = np.random.choice(pos_indices, min_samples, replace=False)
+                sampled_neg = np.random.choice(neg_indices, min_samples, replace=False)
+                
+                # Combine the balanced samples
+                balanced_indices = np.concatenate([sampled_pos, sampled_neg])
+                balanced_errors = errors[balanced_indices]
+                balanced_uncertainty = uncertainty[balanced_indices]
+                
+                # Calculate metrics on the balanced sample
+                auroc_balanced = roc_auc_score(balanced_errors, balanced_uncertainty)
+                auprc_balanced = average_precision_score(balanced_errors, balanced_uncertainty)
+                
+                logging.info(f"Balanced sampling: AUROC={auroc_balanced:.4f}, AUPRC={auprc_balanced:.4f}")
+                
+                # Return balanced metrics for severe imbalance cases
+                return auroc_balanced, auprc_balanced
+        
+        # Standard calculation for more balanced cases
         auroc = roc_auc_score(errors, uncertainty)
         auprc = average_precision_score(errors, uncertainty)
-    except ValueError:
-        auroc=float('nan')
-        auprc=float('nan')
+        
+        # Add informative log statement
+        logging.info(f"AUROC and AUPRC measure how well uncertainty predicts errors, not segmentation performance")
+        
+        # Verify the output is valid
+        if np.isnan(auroc) or np.isnan(auprc):
+            return float('nan'), float('nan')
+            
+    except Exception as e:
+        # Catch any remaining calculation errors
+        logging.error(f"Error calculating AUROC/AUPRC: {e}")
+        return float('nan'), float('nan')
     
-    return auroc,auprc
+    return auroc, auprc
+
+def calculate_segmentation_metrics(predictions, ground_truth, threshold=0.5):
+    """Calculate AUROC and AUPRC for the segmentation task itself (not uncertainty).
+    
+    Args:
+        predictions: Predicted probabilities [B, H, W]
+        ground_truth: Ground truth binary mask [B, H, W]
+        threshold: Threshold for binarizing predictions (default: 0.5)
+        
+    Returns:
+        Dictionary with segmentation metrics
+    """
+    # Flatten predictions and ground truth
+    pred_flat = predictions.view(-1).cpu().numpy()
+    gt_flat = ground_truth.view(-1).cpu().numpy()
+    
+    # Calculate class balance
+    pos_rate = np.mean(gt_flat)
+    
+    logging.info(f"Positive class rate in ground truth: {pos_rate:.4f}")
+    
+    try:
+        # Calculate AUROC and AUPRC for segmentation (predicting positive class)
+        seg_auroc = roc_auc_score(gt_flat, pred_flat)
+        seg_auprc = average_precision_score(gt_flat, pred_flat)
+        
+        # Binary predictions for other metrics
+        pred_binary = (pred_flat > threshold).astype(np.int32)
+        
+        # True/false positives/negatives
+        tp = np.sum((pred_binary == 1) & (gt_flat == 1))
+        fp = np.sum((pred_binary == 1) & (gt_flat == 0))
+        tn = np.sum((pred_binary == 0) & (gt_flat == 0))
+        fn = np.sum((pred_binary == 0) & (gt_flat == 1))
+        
+        # Calculate precision, recall, specificity
+        precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+        recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+        specificity = tn / (tn + fp) if (tn + fp) > 0 else 0.0
+        
+        return {
+            'seg_auroc': seg_auroc,
+            'seg_auprc': seg_auprc,
+            'precision': precision,
+            'recall': recall,
+            'specificity': specificity
+        }
+    except Exception as e:
+        logging.error(f"Error calculating segmentation metrics: {e}")
+        return {
+            'seg_auroc': float('nan'),
+            'seg_auprc': float('nan'),
+            'precision': float('nan'),
+            'recall': float('nan'),
+            'specificity': float('nan')
+        }
 
 def calculate_negative_log_likelihood(predictions, targets, epsilon=1e-9):
     """Calculates the pixel-wise Negative Log-Likelihood (NLL).
@@ -261,6 +391,3 @@ def calculate_uncertainty_error_dice(uncertainty_map, predictions_binary, target
     dice = (2.0 * intersection) / (denominator + 1e-8)
     return dice.item()
 
-def create_comprehensive_uncertainty_report(segmentations, ground_truth, output_path=None):
-    # (No change to your original function)
-    pass
