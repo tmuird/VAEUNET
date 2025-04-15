@@ -50,11 +50,13 @@ def plot_global_roc_pr(
     output_dir,
     model_label="Model",
     prefix="",
-    log_wandb=False
+    log_wandb=False,
+    max_pixels_for_roc_pr=20_000_000
 ):
     """
     Plots the global AUROC and AUPRC curves by loading data incrementally.
     Saves plots into output_dir with optional prefix appended to filenames.
+    Subsamples data if the total number of pixels exceeds max_pixels_for_roc_pr.
 
     Args:
         processed_ids: Set of image IDs that were processed.
@@ -63,6 +65,7 @@ def plot_global_roc_pr(
         model_label: e.g. 'High-KL Model'
         prefix: optional string to prepend to filenames, e.g. "global_" => "global_roc.png"
         log_wandb: If True, log plots to W&B
+        max_pixels_for_roc_pr: Maximum number of pixels to use for ROC/PR calculation.
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -96,6 +99,7 @@ def plot_global_roc_pr(
         logging.info("Concatenating global errors and uncertainties...")
         all_errors = np.concatenate(all_errors_loaded)
         all_uncertainties = np.concatenate(all_uncertainties_loaded)
+        total_pixels = len(all_errors)
         logging.info(f"Concatenated shapes: errors={all_errors.shape}, uncertainties={all_uncertainties.shape}")
         log_memory_usage("[After Global ROC/PR Concat]")
         
@@ -104,12 +108,28 @@ def plot_global_roc_pr(
         gc.collect()
         log_memory_usage("[After Global ROC/PR List Cleanup]")
 
-        # Compute ROC
-        fpr, tpr, _ = roc_curve(all_errors, all_uncertainties)
+        # Subsampling Step
+        if total_pixels > max_pixels_for_roc_pr:
+            logging.warning(f"Total pixels ({total_pixels}) exceeds threshold ({max_pixels_for_roc_pr}). Subsampling for ROC/PR calculation.")
+            indices = np.random.choice(total_pixels, max_pixels_for_roc_pr, replace=False)
+            errors_sampled = all_errors[indices]
+            uncertainties_sampled = all_uncertainties[indices]
+            del all_errors, all_uncertainties  # Free full arrays
+            gc.collect()
+            log_memory_usage("[After Global ROC/PR Subsampling]")
+            errors_to_use = errors_sampled
+            uncertainties_to_use = uncertainties_sampled
+        else:
+            logging.info("Using all pixels for ROC/PR calculation.")
+            errors_to_use = all_errors
+            uncertainties_to_use = all_uncertainties
+
+        # Compute ROC using potentially subsampled data
+        fpr, tpr, _ = roc_curve(errors_to_use, uncertainties_to_use)
         roc_auc = auc(fpr, tpr)
 
-        # Compute PR
-        precision, recall, _ = precision_recall_curve(all_errors, all_uncertainties)
+        # Compute PR using potentially subsampled data
+        precision, recall, _ = precision_recall_curve(errors_to_use, uncertainties_to_use)
         prc_auc = auc(recall, precision)
 
         # Plot ROC
@@ -118,7 +138,7 @@ def plot_global_roc_pr(
         plt.plot([0,1],[0,1],'k--', label='Chance')
         plt.xlabel('False Positive Rate')
         plt.ylabel('True Positive Rate')
-        plt.title(f'Global ROC Curve ({model_label})')
+        plt.title(f'Global ROC Curve ({model_label}){" (Subsampled)" if total_pixels > max_pixels_for_roc_pr else ""}')
         plt.legend(loc='lower right')
         plt.grid(alpha=0.3)
         out_roc = output_dir / f"{prefix}roc_curve.png"
@@ -133,11 +153,11 @@ def plot_global_roc_pr(
         # Plot PR
         plt.figure(figsize=(6,6))
         plt.plot(recall, precision, label=f'{model_label} (AUC={prc_auc:.4f})', lw=2)
-        baseline = np.sum(all_errors) / (len(all_errors)+1e-9)  # fraction of positives
+        baseline = np.sum(errors_to_use) / (len(errors_to_use)+1e-9)  # fraction of positives
         plt.plot([0,1],[baseline, baseline],'k--', label=f'Chance={baseline:.3f}')
         plt.xlabel('Recall')
         plt.ylabel('Precision')
-        plt.title(f'Global Precision-Recall Curve ({model_label})')
+        plt.title(f'Global Precision-Recall Curve ({model_label}){" (Subsampled)" if total_pixels > max_pixels_for_roc_pr else ""}')
         plt.legend(loc='lower left')
         plt.grid(alpha=0.3)
         out_pr = output_dir / f"{prefix}pr_curve.png"
@@ -159,12 +179,15 @@ def plot_global_roc_pr(
                 logging.warning(f"Could not log global AUCs to W&B summary: {e}")
 
         # Final cleanup
-        del all_errors, all_uncertainties, fpr, tpr, precision, recall
+        del errors_to_use, uncertainties_to_use, fpr, tpr, precision, recall
+        # Ensure full arrays are deleted if they weren't subsampled
+        if 'all_errors' in locals(): del all_errors
+        if 'all_uncertainties' in locals(): del all_uncertainties
         gc.collect()
         log_memory_usage("[After Global ROC/PR Plotting]")
 
     except ValueError as e:
-         logging.error(f"Error concatenating global arrays for ROC/PR: {e}. Check shapes of temporary .npy files in {temp_pixel_data_dir}. Skipping plot.")
+         logging.error(f"Error during global ROC/PR calculation: {e}. Check shapes of temporary .npy files in {temp_pixel_data_dir}. Skipping plot.")
     except Exception as e:
          logging.error(f"Unexpected error during global ROC/PR generation: {e}. Skipping plot.")
     finally:
@@ -173,6 +196,8 @@ def plot_global_roc_pr(
         if 'all_uncertainties_loaded' in locals(): del all_uncertainties_loaded
         if 'all_errors' in locals(): del all_errors
         if 'all_uncertainties' in locals(): del all_uncertainties
+        if 'errors_to_use' in locals(): del errors_to_use
+        if 'uncertainties_to_use' in locals(): del uncertainties_to_use
         gc.collect()
         log_memory_usage("[End of Global ROC/PR]")
 
@@ -897,7 +922,7 @@ def analyze_model(model, dataset, args, wandb_run=None):
     perform_temperature_analysis(processed_ids, temp_pixel_data_dir, output_dir, args.temp_values, log_wandb=log_wandb)
     plot_global_sparsification_curve(processed_ids, temp_pixel_data_dir, output_dir, model_label=args.model_label, log_wandb=log_wandb)
     plot_global_uncertainty_distribution(processed_ids, temp_pixel_data_dir, output_dir, model_label=args.model_label, log_wandb=log_wandb)
-    plot_global_roc_pr(processed_ids, temp_pixel_data_dir, output_dir, model_label=args.model_label, prefix="global_", log_wandb=log_wandb)
+    plot_global_roc_pr(processed_ids, temp_pixel_data_dir, output_dir, model_label=args.model_label, prefix="global_", log_wandb=log_wandb, max_pixels_for_roc_pr=args.max_pixels_roc_pr)
     
     if log_wandb:
         try:
@@ -970,6 +995,8 @@ def get_args():
                         help='Label for the model in plots')
     parser.add_argument('--batch_size', type=int, default=4,
                         help='Batch size for patch processing (default: 4)')
+    parser.add_argument('--max_pixels_roc_pr', type=int, default=20_000_000,
+                        help='Maximum number of pixels to use for global ROC/PR calculation to limit memory usage (default: 20 million)')
     parser.add_argument('--no_wandb', action='store_true', help='Disable Weights & Biases logging')
     parser.add_argument('--wandb_project', type=str, default='VAE_UNet_Analysis', help='W&B project name')
     parser.add_argument('--wandb_entity', type=str, default=None, help='W&B entity (username or team)')

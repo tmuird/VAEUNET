@@ -139,7 +139,7 @@ def collate_patches(batch):
             'img_id': [x['img_id'] for x in batch]
         }
 
-# def multi_temp_training_step(model, images, true_masks, criterion, 
+def multi_temp_training_step(model, images, true_masks, criterion, 
                         temps=[1.0, 3.0], weight=0.3):
     """Training step with multi-temperature sampling."""
     # Standard prediction
