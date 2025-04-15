@@ -19,9 +19,14 @@ import math
 import gc
 import shutil
 import psutil
+from collections import defaultdict
+import torch.nn as nn
+import torch.nn.functional as F
+import traceback
+import functools
 
 from utils.data_loading import IDRIDDataset, load_image
-from unet.unet_resnet import UNetResNet
+from unet.unet_resnet import UNetResNet, AttentionGate
 from utils.uncertainty_metrics import (
     calculate_expected_calibration_error, 
     calculate_sparsification_metrics,
@@ -31,7 +36,7 @@ from utils.uncertainty_metrics import (
     calculate_uncertainty_error_dice
 )
 from utils.tensor_utils import ensure_dict_python_scalars, fix_dataframe_tensors
-from visualize_vae import get_segmentation_distribution_from_image, track_memory
+from visualize_vae import get_segmentation_distribution_from_image, track_memory, get_image_and_mask, predict_with_patches, predict_full_image
 
 
 def log_memory_usage(stage_name=""):
@@ -42,6 +47,22 @@ def log_memory_usage(stage_name=""):
     if torch.cuda.is_available():
         gpu_mem_mb = torch.cuda.memory_allocated() / (1024 * 1024)
     logging.info(f"Memory usage {stage_name}: RAM={ram_mb:.2f} MB, GPU={gpu_mem_mb:.2f} MB")
+
+
+# --- Global dictionary to store attention maps from hooks ---
+captured_attention_maps = defaultdict(list)
+current_sample_index = 0  # Global variable to track sample index (use with caution)
+
+
+# Modify hook function to accept module_name
+def attention_hook_fn(module, input, output, module_name):
+    """Hook function to capture attention map output."""
+    global captured_attention_maps
+    global current_sample_index
+    # Store the output tensor on CPU to save GPU memory
+    # Key by module name and sample index
+    # Use module_name passed via functools.partial
+    captured_attention_maps[f"sample_{current_sample_index}_{module_name}"].append(output.detach().cpu())
 
 
 def plot_global_roc_pr(
@@ -56,7 +77,6 @@ def plot_global_roc_pr(
     """
     Plots the global AUROC and AUPRC curves by loading data incrementally.
     Saves plots into output_dir with optional prefix appended to filenames.
-    Subsamples data if the total number of pixels exceeds max_pixels_for_roc_pr.
 
     Args:
         processed_ids: Set of image IDs that were processed.
@@ -65,7 +85,6 @@ def plot_global_roc_pr(
         model_label: e.g. 'High-KL Model'
         prefix: optional string to prepend to filenames, e.g. "global_" => "global_roc.png"
         log_wandb: If True, log plots to W&B
-        max_pixels_for_roc_pr: Maximum number of pixels to use for ROC/PR calculation.
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -128,8 +147,8 @@ def plot_global_roc_pr(
         fpr, tpr, _ = roc_curve(errors_to_use, uncertainties_to_use)
         roc_auc = auc(fpr, tpr)
 
-        # Compute PR using potentially subsampled data
-        precision, recall, _ = precision_recall_curve(errors_to_use, uncertainties_to_use)
+        # Compute PR
+        precision, recall, _ = precision_recall_curve(all_errors, all_uncertainties)
         prc_auc = auc(recall, precision)
 
         # Plot ROC
@@ -187,7 +206,7 @@ def plot_global_roc_pr(
         log_memory_usage("[After Global ROC/PR Plotting]")
 
     except ValueError as e:
-         logging.error(f"Error during global ROC/PR calculation: {e}. Check shapes of temporary .npy files in {temp_pixel_data_dir}. Skipping plot.")
+         logging.error(f"Error concatenating global arrays for ROC/PR: {e}. Check shapes of temporary .npy files in {temp_pixel_data_dir}. Skipping plot.")
     except Exception as e:
          logging.error(f"Unexpected error during global ROC/PR generation: {e}. Skipping plot.")
     finally:
@@ -200,7 +219,6 @@ def plot_global_roc_pr(
         if 'uncertainties_to_use' in locals(): del uncertainties_to_use
         gc.collect()
         log_memory_usage("[End of Global ROC/PR]")
-
 
 def create_calibration_visualizations(processed_ids, temp_pixel_data_dir, output_dir, log_wandb=False):
     """Creates global calibration plot by loading data incrementally."""
@@ -705,8 +723,15 @@ def create_uncertainty_visualizations(metrics_df, output_dir, log_wandb=False):
 
 @track_memory
 def analyze_model(model, dataset, args, wandb_run=None):
+    # Declare global variables at the beginning of the function
+    global captured_attention_maps
+    global current_sample_index
+    
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model.eval()
+    if not getattr(args, 'enable_dropout', False):
+        model.eval()
+    else:
+        model.train()
     
     output_dir = Path(args.output_dir) / f"{args.lesion_type}_T{args.temperature}_N{args.samples}"
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -717,6 +742,13 @@ def analyze_model(model, dataset, args, wandb_run=None):
     processed_ids = set()
     log_wandb = wandb_run is not None
     
+    # --- Check if model uses attention ---
+    model_uses_attention = isinstance(model, UNetResNet) and model.use_attention
+    if model_uses_attention:
+        logging.info("Model uses attention, will attempt to capture attention maps.")
+        if args.patch_size is not None and args.patch_size > 0:
+            logging.warning("Attention map visualization is currently best supported for full-image analysis (patch_size=None). Stitching patch attention maps is not implemented.")
+
     for i in tqdm(range(len(dataset)), desc="Analyzing images"):
         sample = dataset[i]
         img_id = sample['img_id']
@@ -726,14 +758,154 @@ def analyze_model(model, dataset, args, wandb_run=None):
         
         logging.info(f"Processing image {img_id}")
         
+        # --- Register hooks before processing the image ---
+        hook_handles = []
+        captured_attention_maps.clear()  # Clear maps for the new image
+        
+        if model_uses_attention:
+            logging.debug(f"Registering attention hooks for image {img_id}")
+            attention_gate_count = 0
+            try:
+                # Use functools.partial to pass module name to the hook
+                for name, module in model.named_modules():
+                    if isinstance(module, AttentionGate):
+                        # Create a partial function with the module name baked in
+                        hook_with_name = functools.partial(attention_hook_fn, module_name=name)
+                        handle = module.psi.register_forward_hook(hook_with_name)
+                        hook_handles.append(handle)
+                        attention_gate_count += 1
+                logging.debug(f"Registered {attention_gate_count} attention hooks.")
+            except Exception as e:
+                logging.error(f"Failed to register attention hooks: {e}")
+                for handle in hook_handles:
+                    handle.remove()
+                hook_handles = []
+
         try:
-            segmentations, mask, mu, logvar = get_segmentation_distribution_from_image(
-                model, img_id, dataset=dataset, num_samples=args.samples,
-                patch_size=args.patch_size, overlap=args.overlap, 
-                temperature=args.temperature, enable_dropout=False,
-                batch_size=args.batch_size
-            )
+            # --- Call the main function to get segmentations ---
+            all_segmentations = []
+            all_masks = []
             
+            current_sample_index = 0
+            
+            img_full, mask_full, original_shape_from_file = get_image_and_mask(dataset, img_id) # Rename original_shape
+            img_full_dev = img_full.unsqueeze(0).to(device)
+            mask_full_dev = mask_full.unsqueeze(0).to(device)
+            
+            # Get the actual shape of the tensor fed into the model
+            input_tensor_shape = img_full_dev.shape[2:] # H, W
+            
+            with torch.no_grad():
+                mu, logvar = model.encode(img_full_dev)
+
+            segmentations_list_cpu = []
+            for s_idx in range(args.samples):
+                current_sample_index = s_idx
+                logging.debug(f"Generating sample {s_idx} for image {img_id}")
+                with torch.no_grad():
+                    std = torch.exp(0.5 * logvar) * args.temperature
+                    eps = torch.randn_like(std)
+                    z = mu + eps * std
+                    z = z.unsqueeze(-1).unsqueeze(-1)
+
+                    if args.patch_size is not None and args.patch_size > 0:
+                        seg = predict_with_patches(model, img_full_dev, z, patch_size=args.patch_size, overlap=args.overlap, batch_size=args.batch_size)
+                    else:
+                        seg = predict_full_image(model, img_full_dev, z)
+                    
+                    segmentations_list_cpu.append(seg.cpu())
+                    del seg, z, eps, std
+                    torch.cuda.empty_cache()
+
+            segmentations = torch.cat(segmentations_list_cpu, dim=0)
+            mask = mask_full_dev
+            del segmentations_list_cpu, img_full_dev
+            
+            # --- Process captured attention maps ---
+            if hook_handles and captured_attention_maps:
+                logging.debug(f"Processing {len(captured_attention_maps)} captured attention map entries.")
+                processed_attention_maps = defaultdict(list)
+                
+                for key, maps_list in captured_attention_maps.items():
+                    parts = key.split('_')
+                    sample_idx = int(parts[1])
+                    # The rest of the key is the module name
+                    module_name = '_'.join(parts[2:]) # Reconstruct module name
+                    if maps_list:
+                        # Store maps associated with the module name
+                        processed_attention_maps[module_name].append(maps_list[0]) 
+                
+                averaged_attention_maps = {}
+                for module_name, maps_list in processed_attention_maps.items():
+                    if maps_list:
+                        stacked_maps = torch.stack(maps_list, dim=0)
+                        avg_map = stacked_maps.mean(dim=0)
+                        averaged_attention_maps[module_name] = avg_map # Use module_name as key
+                        logging.debug(f"Averaged attention map for module {module_name}: shape {avg_map.shape}")
+
+                if log_wandb and averaged_attention_maps:
+                    log_dict = {}
+                    # Use the shape of the input tensor for resizing
+                    img_h, img_w = input_tensor_shape 
+                    map_idx = 0
+                    # Sort maps by name to potentially get them in order (e.g., decoder_0, decoder_1...)
+                    sorted_module_names = sorted(averaged_attention_maps.keys())
+
+                    for module_name in sorted_module_names:
+                        avg_map = averaged_attention_maps[module_name]
+                        try:
+                            # Fix: Ensure the attention map has the right number of dimensions and channels
+                            # First, squeeze any singleton dimensions except batch
+                            if avg_map.dim() > 2:
+                                # Keep only first channel if multi-channel
+                                if avg_map.shape[0] > 1:
+                                    avg_map = avg_map[0:1]
+                            
+                            # Make sure it's in the format [1, C, H, W] for interpolation
+                            if avg_map.dim() == 2:  # [H, W]
+                                avg_map = avg_map.unsqueeze(0).unsqueeze(0)  # Add batch and channel dims
+                            elif avg_map.dim() == 3:  # [C, H, W] or [1, H, W]
+                                avg_map = avg_map.unsqueeze(0)  # Add batch dim
+                            
+                            # Now use proper interpolation with input tensor in expected format
+                            # Resize to the actual input tensor dimensions
+                            logging.debug(f"Resizing attention map from {avg_map.shape} to {(img_h, img_w)}")
+                            resized_map = F.interpolate(avg_map, size=(img_h, img_w), 
+                                                      mode='bilinear', align_corners=False)
+                            
+                            # Squeeze back to [H, W] for visualization
+                            resized_map = resized_map.squeeze()
+                            
+                            # Normalize for visualization
+                            if resized_map.dim() >= 2:
+                                # Get min/max for proper normalization
+                                min_val = resized_map.min()
+                                max_val = resized_map.max()
+                                if max_val > min_val:
+                                    resized_map = (resized_map - min_val) / (max_val - min_val)
+                                
+                                # Convert to numpy for visualization
+                                resized_map_np = resized_map.numpy()
+                                colormap = cm.get_cmap('viridis')
+                                colored_map = (colormap(resized_map_np)[:, :, :3] * 255).astype(np.uint8)
+                                # Use module_name in the log key for clarity
+                                log_dict[f"attention_maps/{img_id}/{module_name}"] = wandb.Image(colored_map)
+                                map_idx += 1 # Keep map_idx if needed, but module_name is more descriptive
+                        except Exception as viz_e:
+                            logging.warning(f"Could not visualize attention map for module {module_name}: {viz_e}")
+                            import traceback
+                            traceback.print_exc()
+                    
+                    if log_dict:
+                        try:
+                            wandb.log(log_dict)
+                            logging.info(f"Logged {len(log_dict)} averaged attention maps for {img_id}.")
+                        except Exception as log_e:
+                            logging.warning(f"Could not log attention maps to W&B for {img_id}: {log_e}")
+                
+                del processed_attention_maps, averaged_attention_maps
+                if 'log_dict' in locals(): del log_dict
+
             segmentations_cpu = segmentations.cpu()
             mask_cpu = mask.cpu()
             
@@ -860,7 +1032,6 @@ def analyze_model(model, dataset, args, wandb_run=None):
 
                 except Exception as e:
                     logging.warning(f"Could not log visualizations to W&B for {img_id}: {e}")
-                    import traceback
                     traceback.print_exc()
 
             del segmentations, mask, mu, logvar, segmentations_cpu, mask_cpu, mean_pred, std_dev
@@ -872,7 +1043,6 @@ def analyze_model(model, dataset, args, wandb_run=None):
 
         except Exception as e:
             logging.error(f"Error processing image {img_id}: {e}")
-            import traceback
             traceback.print_exc()
             for suffix in ["_pred_flat.npy", "_gt_flat.npy", "_errors.npy", "_uncertainties.npy", "_sparsification.npz", "_uncertainty_dist.npz"]:
                 temp_file = temp_pixel_data_dir / f"{img_id}{suffix}"
@@ -880,18 +1050,26 @@ def analyze_model(model, dataset, args, wandb_run=None):
                     temp_file.unlink(missing_ok=True)
             gc.collect()
             continue
-        
-        if args.max_images and len(processed_ids)>=args.max_images:
+        finally:
+            if hook_handles:
+                logging.debug(f"Removing {len(hook_handles)} attention hooks for image {img_id}")
+                for handle in hook_handles:
+                    handle.remove()
+                hook_handles = []
+            captured_attention_maps.clear()
+            gc.collect()
+
+        if args.max_images and len(processed_ids) >= args.max_images:
             break
 
     metrics_df = pd.DataFrame(metrics_data)
     metrics_df = fix_dataframe_tensors(metrics_df)
-    numeric_cols = [] # Keep track of numeric columns for summary
+    numeric_cols = []
     for col in metrics_df.columns:
         if col != 'img_id':
             try:
                 metrics_df[col] = pd.to_numeric(metrics_df[col], errors='coerce')
-                numeric_cols.append(col) # Add to list if conversion is successful
+                numeric_cols.append(col)
             except Exception as e:
                 logging.warning(f"Could not convert {col} to numeric: {e}")
     
@@ -901,21 +1079,15 @@ def analyze_model(model, dataset, args, wandb_run=None):
     
     if log_wandb:
         try:
-            # Calculate mean values for summary row
             summary_row = metrics_df[numeric_cols].mean().to_dict()
-            summary_row['img_id'] = 'Overall Mean' # Add identifier for the summary row
-            
-            # Create a DataFrame for the summary row
+            summary_row['img_id'] = 'Overall Mean'
             summary_df = pd.DataFrame([summary_row])
-            
-            # Concatenate the summary row to the original DataFrame
             df_for_wandb = pd.concat([metrics_df, summary_df], ignore_index=True)
-            
-            # Log the table with the summary row
             wandb.log({"analysis_summary_table": wandb.Table(dataframe=df_for_wandb)})
         except Exception as e:
             logging.warning(f"Could not log metrics DataFrame with summary row to W&B: {e}")
 
+    # --- Ensure these plotting calls are present ---
     create_uncertainty_visualizations(metrics_df, output_dir, log_wandb=log_wandb)
     
     create_calibration_visualizations(processed_ids, temp_pixel_data_dir, output_dir, log_wandb=log_wandb)
@@ -923,6 +1095,7 @@ def analyze_model(model, dataset, args, wandb_run=None):
     plot_global_sparsification_curve(processed_ids, temp_pixel_data_dir, output_dir, model_label=args.model_label, log_wandb=log_wandb)
     plot_global_uncertainty_distribution(processed_ids, temp_pixel_data_dir, output_dir, model_label=args.model_label, log_wandb=log_wandb)
     plot_global_roc_pr(processed_ids, temp_pixel_data_dir, output_dir, model_label=args.model_label, prefix="global_", log_wandb=log_wandb, max_pixels_for_roc_pr=args.max_pixels_roc_pr)
+    # --- End of plotting calls ---
     
     if log_wandb:
         try:
