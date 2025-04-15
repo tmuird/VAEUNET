@@ -147,8 +147,8 @@ def plot_global_roc_pr(
         fpr, tpr, _ = roc_curve(errors_to_use, uncertainties_to_use)
         roc_auc = auc(fpr, tpr)
 
-        # Compute PR
-        precision, recall, _ = precision_recall_curve(all_errors, all_uncertainties)
+        # Compute PR using potentially subsampled data
+        precision, recall, _ = precision_recall_curve(errors_to_use, uncertainties_to_use)
         prc_auc = auc(recall, precision)
 
         # Plot ROC
