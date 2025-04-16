@@ -3,9 +3,119 @@ import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.gridspec import GridSpec
 import torch.nn.functional as F
-from sklearn.metrics import roc_auc_score, average_precision_score
+from sklearn.metrics import roc_auc_score, average_precision_score, roc_curve, precision_recall_curve, auc
 import logging
-
+from tqdm import tqdm
+import gc
+def calculate_segmentation_metrics_chunked(processed_ids, temp_pixel_data_dir, threshold=0.5, chunk_size=100000):
+    """Calculate segmentation metrics incrementally over chunks to avoid memory issues.
+    
+    Args:
+        processed_ids: Set of image IDs that were processed
+        temp_pixel_data_dir: Path to the directory containing temporary .npy files
+        threshold: Threshold for binarizing predictions (default: 0.5)
+        chunk_size: Number of elements to process at once
+        
+    Returns:
+        Dictionary with segmentation metrics
+    """
+    # Counters for incremental calculation
+    total_tp = 0
+    total_fp = 0
+    total_tn = 0
+    total_fn = 0
+    total_elements = 0
+    
+    # For AUROC/AUPRC calculation we need to collect all scores and labels
+    # Use lists that will be appended to for each image
+    all_scores = []
+    all_labels = []
+    
+    logging.info("Calculating segmentation metrics in chunks...")
+    
+    for img_id in tqdm(processed_ids, desc="Processing metrics by image"):
+        try:
+            pred_path = temp_pixel_data_dir / f"{img_id}_pred_flat.npy"
+            gt_path = temp_pixel_data_dir / f"{img_id}_gt_flat.npy"
+            
+            if pred_path.exists() and gt_path.exists():
+                # Process this image data
+                pred = np.load(pred_path)
+                gt = np.load(gt_path)
+                
+                # For AUROC/AUPRC store only a random subset to manage memory
+                if len(pred) > 10000:  # For very large images
+                    # Random sample of indices 
+                    indices = np.random.choice(len(pred), 10000, replace=False)
+                    all_scores.append(pred[indices])
+                    all_labels.append(gt[indices])
+                else:
+                    all_scores.append(pred)
+                    all_labels.append(gt)
+                
+                # Process predictions in chunks to calculate TP, FP, TN, FN
+                for i in range(0, len(pred), chunk_size):
+                    end_idx = min(i + chunk_size, len(pred))
+                    pred_chunk = pred[i:end_idx]
+                    gt_chunk = gt[i:end_idx]
+                    
+                    # Binarize predictions
+                    pred_binary = (pred_chunk > threshold).astype(np.int32)
+                    gt_binary = gt_chunk.astype(np.int32)
+                    
+                    # Calculate confusion matrix elements
+                    tp = np.sum((pred_binary == 1) & (gt_binary == 1))
+                    fp = np.sum((pred_binary == 1) & (gt_binary == 0))
+                    tn = np.sum((pred_binary == 0) & (gt_binary == 0))
+                    fn = np.sum((pred_binary == 0) & (gt_binary == 1))
+                    
+                    # Accumulate counts
+                    total_tp += tp
+                    total_fp += fp
+                    total_tn += tn
+                    total_fn += fn
+                    total_elements += len(pred_chunk)
+            
+        except Exception as e:
+            logging.warning(f"Error processing file for {img_id}: {e}")
+    
+    # Calculate final metrics
+    precision = total_tp / (total_tp + total_fp) if (total_tp + total_fp) > 0 else 0.0
+    recall = total_tp / (total_tp + total_fn) if (total_tp + total_fn) > 0 else 0.0
+    specificity = total_tn / (total_tn + total_fp) if (total_tn + total_fp) > 0 else 0.0
+    accuracy = (total_tp + total_tn) / total_elements if total_elements > 0 else 0.0
+    f1_score = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0
+    
+    # Concatenate stored scores and labels for ROC/PR curve calculation
+    try:
+        scores_concat = np.concatenate(all_scores)
+        labels_concat = np.concatenate(all_labels)
+        
+        # Calculate ROC curve and AUC
+        fpr, tpr, _ = roc_curve(labels_concat, scores_concat)
+        roc_auc = auc(fpr, tpr)
+        
+        # Calculate PR curve and AUC
+        precision_curve, recall_curve, _ = precision_recall_curve(labels_concat, scores_concat)
+        pr_auc = auc(recall_curve, precision_curve)
+        
+        del scores_concat, labels_concat
+        gc.collect()
+        
+    except Exception as e:
+        logging.error(f"Error calculating ROC/PR metrics: {e}")
+        roc_auc = float('nan')
+        pr_auc = float('nan')
+    
+    return {
+        'seg_auroc': roc_auc,
+        'seg_auprc': pr_auc,
+        'precision': precision,
+        'recall': recall,
+        'specificity': specificity,
+        'accuracy': accuracy,
+        'f1_score': f1_score
+    }
 def calculate_uncertainty_metrics(segmentations):
     """Calculate various uncertainty metrics from multiple segmentation samples.
     

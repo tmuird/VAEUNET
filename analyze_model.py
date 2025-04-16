@@ -1083,32 +1083,53 @@ def analyze_model(model, dataset, args, wandb_run=None):
             logging.warning(f"Could not log metrics DataFrame with summary row to W&B: {e}")
      # create_uncertainty_visualizations(metrics_df, output_dir, log_wandb=log_wandb)
      # --- Compute global segmentation metrics (Garifullin-style) ---
-    all_preds = []
-    all_gts = []
+   # Replace the section where global segmentation metrics are calculated with this:
 
-    for img_id in processed_ids:
-        try:
-            pred_path = temp_pixel_data_dir / f"{img_id}_pred_flat.npy"
-            gt_path = temp_pixel_data_dir / f"{img_id}_gt_flat.npy"
-            if pred_path.exists() and gt_path.exists():
-                pred = np.load(pred_path)
-                gt = np.load(gt_path)
-                all_preds.append(pred)
-                all_gts.append(gt)
-        except Exception as e:
-            logging.warning(f"Error loading prediction/GT for {img_id}: {e}")
+    # --- Compute global segmentation metrics with memory-efficient chunking ---
+    logging.info("Computing global segmentation metrics with memory-efficient chunking...")
 
-    if all_preds and all_gts:
-        all_preds_flat = np.concatenate(all_preds)
-        all_gts_flat = np.concatenate(all_gts).astype(int) # Ensure GT is integer for metrics
+    try:
+        # Direct calculation of ROC/PR curves for visualization
+        all_preds = []
+        all_gts = []
+        
+        # Only collect a subset from each image for plotting ROC/PR 
+        for img_id in processed_ids:
+            try:
+                pred_path = temp_pixel_data_dir / f"{img_id}_pred_flat.npy"
+                gt_path = temp_pixel_data_dir / f"{img_id}_gt_flat.npy"
+                if pred_path.exists() and gt_path.exists():
+                    # Load and sample to limit memory usage
+                    pred = np.load(pred_path)
+                    gt = np.load(gt_path)
+                    
+                    # If large image, take a random sample
+                    if len(pred) > 50000:
+                        sample_size = 50000
+                        indices = np.random.choice(len(pred), sample_size, replace=False)
+                        all_preds.append(pred[indices])
+                        all_gts.append(gt[indices])
+                    else:
+                        all_preds.append(pred)
+                        all_gts.append(gt)
+                    
+                    # Clear variables to free memory
+                    del pred, gt
+                    gc.collect()
+            except Exception as e:
+                logging.warning(f"Error sampling prediction/GT for {img_id}: {e}")
 
-        # --- Calculate and Plot Global Segmentation ROC/PR ---
-        try:
-            # Calculate ROC curve and AUC using numpy arrays
+        # Calculate ROC/PR curves for visualization
+        if all_preds and all_gts:
+            log_memory_usage("[Before Plot ROC/PR Concat]")
+            all_preds_flat = np.concatenate(all_preds)
+            all_gts_flat = np.concatenate(all_gts).astype(int)
+            log_memory_usage("[After Plot ROC/PR Concat]")
+            
+            # Calculate and plot ROC curve
             fpr, tpr, _ = roc_curve(all_gts_flat, all_preds_flat)
             seg_roc_auc = auc(fpr, tpr)
-
-            # Plot ROC Curve
+            
             plt.figure(figsize=(6, 6))
             plt.plot(fpr, tpr, label=f'{args.model_label} (AUC={seg_roc_auc:.4f})', lw=2)
             plt.plot([0, 1], [0, 1], 'k--', label='Chance')
@@ -1120,14 +1141,12 @@ def analyze_model(model, dataset, args, wandb_run=None):
             seg_roc_path = output_dir / "global_segmentation_roc_curve.png"
             plt.savefig(seg_roc_path, dpi=300, bbox_inches='tight')
             plt.close()
-            logging.info(f"Global Segmentation ROC curve saved to {seg_roc_path} (AUC={seg_roc_auc:.4f})")
-
-            # Calculate PR curve and AUC using numpy arrays
+            
+            # Calculate and plot PR curve
             precision, recall, _ = precision_recall_curve(all_gts_flat, all_preds_flat)
             seg_prc_auc = auc(recall, precision)
             baseline = np.sum(all_gts_flat) / len(all_gts_flat)
-
-            # Plot PR Curve
+            
             plt.figure(figsize=(6, 6))
             plt.plot(recall, precision, label=f'{args.model_label} (AUC={seg_prc_auc:.4f})', lw=2)
             plt.plot([0, 1], [baseline, baseline], 'k--', label=f'Chance={baseline:.3f}')
@@ -1139,53 +1158,53 @@ def analyze_model(model, dataset, args, wandb_run=None):
             seg_pr_path = output_dir / "global_segmentation_pr_curve.png"
             plt.savefig(seg_pr_path, dpi=300, bbox_inches='tight')
             plt.close()
+            
+            # Clean up temporary variables
+            del all_preds_flat, all_gts_flat, fpr, tpr, precision, recall
+            gc.collect()
+            log_memory_usage("[After Plot ROC/PR Cleanup]")
+            
+            logging.info(f"Global Segmentation ROC curve saved to {seg_roc_path} (AUC={seg_roc_auc:.4f})")
             logging.info(f"Global Segmentation PR curve saved to {seg_pr_path} (AUC={seg_prc_auc:.4f})")
-
+            
             if log_wandb:
                 try:
                     wandb.log({
                         "plots/global_segmentation_roc_curve": wandb.Image(str(seg_roc_path)),
                         "plots/global_segmentation_pr_curve": wandb.Image(str(seg_pr_path))
                     })
-                    # Log AUCs to summary (might overwrite if calculate_segmentation_metrics also logs them)
+                    # Log AUCs
                     wandb.summary["segmentation/auroc"] = seg_roc_auc
                     wandb.summary["segmentation/auprc"] = seg_prc_auc
                 except Exception as e:
                     logging.warning(f"Could not log global segmentation ROC/PR plots to W&B: {e}")
-
-        except Exception as plot_err:
-            logging.error(f"Failed to generate/save global segmentation ROC/PR plots: {plot_err}")
-            seg_roc_auc = np.nan
-            seg_prc_auc = np.nan
-        # --- End Calculate and Plot Global Segmentation ROC/PR ---
-
-        # Calculate other segmentation metrics if needed (using the function or manually)
-        # This part assumes calculate_segmentation_metrics might still be useful for other metrics
-        # If calculate_segmentation_metrics is not used, calculate precision/recall/specificity manually here
-        preds_tensor = torch.tensor(all_preds_flat)
-        gts_tensor = torch.tensor(all_gts_flat)
-        seg_metrics = calculate_segmentation_metrics(preds_tensor, gts_tensor, threshold=0.5)
-        # Overwrite AUCs with the ones calculated directly for consistency with plots
-        seg_metrics['seg_auroc'] = seg_roc_auc
-        seg_metrics['seg_auprc'] = seg_prc_auc
+        
+        # Calculate other metrics in a memory-efficient way
+        from utils.uncertainty_metrics import calculate_segmentation_metrics_chunked
+        
+        seg_metrics = calculate_segmentation_metrics_chunked(
+            processed_ids, 
+            temp_pixel_data_dir,
+            threshold=0.5,
+            chunk_size=100000
+        )
+        
+        if log_wandb:
+            wandb.summary.update({
+                "segmentation/precision": seg_metrics['precision'],
+                "segmentation/recall": seg_metrics['recall'],
+                "segmentation/specificity": seg_metrics['specificity'],
+                "segmentation/accuracy": seg_metrics['accuracy'],
+                "segmentation/f1_score": seg_metrics['f1_score']
+            })
 
         logging.info(f"[Segmentation Metrics - Global]")
         for k, v in seg_metrics.items():
             logging.info(f"{k}: {v:.4f}")
 
-        if log_wandb:
-            # Log other metrics from seg_metrics (AUCs will be updated/overwritten)
-            wandb.summary.update({
-                "segmentation/auroc": seg_metrics['seg_auroc'],
-                "segmentation/auprc": seg_metrics['seg_auprc'],
-                "segmentation/precision": seg_metrics['precision'],
-                "segmentation/recall": seg_metrics['recall'],
-                "segmentation/specificity": seg_metrics['specificity'],
-                # Add other metrics from seg_metrics if available
-            })
-        
-        del all_preds_flat, all_gts_flat, preds_tensor, gts_tensor # Cleanup
-
+    except Exception as e:
+        logging.error(f"Error in global segmentation metrics calculation: {e}")
+        traceback.print_exc()
     # --- Ensure these plotting calls are present ---
     create_calibration_visualizations(processed_ids, temp_pixel_data_dir, output_dir, log_wandb=log_wandb)
     perform_temperature_analysis(processed_ids, temp_pixel_data_dir, output_dir, args.temp_values, log_wandb=log_wandb)
