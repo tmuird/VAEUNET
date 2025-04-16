@@ -206,7 +206,9 @@ class UNetResNet(nn.Module):
         logvar = self.logvar_head(x_enc).squeeze(-1).squeeze(-1)  # Shape: [B, latent_dim]
         
         # Reparameterize
-        should_sample = self.latent_injection != 'none'
+        # Determine if we should sample from the latent space
+        # For 'none' and 'inject_no_bottleneck', we don't need to use the sampled latent in the bottleneck
+        should_sample = self.latent_injection not in ['none', 'inject_no_bottleneck']
         if should_sample:
             z = self.reparameterize(mu, logvar)
         else:

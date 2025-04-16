@@ -712,11 +712,7 @@ def analyze_model(model, dataset, args, wandb_run=None):
     global current_sample_index
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    if not getattr(args, 'enable_dropout', False):
-        model.eval()
-    else:
-        model.train()
-    
+    model.eval()    
     output_dir = Path(args.output_dir) / f"{args.lesion_type}_T{args.temperature}_N{args.samples}"
     output_dir.mkdir(parents=True, exist_ok=True)
     temp_pixel_data_dir = output_dir / "temp_pixel_data"
@@ -780,7 +776,7 @@ def analyze_model(model, dataset, args, wandb_run=None):
             input_tensor_shape = img_full_dev.shape[2:] # H, W
             
             # Determine if sampling should be applied based on model configuration
-            should_sample = getattr(model, 'latent_injection', 'all') != 'none'
+            should_sample = getattr(model, 'latent_injection', 'all') not in ['none', 'inject_no_bottleneck']
             if not should_sample:
                 logging.info(f"Latent injection mode is '{model.latent_injection}'. Using deterministic mu (temperature ignored).")
             

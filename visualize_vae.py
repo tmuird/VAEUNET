@@ -72,7 +72,7 @@ def predict_full_image(model, img, z):
         z_full = F.interpolate(z, size=x_enc.shape[2:], mode='bilinear', align_corners=True)
         
         # Initial projection
-        x = model.z_initial(z_full)
+        x = model.z_initial(z_full) if model.use_bottleneck else features[-1]
         
         # Decode with z injection at each stage
         for k, decoder_block in enumerate(model.decoder_blocks):
@@ -348,7 +348,7 @@ def predict_with_patches(model, img, z, patch_size=512, overlap=None, batch_size
                                          mode='bilinear', align_corners=True)
                 
                 # Initial projection
-                x = model.z_initial(z_resized)
+                x = model.z_initial(z_resized) if model.use_bottleneck else x_enc_batch
                 
                 # Decode with z injection
                 for k, decoder_block in enumerate(model.decoder_blocks):
