@@ -74,7 +74,6 @@ def plot_global_roc_pr(
     model_label="Model",
     prefix="",
     log_wandb=False,
-    max_pixels_for_roc_pr=20_000_000
 ):
     """
     Plots the global AUROC and AUPRC curves by loading data incrementally.
@@ -124,7 +123,7 @@ def plot_global_roc_pr(
         logging.info(f"Concatenated shapes: errors={all_errors.shape}, uncertainties={all_uncertainties.shape}")
         log_memory_usage("[After Global ROC/PR Concat]")
         
-        # Calculate global baseline using all loaded errors BEFORE subsampling
+        # Calculate global baseline using all loaded errors
         global_baseline = np.sum(all_errors) / (total_pixels + 1e-9)
         logging.info(f"Calculated global baseline (positive rate): {global_baseline:.6f}")
 
@@ -133,15 +132,12 @@ def plot_global_roc_pr(
         gc.collect()
         log_memory_usage("[After Global ROC/PR List Cleanup]")
 
-        errors_to_use = all_errors
-        uncertainties_to_use = all_uncertainties
-
-        # Compute ROC using potentially subsampled data
-        fpr, tpr, _ = roc_curve(errors_to_use, uncertainties_to_use)
+        # Compute ROC using all data
+        fpr, tpr, _ = roc_curve(all_errors, all_uncertainties)
         roc_auc = auc(fpr, tpr)
 
-        # Compute PR using potentially subsampled data
-        precision, recall, _ = precision_recall_curve(errors_to_use, uncertainties_to_use)
+        # Compute PR using all data
+        precision, recall, _ = precision_recall_curve(all_errors, all_uncertainties)
         prc_auc = auc(recall, precision)
 
         # Plot ROC
@@ -150,7 +146,7 @@ def plot_global_roc_pr(
         plt.plot([0,1],[0,1],'k--', label='Chance')
         plt.xlabel('False Positive Rate')
         plt.ylabel('True Positive Rate')
-        plt.title(f'Global ROC Curve ({model_label}){" (Subsampled)" if total_pixels > max_pixels_for_roc_pr else ""}')
+        plt.title(f'Global ROC Curve ({model_label})')
         plt.legend(loc='lower right')
         plt.grid(alpha=0.3)
         out_roc = output_dir / f"{prefix}roc_curve.png"
@@ -165,11 +161,10 @@ def plot_global_roc_pr(
         # Plot PR
         plt.figure(figsize=(6,6))
         plt.plot(recall, precision, label=f'{model_label} (AUC={prc_auc:.4f})', lw=2)
-        # Use the calculated global_baseline for the chance line
         plt.plot([0,1],[global_baseline, global_baseline],'k--', label=f'Chance={global_baseline:.3f}')
         plt.xlabel('Recall')
         plt.ylabel('Precision')
-        plt.title(f'Global Precision-Recall Curve ({model_label}){" (Subsampled)" if total_pixels > max_pixels_for_roc_pr else ""}')
+        plt.title(f'Global Precision-Recall Curve ({model_label})')
         plt.legend(loc='lower left')
         plt.grid(alpha=0.3)
         out_pr = output_dir / f"{prefix}pr_curve.png"
@@ -191,8 +186,7 @@ def plot_global_roc_pr(
                 logging.warning(f"Could not log global AUCs to W&B summary: {e}")
 
         # Final cleanup
-        del errors_to_use, uncertainties_to_use, fpr, tpr, precision, recall
-        # Ensure full arrays are deleted if they weren't subsampled
+        del fpr, tpr, precision, recall
         if 'all_errors' in locals(): del all_errors
         if 'all_uncertainties' in locals(): del all_uncertainties
         gc.collect()
@@ -203,7 +197,6 @@ def plot_global_roc_pr(
     except Exception as e:
          logging.error(f"Unexpected error during global ROC/PR generation: {e}. Skipping plot.")
     finally:
-        # Ensure cleanup even if errors occur
         if 'all_errors_loaded' in locals(): del all_errors_loaded
         if 'all_uncertainties_loaded' in locals(): del all_uncertainties_loaded
         if 'all_errors' in locals(): del all_errors
@@ -786,6 +779,12 @@ def analyze_model(model, dataset, args, wandb_run=None):
             # Get the actual shape of the tensor fed into the model
             input_tensor_shape = img_full_dev.shape[2:] # H, W
             
+            # Determine if sampling should be applied based on model configuration
+            should_sample = getattr(model, 'latent_injection', 'all') != 'none'
+            if not should_sample:
+                logging.info(f"Latent injection mode is '{model.latent_injection}'. Using deterministic mu (temperature ignored).")
+            
+            # Get latent distribution parameters
             with torch.no_grad():
                 mu, logvar = model.encode(img_full_dev)
 
@@ -794,9 +793,14 @@ def analyze_model(model, dataset, args, wandb_run=None):
                 current_sample_index = s_idx
                 logging.debug(f"Generating sample {s_idx} for image {img_id}")
                 with torch.no_grad():
-                    std = torch.exp(0.5 * logvar) * args.temperature
-                    eps = torch.randn_like(std)
-                    z = mu + eps * std
+                    # Sample from latent space or use mu directly
+                    if should_sample:
+                        std = torch.exp(0.5 * logvar) * args.temperature
+                        eps = torch.randn_like(std)
+                        z = mu + eps * std
+                    else:
+                        # Use deterministic mu when sampling is disabled for this mode
+                        z = mu
                     z = z.unsqueeze(-1).unsqueeze(-1)
 
                     if args.patch_size is not None and args.patch_size > 0:
@@ -805,7 +809,9 @@ def analyze_model(model, dataset, args, wandb_run=None):
                         seg = predict_full_image(model, img_full_dev, z)
                     
                     segmentations_list_cpu.append(seg.cpu())
-                    del seg, z, eps, std
+                    del seg, z
+                    if should_sample:
+                        del eps, std
                     torch.cuda.empty_cache()
 
             segmentations = torch.cat(segmentations_list_cpu, dim=0)
@@ -1189,7 +1195,7 @@ def analyze_model(model, dataset, args, wandb_run=None):
     perform_temperature_analysis(processed_ids, temp_pixel_data_dir, output_dir, args.temp_values, log_wandb=log_wandb)
     plot_global_sparsification_curve(processed_ids, temp_pixel_data_dir, output_dir, model_label=args.model_label, log_wandb=log_wandb)
     plot_global_uncertainty_distribution(processed_ids, temp_pixel_data_dir, output_dir, model_label=args.model_label, log_wandb=log_wandb)
-    plot_global_roc_pr(processed_ids, temp_pixel_data_dir, output_dir, model_label=args.model_label, prefix="global_", log_wandb=log_wandb, max_pixels_for_roc_pr=args.max_pixels_roc_pr)
+    plot_global_roc_pr(processed_ids, temp_pixel_data_dir, output_dir, model_label=args.model_label, prefix="global_", log_wandb=log_wandb)
 
     # --- End of plotting calls ---
 
@@ -1260,8 +1266,6 @@ def get_args():
                         help='Label for the model in plots')
     parser.add_argument('--batch_size', type=int, default=4,
                         help='Batch size for patch processing (default: 4)')
-    parser.add_argument('--max_pixels_roc_pr', type=int, default=20_000_000,
-                        help='Maximum number of pixels to use for global ROC/PR calculation to limit memory usage (default: 20 million)')
     parser.add_argument('--no_wandb', action='store_true', help='Disable Weights & Biases logging')
     parser.add_argument('--wandb_project', type=str, default='VAE_UNet_Analysis', help='W&B project name')
     parser.add_argument('--wandb_entity', type=str, default=None, help='W&B entity (username or team)')
