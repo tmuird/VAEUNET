@@ -12,3 +12,7 @@ data/patches/
 *.jpeg
 *.npy
 *.npz
+/uncertainty
+/analysis
+/outputs
+/calibration

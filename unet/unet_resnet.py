@@ -170,8 +170,8 @@ class UNetResNet(nn.Module):
             use_latent_list = [True, True, True, True]
             latent_injection = 'all' # Correct the mode if unknown
             
-        # Whether to use bottleneck injection (decoder starts from z)
-        # This is True for all modes EXCEPT 'none' and the new 'inject_no_bottleneck'
+     
+        # True for all modes EXCEPT 'none' and the new 'inject_no_bottleneck'
         self.use_bottleneck = latent_injection not in ['none', 'inject_no_bottleneck']
             
         # Decoder blocks with parameterized latent injection
@@ -207,15 +207,14 @@ class UNetResNet(nn.Module):
         
         # Reparameterize
         # Determine if we should sample from the latent space
-        # For 'none' and 'inject_no_bottleneck', we don't need to use the sampled latent in the bottleneck
         should_sample = self.latent_injection not in ['none', 'inject_no_bottleneck']
         if should_sample:
             z = self.reparameterize(mu, logvar)
         else:
-            z = mu # Shape: [B, latent_dim]
+            z = mu 
         
         # Reshape z to spatial dimensions
-        z = z.unsqueeze(-1).unsqueeze(-1)  # [B, latent_dim, 1, 1]
+        z = z.unsqueeze(-1).unsqueeze(-1)  
         
         # Initial feature size matches the smallest encoder feature
         initial_size = features[-1].shape[2:]
@@ -264,7 +263,7 @@ class UNetResNet(nn.Module):
             # Use latent for bottleneck
             x = self.z_initial(z_spatial)
         else:
-            # For 'none' mode, we still need a starting point, use encoder features with channel padding
+         
             x = torch.zeros(z.size(0), 512, initial_size[0], initial_size[1], device=z.device)
         
         # Decode with conditional z injection
@@ -279,21 +278,4 @@ class UNetResNet(nn.Module):
         
         return output
 
-        """Sample from the latent space and generate segmentation masks.
-        Args:
-            num_samples: Number of samples to generate
-            temp: Temperature parameter for sampling (higher = more diverse)
-            device: Device to generate on
-        """
-        if device is None:
-            device = next(self.parameters()).device
-            
-        # Sample from standard normal
-        z = torch.randn(num_samples, self.latent_dim, device=device) * temp
-        
-        # Generate masks
-        with torch.no_grad():
-            masks = self.decode(z)
-            masks = torch.sigmoid(masks)
-        
-        return masks
+    
